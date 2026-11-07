@@ -347,7 +347,7 @@ func toStateEntry(e *thread.Entry) stateEntry {
 		Kind:  string(e.Kind),
 		From:  from,
 		Text:  cutEnd(strings.Join(parts, "\n"), entryTextRunes),
-		Tools: e.Digest.Render(),
+		Tools: toolNames(e.Digest),
 	}
 }
 
@@ -446,4 +446,29 @@ func nameOrNone(s string) string {
 		return "none"
 	}
 	return s
+}
+
+// toolNames lists the tools a reply used, by name in first-use order with a
+// count, as "web_search ×2, read_file": the router's state keeps tool names,
+// not their arguments.
+func toolNames(d *thread.ToolDigest) string {
+	if d == nil {
+		return ""
+	}
+	var order []string
+	count := map[string]int{}
+	for _, c := range d.Calls {
+		if count[c.Name] == 0 {
+			order = append(order, c.Name)
+		}
+		count[c.Name]++
+	}
+	parts := make([]string, 0, len(order))
+	for _, n := range order {
+		if count[n] > 1 {
+			n = fmt.Sprintf("%s ×%d", n, count[n])
+		}
+		parts = append(parts, n)
+	}
+	return strings.Join(parts, ", ")
 }

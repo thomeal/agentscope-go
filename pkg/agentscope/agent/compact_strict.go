@@ -203,7 +203,7 @@ func (a *UnifiedAgent) compactStrictImpl(ctx context.Context, cfg *ContextConfig
 	a.state.Summary = newSummary
 	a.state.Context = msgsToReserve
 	a.lastModelInputTokens = 0
-	a.pendingPrecompress = nil
+	a.dropReadyLocked()
 	a.compactionVersion++
 	if a.readCache != nil {
 		cleanReadCacheForReserved(a.readCache, msgsToReserve)

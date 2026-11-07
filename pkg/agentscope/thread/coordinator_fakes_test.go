@@ -51,6 +51,7 @@ type fakePart struct {
 	syncErr     error
 	saveErr     error // Activate applies its Sync, then fails (an unsaved checkpoint)
 	activateErr error
+	planHeld    bool // a plan survives clears: clearing Private leaves a set flag set, as on the agent
 	scripts     []fakeScript
 	script      fakeScript // used when scripts is empty
 	confirms    []string
@@ -116,6 +117,9 @@ func (f *fakePart) applyLocked(s *Sync) error {
 	}
 	if s.Taint != nil {
 		f.state.Tainted = *s.Taint
+	}
+	if s.Private != nil {
+		f.state.Private = *s.Private || (f.state.Private && f.planHeld)
 	}
 	return nil
 }
@@ -194,6 +198,11 @@ func (f *fakePart) Activate(ctx context.Context, act Activation) (<-chan Activat
 		}
 		f.mu.Lock()
 		f.state.Busy = false
+		if end != nil && end.Private && f.desc.Zone == ZoneEdge {
+			// Like the in-repo participants: a private run leaves the
+			// edge's state private (ParticipantState.Private).
+			f.state.Private = true
+		}
 		f.mu.Unlock()
 		if end != nil {
 			ch <- ActivationEvent{End: end}
@@ -301,7 +310,6 @@ func (r *fakeRun) pending() *Sync {
 	cursor := r.f.State().Cursor
 	s, err := r.host().Pending(r.ctx, r.name(), cursor)
 	r.f.mu.Lock()
-	defer r.f.mu.Unlock()
 	if err == nil && s != nil {
 		if aerr := r.f.applyLocked(s); aerr != nil {
 			// Pending projects past the given cursor, so this is a
@@ -310,7 +318,21 @@ func (r *fakeRun) pending() *Sync {
 		}
 	}
 	r.f.pendings = append(r.f.pendings, s)
+	r.f.mu.Unlock()
 	return s
+}
+
+// plan publishes a plan_updated event, as an agent's update_plan tool does.
+func (r *fakeRun) plan(steps ...string) {
+	items := make([]any, 0, len(steps))
+	for i, st := range steps {
+		status := "completed"
+		if i == len(steps)-1 {
+			status = "in_progress"
+		}
+		items = append(items, map[string]any{"step": st, "status": status})
+	}
+	r.out <- ActivationEvent{Event: event.NewCustomEvent("", planEvent, map[string]any{"plan": items})}
 }
 
 // read reads the thread and records what it got.
@@ -398,9 +420,9 @@ type fakeForker struct {
 	peerOut     ForkOutput
 	ownOut      ForkOutput
 	forkErr     error
-	applied     []string
-	applyErr    error
-	beforeApply func()
+	offered     []string
+	offerErr    error
+	beforeOffer func()
 	gate        chan struct{}
 	forked      chan ForkSpec
 }
@@ -432,9 +454,9 @@ func (f *fakeForker) Fork(ctx context.Context, _ Snapshot, spec ForkSpec) (ForkO
 	f.fmu.Lock()
 	f.specs = append(f.specs, spec)
 	g, forked := f.gate, f.forked
-	out := f.ownOut
-	if spec.Validate != nil {
-		out = f.peerOut
+	out := f.peerOut
+	if spec.Prompt == DefaultOwnPrompt || spec.Prompt == DefaultOwnUpdatePrompt {
+		out = f.ownOut
 	}
 	err := f.forkErr
 	f.fmu.Unlock()
@@ -451,17 +473,16 @@ func (f *fakeForker) Fork(ctx context.Context, _ Snapshot, spec ForkSpec) (ForkO
 	return out, err
 }
 
-func (f *fakeForker) ApplyOwnSummary(_ context.Context, _ Snapshot, text string) error {
+func (f *fakeForker) OfferOwnSummary(_ context.Context, _ Snapshot, text string) error {
 	f.fmu.Lock()
 	defer f.fmu.Unlock()
-	if f.beforeApply != nil {
-		f.beforeApply()
+	if f.beforeOffer != nil {
+		f.beforeOffer()
 	}
-	f.applied = append(f.applied, text)
-	if f.applyErr != nil {
-		return f.applyErr
+	if f.offerErr != nil {
+		return f.offerErr
 	}
-	f.setState(func(s *ParticipantState) { s.InputTokens = 1000 })
+	f.offered = append(f.offered, text)
 	return nil
 }
 
@@ -471,10 +492,10 @@ func (f *fakeForker) forkSpecs() []ForkSpec {
 	return slices.Clone(f.specs)
 }
 
-func (f *fakeForker) appliedOwn() []string {
+func (f *fakeForker) offeredOwn() []string {
 	f.fmu.Lock()
 	defer f.fmu.Unlock()
-	return slices.Clone(f.applied)
+	return slices.Clone(f.offered)
 }
 
 // ---------------------------------------------------------------- router and policy

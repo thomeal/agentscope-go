@@ -124,7 +124,9 @@ func (p *Prepared) Participant(cfg AgentConfig) (*AgentParticipant, error) { //n
 // NewAgentParticipant wraps an agent built without Prepare: it has no thread
 // tools and no boundary input, so entries that arrive during an activation
 // wait for the next one, and taint from TaintingTools reaches the agent when
-// the activation ends.
+// the activation ends. On the edge it also has no privacy probe: privacy
+// from PrivateTools or a private trigger is saved when the activation ends,
+// so a checkpoint the agent saves during the reply may lack it.
 func NewAgentParticipant(cfg AgentConfig) (*AgentParticipant, error) { //nolint:gocritic // the value parameter keeps the documented API
 	c, err := newCore(cfg.Descriptor, PrepareOptions{}, false)
 	if err != nil {
@@ -171,12 +173,13 @@ func (p *AgentParticipant) Release(h thread.Host) { p.c.release(h) }
 
 // State reports the agent's thread view plus whether an activation runs. The
 // agent is the host's: when the host restores it from a checkpoint before
-// binding the participant, the view already holds the restored cursor and
-// taint.
+// binding the participant, the view already holds the restored cursor,
+// taint and privacy.
 func (p *AgentParticipant) State() thread.ParticipantState {
 	busy := p.c.busy()
 	v := p.agent.ThreadView()
-	return thread.ParticipantState{Cursor: v.Cursor, InputTokens: v.InputTokens, Window: v.Window, Tainted: v.Tainted, Busy: busy}
+	return thread.ParticipantState{Cursor: v.Cursor, InputTokens: v.InputTokens, Window: v.Window, SummaryTokens: v.SummaryTokens,
+		CompactAt: v.CompactAt, Tainted: v.Tainted, Private: v.Private, Busy: busy}
 }
 
 // Sync applies s between activations; it refuses while busy.
@@ -219,6 +222,11 @@ func (p *AgentParticipant) Activate(ctx context.Context, act thread.Activation) 
 		return nil, err
 	}
 	if !act.Sync.Empty() {
+		// Marked before the update is applied: the checkpoint that holds it
+		// must hold the flag too.
+		if p.c.importsEdgeOnly(ctx, host, act.Sync) {
+			a.markPrivate()
+		}
 		u, err := toUpdate(act.Sync)
 		if err == nil {
 			err = p.agent.ApplyThreadUpdate(ctx, u)
@@ -226,9 +234,6 @@ func (p *AgentParticipant) Activate(ctx context.Context, act thread.Activation) 
 		if err != nil {
 			p.c.endActivation()
 			return nil, fmt.Errorf("participant %s: apply activation sync: %w", p.c.desc.Name, err)
-		}
-		if p.c.importsEdgeOnly(ctx, host, act.Sync) {
-			a.markPrivate()
 		}
 	}
 	a.start(p.agent.ThreadView())
@@ -296,7 +301,9 @@ func (p *AgentParticipant) Activate(ctx context.Context, act thread.Activation) 
 
 // settle brings the idle agent in line with what the activation did, before
 // the next activation can start: the taint it has not been told about (no
-// boundary ran after the untrusted read) and a note for each writing call
+// boundary ran after the untrusted read), an edge run's privacy (the probe
+// marks only the checkpoints an agent with a StateSaver writes; an agent
+// built without Prepare has no probe), and a note for each writing call
 // whose answer it did not record (tracker.notes). It always saves the agent's
 // state, even with nothing to apply: the agent does not checkpoint after a
 // final answer, and an agent the host restores later must hold the whole
@@ -304,9 +311,14 @@ func (p *AgentParticipant) Activate(ctx context.Context, act thread.Activation) 
 // without one); a failure is reported in end.
 func (p *AgentParticipant) settle(ctx context.Context, t *tracker, end *thread.ActivationEnd) {
 	u := agent.ThreadUpdate{Messages: t.notes()}
-	if end.Tainted && !p.agent.ThreadView().Tainted {
+	view := p.agent.ThreadView()
+	if end.Tainted && !view.Tainted {
 		v := true
 		u.Taint = &v
+	}
+	if _, private := t.act.flags(); private && !view.Private && p.c.desc.Zone == thread.ZoneEdge {
+		v := true
+		u.Private = &v
 	}
 	if err := p.agent.ApplyThreadUpdate(context.WithoutCancel(ctx), u); err != nil {
 		reportSettle(p.c.desc.Name, end, fmt.Errorf("participant %s: update the agent after the reply: %w", p.c.desc.Name, err))
@@ -355,14 +367,12 @@ func (p *AgentParticipant) Fork(ctx context.Context, snap thread.Snapshot, spec 
 	return forkOn(ctx, p.agent, snap, &spec, p.keepToolChoice, p.forkGuard)
 }
 
-// ApplyOwnSummary replaces the agent's context with text plus a recent tail,
-// between activations. A snapshot that no longer matches is thread.ErrStale.
-func (p *AgentParticipant) ApplyOwnSummary(ctx context.Context, snap thread.Snapshot, text string) error {
-	if err := p.c.beginOp(); err != nil {
-		return err
-	}
-	defer p.c.endOp()
-	return applyOn(ctx, p.agent, snap, text)
+// OfferOwnSummary hands the agent text, a summary of its own context built
+// from snap, to install at its compaction line (agent.OfferSummary). It may
+// be called while an activation runs. A snapshot that no longer matches is
+// thread.ErrStale.
+func (p *AgentParticipant) OfferOwnSummary(ctx context.Context, snap thread.Snapshot, text string) error {
+	return offerOn(ctx, p.agent, snap, text, false)
 }
 
 // forkSnapshot is the thread.Snapshot of an agent participant.
@@ -423,12 +433,18 @@ func forkOn(ctx context.Context, a *agent.UnifiedAgent, snap thread.Snapshot, sp
 	return out, err
 }
 
-func applyOn(ctx context.Context, a *agent.UnifiedAgent, snap thread.Snapshot, text string) error {
+// offerOn offers text to a. With anyInstance a snapshot another instance
+// took is accepted too (a team master is rebuilt from its checkpoint for
+// every activation): the agent matches it by its boundary message's ID.
+func offerOn(ctx context.Context, a *agent.UnifiedAgent, snap thread.Snapshot, text string, anyInstance bool) error {
 	s, err := ownSnapshot(a, snap)
+	if err != nil && anyInstance && errors.Is(err, thread.ErrStale) {
+		s, err = snap.(*forkSnapshot), nil
+	}
 	if err != nil {
 		return err
 	}
-	err = a.ApplySummary(ctx, s.snap, text, agent.SummaryApplyOptions{})
+	err = a.OfferSummary(ctx, s.snap, text, agent.SummaryApplyOptions{})
 	if errors.Is(err, agent.ErrStaleSnapshot) {
 		return fmt.Errorf("%w: %w", thread.ErrStale, err)
 	}

@@ -25,11 +25,13 @@ type agentStateJSON struct {
 	MiddlewareState map[string]any      `json:"middleware_context,omitempty"`
 	ReadCacheData   json.RawMessage     `json:"read_cache_data,omitempty"`
 	Plan            []tool.PlanItem     `json:"plan,omitempty"`
+	SummaryOffer    *SummaryOffer       `json:"summary_offer,omitempty"`
 	// Thread state (schema version 3).
 	PeerSummary  *PeerSummary `json:"peer_summary,omitempty"`
 	ThreadIndex  string       `json:"thread_index,omitempty"`
 	ThreadCursor uint64       `json:"thread_cursor,omitempty"`
 	Tainted      bool         `json:"tainted,omitempty"`
+	Private      bool         `json:"private,omitempty"`
 }
 
 // MarshalJSON serializes AgentState to JSON.
@@ -48,10 +50,12 @@ func (s *AgentState) MarshalJSON() ([]byte, error) {
 		MiddlewareState: s.MiddlewareState,
 		ReadCacheData:   s.ReadCacheData,
 		Plan:            s.Plan,
+		SummaryOffer:    s.SummaryOffer,
 		PeerSummary:     s.PeerSummary,
 		ThreadIndex:     s.ThreadIndex,
 		ThreadCursor:    s.ThreadCursor,
 		Tainted:         s.Tainted,
+		Private:         s.Private,
 	})
 }
 
@@ -59,7 +63,7 @@ func (s *AgentState) MarshalJSON() ([]byte, error) {
 // schema version 3: an older loader would silently drop the cursor and could
 // re-import entries the agent already holds.
 func (s *AgentState) usesThreadState() bool {
-	return s.PeerSummary != nil || s.ThreadIndex != "" || s.ThreadCursor != 0 || s.Tainted
+	return s.PeerSummary != nil || s.ThreadIndex != "" || s.ThreadCursor != 0 || s.Tainted || s.Private
 }
 
 // checkpointSchemaVersion returns the lowest schema version able to carry s:
@@ -94,10 +98,12 @@ func (s *AgentState) UnmarshalJSON(data []byte) error {
 	s.MiddlewareState = raw.MiddlewareState
 	s.ReadCacheData = raw.ReadCacheData
 	s.Plan = raw.Plan
+	s.SummaryOffer = raw.SummaryOffer
 	s.PeerSummary = raw.PeerSummary
 	s.ThreadIndex = raw.ThreadIndex
 	s.ThreadCursor = raw.ThreadCursor
 	s.Tainted = raw.Tainted
+	s.Private = raw.Private
 	return nil
 }
 

@@ -11,47 +11,44 @@ func TestDigestBuilderEmpty(t *testing.T) {
 	if d := b.Digest(); d != nil {
 		t.Fatalf("empty builder gave %+v, want nil", d)
 	}
-	b.Add("  ", map[string]any{"path": "a"})
+	b.Add("  ", `{"path":"a"}`)
 	if d := b.Digest(); d != nil {
 		t.Fatalf("a nameless call gave %+v, want nil", d)
 	}
 }
 
-func TestDigestBuilderGroups(t *testing.T) {
+// TestDigestBuilderListsEveryCall: one item per call in call order, with
+// the raw arguments cut at DigestArgsRunes (stage 0's tool summary).
+func TestDigestBuilderListsEveryCall(t *testing.T) {
 	var b DigestBuilder
-	b.Add("Read", map[string]any{"path": "a.go"})
-	b.Add("Grep", map[string]any{"pattern": "TODO", "path": "src"})
-	b.Add("Read", map[string]any{"path": "a.go"})
-	b.Add("Bash", map[string]any{"command": "go test ./..."})
-	b.Add("Grep", map[string]any{"pattern": "FIXME", "path": "src"})
-	b.Add("Edit", map[string]any{"file_path": "b.go"})
-	b.Add("Edit", map[string]any{"file_path": "c.go"})
-	b.Add("Read", map[string]any{"path": "a.go"})
-	b.Add("Bash", map[string]any{"cmd": "go vet"})
-	b.Add("Fetch", map[string]any{"url": "https://example.com"})
-	b.Add("Fetch", nil)
+	b.Add("read_file", `{"path":"a.go"}`)
+	b.Add("read_file", `{"path":"a.go"}`)
+	b.Add("write_file", `{"path":"b.go","content":"`+strings.Repeat("x", 300)+`"}`)
+	b.Add("list", "")
 	got := b.Digest()
+	long := `{"path":"b.go","content":"` + strings.Repeat("x", 300) + `"}`
 	want := &ToolDigest{Calls: []ToolCallDigest{
-		{Name: "Read", Target: "a.go", Count: 3},
-		{Name: "Grep", Target: "src", Count: 2},
-		{Name: "Bash", Target: "go", Count: 2},
-		{Name: "Edit", Count: 2},
-		{Name: "Fetch", Count: 2},
+		{Name: "read_file", Args: `{"path":"a.go"}`},
+		{Name: "read_file", Args: `{"path":"a.go"}`},
+		{Name: "write_file", Args: string([]rune(long)[:DigestArgsRunes]) + "..."},
+		{Name: "list"},
 	}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("digest\n got %+v\nwant %+v", got, want)
 	}
-	if r := got.Render(); r != "Read a.go ×3, Grep src ×2, Bash go ×2, Edit ×2, Fetch ×2" {
-		t.Errorf("render %q", r)
+	lines := strings.Split(got.Render(), "\n")
+	if len(lines) != 4 || lines[0] != `read_file {"path":"a.go"}` || lines[3] != "list" ||
+		!strings.HasPrefix(lines[2], `write_file {"path":"b.go"`) || !strings.HasSuffix(lines[2], "...") {
+		t.Errorf("render %q", got.Render())
 	}
 	// A digest is a snapshot; later calls do not change it.
-	b.Add("Read", map[string]any{"path": "z.go"})
-	if got.Calls[0].Target != "a.go" || got.Calls[0].Count != 3 {
-		t.Errorf("snapshot changed: %+v", got.Calls[0])
+	b.Add("read_file", `{"path":"z.go"}`)
+	if len(got.Calls) != 4 {
+		t.Errorf("snapshot changed: %+v", got.Calls)
 	}
 }
 
-func TestDigestTarget(t *testing.T) {
+func TestToolTarget(t *testing.T) {
 	long := strings.Repeat("é", 100)
 	cases := []struct {
 		name string
@@ -81,7 +78,7 @@ func TestDigestTarget(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := digestTarget(tc.args); got != tc.want {
+			if got := ToolTarget(tc.args); got != tc.want {
 				t.Errorf("target %q, want %q", got, tc.want)
 			}
 		})

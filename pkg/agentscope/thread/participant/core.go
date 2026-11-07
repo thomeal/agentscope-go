@@ -19,7 +19,7 @@ import (
 
 var (
 	// ErrBusy is returned when an activation, or an operation that must run
-	// between activations (Sync, Compact, ApplyOwnSummary), is already running.
+	// between activations (Sync, Compact), is already running.
 	ErrBusy = errors.New("participant: busy")
 	// ErrNotBound is returned by Activate before Bind.
 	ErrNotBound = errors.New("participant: no host bound")
@@ -135,8 +135,26 @@ func (c *core) options() []agent.AgentOption {
 	}
 	if c.desc.Zone == thread.ZoneCloud {
 		opts = append(opts, agent.WithForkCapture())
+	} else {
+		opts = append(opts, agent.WithPrivacyProbe(c.privateNow))
 	}
 	return opts
+}
+
+// privateNow is the edge agent's privacy probe (agent.WithPrivacyProbe):
+// whether the running activation took anything edge-only. Every mark lands
+// before the checkpoint that first holds what caused it: the trigger's when
+// the activation is created, an import's before the update is applied, a
+// listed tool's or a TeamAssign's from the loop hook after the call, and
+// thread_read's inside the tool. The agent's settle after the run saves once
+// more while the activation is still current.
+func (c *core) privateNow() bool {
+	act := c.current()
+	if act == nil {
+		return false
+	}
+	_, private := act.flags()
+	return private
 }
 
 // hasWriteTools reports whether an external thread tool is installed; those
@@ -288,7 +306,8 @@ func newActivation(act *thread.Activation) *activation {
 }
 
 // start records the agent's thread state after the activation's own Sync was
-// applied: an agent that is already tainted makes the activation tainted.
+// applied: an agent that is already tainted makes the activation tainted,
+// and one whose state is private makes it private.
 func (a *activation) start(view agent.ThreadView) { //nolint:gocritic // ThreadView is returned by value
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -296,6 +315,9 @@ func (a *activation) start(view agent.ThreadView) { //nolint:gocritic // ThreadV
 	if view.Tainted {
 		a.tainted = true
 		a.taintDelivered = true
+	}
+	if view.Private {
+		a.private = true
 	}
 }
 
@@ -500,6 +522,10 @@ func toUpdate(s *thread.Sync) (agent.ThreadUpdate, error) {
 	if s.Taint != nil {
 		t := *s.Taint
 		u.Taint = &t
+	}
+	if s.Private != nil {
+		p := *s.Private
+		u.Private = &p
 	}
 	if e := s.PeerSummary; e != nil {
 		ps := &agent.PeerSummary{Text: e.Text(), Origin: e.Origin.String(), Tainted: e.Tainted}

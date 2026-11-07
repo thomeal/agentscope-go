@@ -21,21 +21,43 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
   `transfer` of the foreground with a structured brief, background tasks and
   reports, summaries written by forked requests that reuse the prompt cache
   (with an optional guardrail on their text), a one-step clear for edge
-  takeovers, chunked import with strict compaction as the edge's fallback,
+  handovers, chunked import with strict compaction as the edge's fallback,
   edge-only visibility that never reaches the cloud, taint tracking, a shared
   ledger, an opt-in tool-output list and leases. The classifier call is
   bounded by a timeout, after which routing falls through to the mode's
-  default. See
+  default; the hybrid question is stage 0's, and the participant
+  descriptions follow stage 0 with tool calls in place of its records.
+  Peer summaries are refreshed when what a handover would bring the edge
+  reaches a share of its window. The cloud's own notes follow Claude Code's
+  session memory (first notes at 10,000 tokens, edit-based updates every
+  5,000) and are installed at its compaction line without a model call;
+  the synchronous compression still runs when they leave the context over
+  the line.
+  Tool digests keep each call's arguments, cut at 200 characters. A failed
+  owner leaves a `failed` marker and hands the request to the other side,
+  queued behind any task running there, and takes the failed run's
+  steering it may read (the rest gets a cycle of its own); plan updates are
+  logged as `progress`; after a crash the turn in flight is resumed on its
+  owner, with the user's steering since then and a warning to check the
+  actual state. The edge's privacy is saved in its checkpoint with what
+  caused it, and recovery reads it from there. See
   [Main Thread](docs/main-thread.md) and `examples/main_thread`.
 - Opt-in `agent` seams it builds on, inert unless used: `ApplyThreadUpdate`,
   `WithBoundaryInput`, `WithThreadInput`, `ThreadView`, `WithForkCapture`,
   `ForkSnapshot`, `ForkSummary` (with `ForkRequest.KeepToolChoice` for
   providers whose cache depends on the tool choice), `ApplySummary`,
-  `CompactStrict`, `ContextConfig.ThreadSummaryTokens` (the own summary's
-  share next to a peer summary), `MarkHandedOff`, `WithExclusiveTools` (matched by the name
+  `OfferSummary` (with `AgentState.SummaryOffer`, applied at the compression
+  trigger), `CompactStrict`, `ContextConfig.ThreadSummaryTokens` (the own
+  summary's share next to a peer summary, sized from the window by default)
+  and `SetThreadSummaryTokens`, `MarkHandedOff`, `WithExclusiveTools` (matched by the name
   the toolkit resolves), `WithTaintGate` (a gated call is denied in
-  `ModeDontAsk` instead of asking), `SetTainted`, and the context-aware
-  `SubmitExternalResultContext` and `SubmitUserConfirmContext`.
+  `ModeDontAsk` instead of asking), `SetTainted`, `WithPrivacyProbe` (asked
+  before every checkpoint; a true answer sets `AgentState.Private`, which
+  `ThreadUpdate.Private` also sets or clears and which a held plan keeps
+  set), and the context-aware `SubmitExternalResultContext` and
+  `SubmitUserConfirmContext`.
+- The loop hooks' `BeforeToolExec` and `AfterToolExec` now also run around
+  the awaiting calls a resumed reply executes, as on the normal tool path.
 - `types.ReplyHandedOff` (`"handed_off"`) ends a reply after a committed
   handoff. Like an interrupted end it cannot be swallowed by `OnReply`
   middleware; `TeamRun` treats it as a normal end and the goal pipeline as

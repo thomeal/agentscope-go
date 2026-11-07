@@ -36,6 +36,12 @@ const (
 	// KindMarker records an interruption, a recovery, unknown effects, a
 	// projection gap or the absence of an owner.
 	KindMarker Kind = "marker"
+	// KindProgress is a run's plan as its agent's newest plan_updated event
+	// left it: what the run had done and meant to do next. It wakes nobody.
+	// A projection renders only the newest one of a run that has not ended,
+	// or that ended in a failure, so a failover or a restart sees where the
+	// run stood without contexts collecting stale plans.
+	KindProgress Kind = "progress"
 )
 
 // Visibility controls which participants may receive an entry.
@@ -182,15 +188,14 @@ type ToolDigest struct {
 	Calls []ToolCallDigest `json:"calls"`
 }
 
-// ToolCallDigest is one tool name with the target it acted on, if any, and
-// how many times it ran.
+// ToolCallDigest is one tool call: its name and its raw arguments, cut at
+// DigestArgsRunes.
 type ToolCallDigest struct {
-	Name   string `json:"name"`
-	Target string `json:"target,omitempty"`
-	Count  int    `json:"count"`
+	Name string `json:"name"`
+	Args string `json:"args,omitempty"`
 }
 
-// Render formats the digest as "Read ×4, Grep ×2".
+// Render formats the digest one call per line, as "read_file {"path":"a.go"}".
 func (d *ToolDigest) Render() string {
 	if d == nil || len(d.Calls) == 0 {
 		return ""
@@ -198,15 +203,12 @@ func (d *ToolDigest) Render() string {
 	parts := make([]string, 0, len(d.Calls))
 	for _, c := range d.Calls {
 		s := c.Name
-		if c.Target != "" {
-			s += " " + c.Target
-		}
-		if c.Count > 1 {
-			s += fmt.Sprintf(" ×%d", c.Count)
+		if c.Args != "" {
+			s += " " + c.Args
 		}
 		parts = append(parts, s)
 	}
-	return strings.Join(parts, ", ")
+	return strings.Join(parts, "\n")
 }
 
 // ArtifactRef points at an artifact outside the log.
@@ -248,8 +250,16 @@ type MarkerKind string
 const (
 	// MarkerInterrupted records a canceled activation.
 	MarkerInterrupted MarkerKind = "interrupted"
-	// MarkerRecovered records a restart.
+	// MarkerRecovered records a request a restart left unanswered and did
+	// not resume: it waits for the user's next message.
 	MarkerRecovered MarkerKind = "recovered"
+	// MarkerRestarted records that the process stopped while a request was
+	// being answered and the restarted Coordinator resumed it; the detail
+	// carries the host's account (Config.RecoveryNote).
+	MarkerRestarted MarkerKind = "restarted"
+	// MarkerFailed records an activation that ended with an error, and why.
+	// An edge error's own text is left out, since it may name private data.
+	MarkerFailed MarkerKind = "failed"
 	// MarkerUnknownEffects records that tools may have run with no recorded
 	// result, so the next owner must check state before repeating them.
 	MarkerUnknownEffects MarkerKind = "unknown_effects"
@@ -297,6 +307,18 @@ type Entry struct {
 	Task       *Task                  `json:"task,omitempty"`
 	Marker     *Marker                `json:"marker,omitempty"`
 	Notify     bool                   `json:"notify,omitempty"`
+	// Run is set on a progress entry: the ID of the activation it reports on.
+	Run string `json:"run,omitempty"`
+	// Steered lists, on the entry that ends a run, the user inputs the run
+	// took besides its trigger: older inputs its cycle carried as context,
+	// inputs delivered to it while it ran, inputs a recovery joined to the
+	// request it resumed, and a failed run's inputs its failover took over.
+	// The entry is the run's failed or interrupted marker, else its reply,
+	// else the owner change of its Transfer. After a reply or a Transfer
+	// recovery takes none of them for an open request; after a failure or
+	// an interrupt they share the fate of the run's request. A failed wake
+	// queues them again; an interrupted one ends them.
+	Steered []uint64 `json:"steered,omitempty"`
 	// Tainted is set when the writer had read an untrusted source, so the
 	// content may carry injected instructions.
 	Tainted bool `json:"tainted,omitempty"`

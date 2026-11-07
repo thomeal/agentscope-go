@@ -20,7 +20,9 @@ type Descriptor struct {
 	// Window is the participant's context window in tokens; 0 means unknown.
 	Window int
 	// SummaryBudget is the target size in tokens of a summary written for
-	// this participant (a cloud fork writing for an edge peer).
+	// this participant (a cloud fork writing for an edge peer). Zero sizes it
+	// from the participant: 5/6 of the summary budget its State reports
+	// (stage 0 gave 2,500 of 3,000), else 5/16 of its window, else 1,024.
 	SummaryBudget int
 	// BriefMaxRunes is the longest brief the participant accepts; 0 means no
 	// limit.

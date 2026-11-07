@@ -7,8 +7,10 @@ import (
 
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/event"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/logging"
+	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/loop"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/message"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/middleware"
+	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/protocol"
 )
 
 // Checkpointing and crash-recovery (HARNESS_DESIGN F1).
@@ -50,7 +52,13 @@ func (a *UnifiedAgent) SaveCheckpoint(ctx context.Context) error {
 	if a.stateSaver == nil {
 		return fmt.Errorf("agent: no StateSaver configured")
 	}
+	// Asked before the state is copied and without a.mu: the probe may take
+	// the host's own locks.
+	private := a.privacyProbe != nil && a.privacyProbe()
 	a.mu.Lock()
+	if private {
+		a.state.Private = true
+	}
 	st := *a.state
 	// Sync permission state from the engine: session-learned rules and
 	// user-granted working directories live there, while a.state.PermissionCtx
@@ -120,7 +128,13 @@ func (a *UnifiedAgent) ForkSession(ctx context.Context, newSessionID string) err
 	if a.stateSaver == nil {
 		return fmt.Errorf("agent: no StateSaver configured")
 	}
+	// Asked before the state is copied and without a.mu: the probe may take
+	// the host's own locks.
+	private := a.privacyProbe != nil && a.privacyProbe()
 	a.mu.Lock()
+	if private {
+		a.state.Private = true
+	}
 	st := *a.state
 	if a.engine != nil {
 		st.PermissionCtx = a.engine.SnapshotContext()
@@ -204,9 +218,13 @@ func (a *UnifiedAgent) awaitingCalls() (asking, submitted []message.ToolCallBloc
 // repromptAwaitingCalls re-drives HITL/external handshakes after a resume:
 // it re-emits the confirmation/execution events for pending calls and
 // records the outcomes, so a conversation restored via WithState continues
-// where it parked instead of ending silently at StateWait. Returns true if
-// any awaiting call was handled (the react loop should re-evaluate).
-func (a *UnifiedAgent) repromptAwaitingCalls(ctx context.Context, ch chan<- event.Event, replyID string, actingHandler middleware.ActingHandler) bool {
+// where it parked instead of ending silently at StateWait. The loop hooks
+// run around each call it executes with StateAct, as on the StateAct path.
+// Returns true if any awaiting call was handled (the react loop should
+// re-evaluate).
+func (a *UnifiedAgent) repromptAwaitingCalls(ctx context.Context, ch chan<- event.Event, replyID string, actingHandler middleware.ActingHandler,
+	hooks *loop.HookRunner, iter int) bool {
+	const state = protocol.StateAct
 	asking, submitted := a.awaitingCalls()
 	handled := false
 
@@ -233,7 +251,9 @@ func (a *UnifiedAgent) repromptAwaitingCalls(ctx context.Context, ch chan<- even
 		// back, so force the allowed state first.
 		resultTC.State = message.ToolCallAllowed
 		a.replaceToolCallInContext(tc.ID, &resultTC)
+		hooks.BeforeToolExec(state, iter, resultTC.Name)
 		a.executeAndRecord(ctx, ch, replyID, &resultTC, actingHandler)
+		hooks.AfterToolExec(state, iter, resultTC.Name, nil)
 		handled = true
 	}
 
@@ -241,7 +261,9 @@ func (a *UnifiedAgent) repromptAwaitingCalls(ctx context.Context, ch chan<- even
 		tc := submitted[i]
 		// A restored call must honor the current toolkit, permissions and
 		// validators. Reuse normal recording and event assembly as well.
+		hooks.BeforeToolExec(state, iter, tc.Name)
 		a.executeAndRecord(ctx, ch, replyID, &tc, actingHandler)
+		hooks.AfterToolExec(state, iter, tc.Name, nil)
 		handled = true
 	}
 

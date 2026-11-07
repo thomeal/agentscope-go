@@ -29,14 +29,25 @@ const DefaultPeerPrompt = "Write a summary of this conversation for {target}, an
 
 // DefaultOwnPrompt asks a fork for a summary its own participant continues
 // from after its earlier messages are removed.
-const DefaultOwnPrompt = "Summarize this conversation so you can continue it after the earlier messages are removed. " +
-	"Keep every decision, constraint, open task, file path, identifier and number you will need. Plain text, no preamble."
+const DefaultOwnPrompt = "Write notes on this conversation so you can continue it after the earlier messages are removed. " +
+	"Use these sections, each a short list: Task (what the user wants and the constraints), Current state (what is done and what is in progress), " +
+	"Files and identifiers (paths, names and numbers you will need), Decisions (what was chosen and why), Errors and fixes, Next steps. " +
+	"Keep every detail you would need to continue. Plain text, no preamble."
+
+// DefaultOwnUpdatePrompt asks a fork to update the participant's notes with
+// edits; the notes follow it.
+const DefaultOwnUpdatePrompt = "Update your notes below with what happened in this conversation since they were written. " +
+	"Answer with edits only, each in this form:\n" + editFind + "\ntext copied exactly from the notes\n" + editSep + "\nits replacement\n" + editReplace + "\n" +
+	"An empty FIND adds the replacement at the end. Keep what still matters and drop what no longer does; leave unchanged parts out. " +
+	"To rewrite a section, replace it whole. If nothing needs to change, answer " + noteNoChange + "."
 
 // Defaults for zero Config fields.
 const (
 	defaultPeerEvery        = 20000
+	defaultPeerRatio        = 0.8
 	defaultPeerBudget       = 1024
-	defaultOwnRatio         = 0.6
+	defaultOwnInit          = 10000
+	defaultOwnEvery         = 5000
 	defaultOwnMaxTokens     = 8192
 	defaultMaxRewrites      = 1
 	defaultEdgeShare        = 0.5
@@ -78,22 +89,44 @@ type SummaryPolicy struct {
 	// PeerTarget is the participant peer summaries are written for; default
 	// the only edge participant.
 	PeerTarget string
+	// PeerRatio is the share of the target's window that its newest peer
+	// summary and the entries after it, what a handover would bring it, may
+	// fill; default 0.8, a negative value turns the rule off. A writer
+	// refreshes the summary at the end of a reply when that load, plus what
+	// the reply added to it, reaches the share, so the target can take over
+	// (also by failover, when the cloud cannot fork) with what it holds. The
+	// target's window is the one its State reports, else its Descriptor's;
+	// when neither is known, PeerEvery's default applies instead.
+	PeerRatio float64
 	// PeerEvery is the growth, in tokens of the writer's input, between peer
-	// summaries; default 20000.
+	// summaries. Zero (the default) leaves the refresh to PeerRatio, or uses
+	// 20000 when the target's window is unknown; a positive value applies
+	// as well as PeerRatio.
 	PeerEvery int
 	// PeerPrompt defaults to DefaultPeerPrompt; {target}, {window} and
 	// {budget} are replaced.
 	PeerPrompt string
 	// PeerMaxTokens defaults to twice the target's SummaryBudget, at least 512.
 	PeerMaxTokens int
-	// OwnRatio triggers an own summary when InputTokens >= OwnRatio x Window;
-	// default 0.6.
-	OwnRatio float64
-	// OwnPrompt defaults to DefaultOwnPrompt.
+	// OwnInit and OwnEvery schedule a cloud participant's own notes the way
+	// Claude Code schedules its session memory: the first notes once its
+	// input reaches OwnInit (default 10000 tokens), then an update whenever
+	// the input grew OwnEvery (default 5000) since the last one, checked at
+	// the end of each reply. An update edits the previous notes
+	// (OwnUpdatePrompt). The notes are not applied when written: the
+	// participant holds them and installs them, without a model call, when
+	// its context reaches its compaction line (Forker.OfferOwnSummary).
+	OwnInit  int
+	OwnEvery int
+	// OwnPrompt asks for the first notes; it defaults to DefaultOwnPrompt.
 	OwnPrompt string
-	// OwnMaxTokens defaults to 8192.
+	// OwnUpdatePrompt asks for edits of the notes, which follow it; it
+	// defaults to DefaultOwnUpdatePrompt.
+	OwnUpdatePrompt string
+	// OwnMaxTokens caps an own fork's output and the notes' size; default
+	// 8192.
 	OwnMaxTokens int
-	// MaxRewrites bounds the peer fork's rewrites after its validation fails;
+	// MaxRewrites bounds a fork's rewrites after its validation fails;
 	// 0 takes the default 1, a negative value allows none.
 	MaxRewrites int
 	// Disabled turns summary forks off.
@@ -164,6 +197,14 @@ type Config struct {
 	Available func(name string) bool
 	// Clock stamps entries and ledger records; nil uses time.Now.
 	Clock func() time.Time
+	// RecoveryNote is the host's account of why the previous process
+	// stopped, from its crash log say. When recovery resumes a request the
+	// stopped process was answering, the restarted marker records it (up to
+	// 1,000 characters) and the resuming participant's input quotes it on one
+	// line, cut at 200 characters. The marker is shared whenever the request
+	// is, and the cloud may read it whoever resumes, so never put edge-only
+	// material in it. Empty says nothing beyond the log.
+	RecoveryNote string
 }
 
 // EventKind names what an Event carries.
@@ -273,7 +314,6 @@ type partState struct {
 
 	running *activation
 	queue   []*activation
-	maint   bool // an own summary is being applied while idle
 	// seen is the highest seq the Coordinator delivered (trigger, import or
 	// Pending); it backs up the participant's cursor.
 	seen         uint64
@@ -295,10 +335,22 @@ type partState struct {
 	// the idle owner.
 	notify map[uint64]*Entry
 
-	forking    bool
-	growth     int
-	lastInput  int
-	pendingOwn *ownResult
+	// restored is set from recovery until its first activation starts: its
+	// checkpoint may predate what it wrote, so its first incremental import
+	// also brings its own entries based past its cursor.
+	restored bool
+
+	forking   bool
+	growth    int
+	lastInput int
+	// ownNotes are the participant's newest own notes; ownAt is its input
+	// when the last own fork started.
+	ownNotes string
+	ownAt    int
+	// peerLoad is the peer target's handover load (newest peer summary and
+	// the entries after it) this writer measured at the end of its last
+	// reply; the next measure's rise predicts the reply after it.
+	peerLoad int
 }
 
 // raisePrivateLocked marks ps as holding edge-only material.
@@ -325,6 +377,9 @@ type cycleState struct {
 	disclosure Disclosure
 	wakes      int
 	failedOver bool
+	// progress is the newest progress entry an activation answering this
+	// cycle wrote; a failover points its successor at it.
+	progress *Entry
 	// noWake holds the reports whose wake failed in this cycle; they wait
 	// for the owner's next foreground activation instead of waking it again.
 	noWake map[uint64]bool
@@ -440,17 +495,26 @@ func (cfg *Config) normalize() error {
 	case len(edges) == 1:
 		s.PeerTarget = edges[0]
 	}
-	if s.PeerEvery <= 0 {
-		s.PeerEvery = defaultPeerEvery
+	if s.PeerEvery < 0 {
+		s.PeerEvery = 0
+	}
+	if s.PeerRatio == 0 {
+		s.PeerRatio = defaultPeerRatio
 	}
 	if s.PeerPrompt == "" {
 		s.PeerPrompt = DefaultPeerPrompt
 	}
-	if s.OwnRatio <= 0 {
-		s.OwnRatio = defaultOwnRatio
+	if s.OwnInit <= 0 {
+		s.OwnInit = defaultOwnInit
+	}
+	if s.OwnEvery <= 0 {
+		s.OwnEvery = defaultOwnEvery
 	}
 	if s.OwnPrompt == "" {
 		s.OwnPrompt = DefaultOwnPrompt
+	}
+	if s.OwnUpdatePrompt == "" {
+		s.OwnUpdatePrompt = DefaultOwnUpdatePrompt
 	}
 	if s.OwnMaxTokens <= 0 {
 		s.OwnMaxTokens = defaultOwnMaxTokens
@@ -463,8 +527,8 @@ func (cfg *Config) normalize() error {
 	}
 	im := &cfg.Import
 	im.EdgeShare = shareOrDefault(im.EdgeShare, defaultEdgeShare)
-	if im.EdgeShare > 1 || s.OwnRatio > 1 {
-		return errors.New("thread: import shares and the own summary ratio must be at most 1")
+	if im.EdgeShare > 1 || s.PeerRatio > 1 {
+		return errors.New("thread: the edge import share and the peer summary ratio must be at most 1")
 	}
 	im.MaxRounds = intOrDefault(im.MaxRounds, defaultMaxRounds)
 	im.IndexRunes = intOrDefault(im.IndexRunes, defaultIndexRunes)
@@ -837,7 +901,7 @@ func (c *Coordinator) dispatch() {
 // ---------------------------------------------------------------- work
 
 // addWorkLocked counts one unit of pending work: a routing cycle, a queued
-// or running activation, a fork job or an own summary being applied.
+// or running activation, or a fork job.
 func (c *Coordinator) addWorkLocked() {
 	if c.work == 0 {
 		c.idle = make(chan struct{})

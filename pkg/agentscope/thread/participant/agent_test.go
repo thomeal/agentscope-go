@@ -128,6 +128,24 @@ func TestPrepareSelectsToolsAndBindsOnce(t *testing.T) {
 	}
 }
 
+// TestDigestLeavesOutThePlan: an update_plan call becomes the run's progress
+// entry, so the reply's digest lists only the other tools.
+func TestDigestLeavesOutThePlan(t *testing.T) {
+	f := newFixture(t, fixtureOptions{
+		tools: []tool.Tool{textTool("read_file", "package main")},
+		agent: []agent.AgentOption{agent.WithPlanTool()},
+		respond: steps(
+			resp("", call("p1", "update_plan", map[string]any{"plan": []any{map[string]any{"step": "read a.go", "status": "in_progress"}}})),
+			resp("", call("c1", "read_file", map[string]any{"path": "a.go"})),
+			resp("Done."),
+		),
+	})
+	_, end := activate(t, f.p, foreground(5, "check a.go"), nil)
+	if end.Err != nil || end.ToolCalls != 2 || end.Digest.Render() != `read_file {"path":"a.go"}` {
+		t.Fatalf("calls=%d digest=%q err=%v", end.ToolCalls, end.Digest.Render(), end.Err)
+	}
+}
+
 func TestActivateForwardsEventsTextDigestUsageAndEventList(t *testing.T) {
 	f := newFixture(t, fixtureOptions{
 		tools: []tool.Tool{textTool("read_file", "package main")},
@@ -143,7 +161,7 @@ func TestActivateForwardsEventsTextDigestUsageAndEventList(t *testing.T) {
 	if end.Text != "Looking.\nDone." {
 		t.Fatalf("text = %q", end.Text)
 	}
-	if end.ToolCalls != 1 || end.Digest.Render() != "read_file a.go" || end.Tainted || end.Private {
+	if end.ToolCalls != 1 || end.Digest.Render() != `read_file {"path":"a.go"}` || end.Tainted || end.Private {
 		t.Fatalf("calls=%d digest=%q tainted=%v private=%v", end.ToolCalls, end.Digest.Render(), end.Tainted, end.Private)
 	}
 	if _, ok := items[0].Event.(event.ReplyStartEvent); !ok {
@@ -299,8 +317,9 @@ func TestBusyParticipantRefusesWork(t *testing.T) {
 	if _, err := f.p.Compact(context.Background(), ""); !errors.Is(err, ErrBusy) {
 		t.Fatalf("compact while busy: %v", err)
 	}
-	if err := f.p.ApplyOwnSummary(context.Background(), nil, "x"); !errors.Is(err, ErrBusy) {
-		t.Fatalf("apply while busy: %v", err)
+	// An own summary may be offered while busy; only the snapshot is checked.
+	if err := f.p.OfferOwnSummary(context.Background(), nil, "x"); !errors.Is(err, thread.ErrNoSnapshot) {
+		t.Fatalf("offer while busy: %v", err)
 	}
 	close(release)
 	if _, end := drain(t, ch, nil); end.Text != "done" {
@@ -341,7 +360,7 @@ func TestTransferSealsTextAndEndsHandedOff(t *testing.T) {
 	if req.From != (thread.Origin{Participant: "cloud"}) || req.Epoch != 3 || req.To != "edge" || req.Tainted || req.Private {
 		t.Fatalf("request = %+v", req)
 	}
-	if req.Text != "Reading.\nHanding over." || req.Digest.Render() != "read_file lamp.cfg" {
+	if req.Text != "Reading.\nHanding over." || req.Digest.Render() != `read_file {"path":"lamp.cfg"}` {
 		t.Fatalf("sealed text %q digest %q", req.Text, req.Digest.Render())
 	}
 	b := req.Brief
@@ -523,6 +542,9 @@ func TestPrivateFlags(t *testing.T) {
 		if len(f.host.snapshot().recorded) != 0 {
 			t.Fatal("the edge does not capture outputs by default")
 		}
+		if got := f.p.State().Private; got != end.Private {
+			t.Fatalf("the agent's own flag = %v after a run that was private %v", got, end.Private)
+		}
 		return end
 	}
 	if end := run(t, foreground(1, "hi"), nil, textResp("ok")); end.Private {
@@ -557,6 +579,37 @@ func TestPrivateFlags(t *testing.T) {
 	}
 	if end := run(t, foreground(1, "hi"), boundary, resp("", call("c1", "read", nil)), textResp("ok")); !end.Private {
 		t.Fatal("an edge-only import at a boundary makes the activation private")
+	}
+}
+
+// TestPrivateStateFollowsSyncs: a Sync sets the agent's privacy and a clear
+// lowers it, unless the agent holds a plan; an agent built without Prepare
+// gets the flag when its private run ends.
+func TestPrivateStateFollowsSyncs(t *testing.T) {
+	ctx := t.Context()
+	yes, no := true, false
+	f := newFixture(t, fixtureOptions{desc: edgeDesc})
+	if err := f.p.Sync(ctx, thread.Sync{Private: &yes}); err != nil {
+		t.Fatal(err)
+	}
+	if !f.p.State().Private {
+		t.Fatal("Sync.Private did not set the flag")
+	}
+	if err := f.p.Sync(ctx, thread.Sync{Reset: true, Private: &no}); err != nil {
+		t.Fatal(err)
+	}
+	if f.p.State().Private {
+		t.Fatal("a clear did not lower the flag")
+	}
+
+	u := newFixture(t, fixtureOptions{
+		desc: edgeDesc, noPrep: true,
+		cfg:     AgentConfig{PrivateTools: []string{"sensor"}},
+		tools:   []tool.Tool{textTool("sensor", "21C")},
+		respond: steps(resp("", call("c1", "sensor", nil)), textResp("ok")),
+	})
+	if _, end := activate(t, u.p, foreground(1, "hi"), nil); !end.Private || !u.p.State().Private {
+		t.Fatalf("an unprepared edge's private run: end %v, state %v", end.Private, u.p.State().Private)
 	}
 }
 
@@ -699,17 +752,26 @@ func TestForkerSnapshotForkAndApply(t *testing.T) {
 	if _, err := f.p.Fork(context.Background(), snap, thread.ForkSpec{}); err == nil {
 		t.Fatal("an empty prompt must fail")
 	}
-	if err := f.p.ApplyOwnSummary(context.Background(), snap, "own summary"); err != nil {
+	// An offer changes nothing until the compaction line, so a newer offer
+	// on the same snapshot replaces it.
+	if err := f.p.OfferOwnSummary(context.Background(), snap, "own summary"); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.p.ApplyOwnSummary(context.Background(), snap, "again"); !errors.Is(err, thread.ErrStale) {
-		t.Fatalf("a used snapshot is stale: %v", err)
+	if err := f.p.OfferOwnSummary(context.Background(), snap, "newer"); err != nil {
+		t.Fatalf("a newer offer: %v", err)
 	}
 	if _, err := f.p.Fork(context.Background(), foreignSnap{}, thread.ForkSpec{Prompt: "x"}); !errors.Is(err, thread.ErrNoSnapshot) {
 		t.Fatalf("foreign snapshot: %v", err)
 	}
-	if err := f.p.ApplyOwnSummary(context.Background(), foreignSnap{}, "x"); err == nil {
+	if err := f.p.OfferOwnSummary(context.Background(), foreignSnap{}, "x"); err == nil {
 		t.Fatal("a foreign snapshot must be refused")
+	}
+	// A reset of the context leaves the snapshot nothing to match.
+	if err := f.p.Sync(context.Background(), thread.Sync{Reset: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.p.OfferOwnSummary(context.Background(), snap, "late"); !errors.Is(err, thread.ErrStale) {
+		t.Fatalf("an offer on a stale snapshot: %v", err)
 	}
 
 	e := newFixture(t, fixtureOptions{desc: edgeDesc, respond: steps(textResp("ok"))})

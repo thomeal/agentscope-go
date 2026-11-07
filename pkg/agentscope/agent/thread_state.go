@@ -139,7 +139,8 @@ type ThreadUpdate struct {
 	// Reset clears Context, the agent's own Summary, the read cache, any
 	// pending background precompression and the provider-grounded token
 	// floor (lastModelInputTokens), before anything else applies. Permission
-	// grants, Plan and the toolkit are kept. Only allowed between replies.
+	// grants, Plan, Tainted, Private and the toolkit are kept. Only allowed
+	// between replies.
 	Reset bool
 	// PeerSummary, when non-nil, replaces the slot. Context messages that
 	// carry a thread seq covered by it (seq <= Through and not Excluded) are
@@ -163,6 +164,10 @@ type ThreadUpdate struct {
 	Cursor uint64
 	// Taint, when non-nil, sets or clears Tainted.
 	Taint *bool
+	// Private, when non-nil, sets or clears Private. Clearing leaves a set
+	// flag set while the agent holds a Plan: the plan outlives a Reset and
+	// may name what a private run read. It never sets a clear flag.
+	Private *bool
 }
 
 // BoundaryInput supplies thread updates inside a running reply. It is called
@@ -178,6 +183,20 @@ type BoundaryInput func(ctx context.Context) (*ThreadUpdate, error)
 // inside a reply) or a persistence failure ends the reply as an error.
 func WithBoundaryInput(src BoundaryInput) AgentOption {
 	return func(a *UnifiedAgent) { a.boundaryInput = src }
+}
+
+// WithPrivacyProbe installs probe (EXPERIMENTAL): it reports whether what the
+// agent's state may now hold includes data that must stay on the device.
+// SaveCheckpoint (and so every automatic checkpoint) asks it before copying
+// the state, without holding the agent's lock, and a true answer sets
+// AgentState.Private first; the probe never clears it. A host keeps the flag
+// sound by answering true no later than the checkpoint that first holds the
+// data: mark the run private when it starts on a private input, from a loop
+// hook's AfterToolExec (which runs before the step's checkpoint, also for
+// calls restored from a checkpoint), from the tool itself, or through a
+// ThreadUpdate's Private.
+func WithPrivacyProbe(probe func() bool) AgentOption {
+	return func(a *UnifiedAgent) { a.privacyProbe = probe }
 }
 
 type threadInputKey struct{}
@@ -215,6 +234,7 @@ type ThreadView struct {
 	PeerSummary     *PeerSummary
 	Index           string
 	Tainted         bool
+	Private         bool
 	ContextMessages int
 	// InputTokens estimates the model input the next call would send (the
 	// system prompt with state awareness and skill instructions, summaries,
@@ -229,6 +249,14 @@ type ThreadView struct {
 	// smaller of the model and its fallback). It is 0 when neither the
 	// configuration nor the model reports one.
 	Window int
+	// SummaryTokens is the ThreadSummaryTokens budget in force: the value
+	// set (configured or SetThreadSummaryTokens), or with 0 the automatic
+	// one for Window; 0 when the option is off or the window is unknown.
+	SummaryTokens int
+	// CompactAt is the estimated input at which automatic compression fires:
+	// TriggerRatio x Window. It is 0 when Window is unknown or the agent has
+	// no ContextConfig (no automatic compression).
+	CompactAt int
 }
 
 // ThreadView returns a copy of the agent's thread state. It may be called
@@ -241,18 +269,32 @@ func (a *UnifiedAgent) ThreadView() ThreadView {
 		PeerSummary:     a.state.PeerSummary.clone(),
 		Index:           a.state.ThreadIndex,
 		Tainted:         a.state.Tainted,
+		Private:         a.state.Private,
 		ContextMessages: len(a.state.Context),
 	}
 	input := cloneMsgs(a.modelInputLocked(a.systemPrompt))
 	floor := a.lastModelInputTokens
-	var cfgSize int
+	var cfgSize, summaryTokens int
+	var trigger float64
 	if a.contextCfg != nil {
 		cfgSize = a.contextCfg.ContextSize
+		summaryTokens = a.contextCfg.ThreadSummaryTokens
+		trigger = a.contextCfg.withDefaults().TriggerRatio
+	}
+	if a.threadSummarySet {
+		summaryTokens = a.threadSummaryTokens
 	}
 	a.mu.Unlock()
 
 	v.InputTokens = max(a.model.CountTokens(input, a.toolkit.GetToolSchemas()), floor)
 	v.Window = a.knownWindow(cfgSize)
+	v.CompactAt = int(float64(v.Window) * trigger)
+	switch {
+	case summaryTokens > 0:
+		v.SummaryTokens = summaryTokens
+	case summaryTokens == 0:
+		v.SummaryTokens = v.Window * threadSummaryAutoNum / threadSummaryAutoDen
+	}
 	return v
 }
 
@@ -365,7 +407,7 @@ func (a *UnifiedAgent) applyThreadUpdateLocked(u *ThreadUpdate) {
 		a.state.Context = nil
 		a.state.Summary = ""
 		a.state.ReadCacheData = nil
-		a.pendingPrecompress = nil
+		a.dropReadyLocked()
 		a.lastModelInputTokens = 0
 		a.lastCapture = nil
 		a.compactionVersion++
@@ -399,6 +441,9 @@ func (a *UnifiedAgent) applyThreadUpdateLocked(u *ThreadUpdate) {
 	}
 	if u.Taint != nil {
 		a.state.Tainted = *u.Taint
+	}
+	if u.Private != nil {
+		a.state.Private = *u.Private || (a.state.Private && len(a.state.Plan) > 0)
 	}
 }
 
@@ -439,7 +484,7 @@ func holdsToolBlocks(m *message.Msg) bool {
 // when a StateSaver is configured, so cursor and content land in one
 // checkpoint. If persisting fails the error is returned, but the update stays
 // applied in memory; retry persistence with SaveCheckpoint.
-func (a *UnifiedAgent) ApplyThreadUpdate(ctx context.Context, u ThreadUpdate) error {
+func (a *UnifiedAgent) ApplyThreadUpdate(ctx context.Context, u ThreadUpdate) error { //nolint:gocritic // the value parameter keeps the documented API
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -521,13 +566,64 @@ func threadInputError(err error) *types.ReplyErrorInfo {
 // leaves: the smallest size the agent's overflow recovery elides a text to.
 const minOwnSummaryTokens = 256
 
-// ownSummaryShare is the own summary's share of ThreadSummaryTokens next to
-// peer, or 0 when the option is off. It counts in TruncateToolResult's unit.
-func ownSummaryShare(cfg *ContextConfig, peer *PeerSummary) int {
-	if cfg == nil || cfg.ThreadSummaryTokens <= 0 {
+// threadSummaryAuto is the share of the context window the automatic
+// ThreadSummaryTokens budget takes: 3/8, which stage 0's 3,000 tokens of an
+// 8,192-token window round to.
+const threadSummaryAutoNum, threadSummaryAutoDen = 3, 8
+
+// SetThreadSummaryTokens changes ContextConfig.ThreadSummaryTokens for what
+// follows: a positive value is the budget, 0 the automatic one, a negative
+// value turns the option off. An own summary over its new share is elided at
+// once. It is safe for concurrent use.
+func (a *UnifiedAgent) SetThreadSummaryTokens(n int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.threadSummaryTokens, a.threadSummarySet = n, true
+	a.boundOwnSummaryLocked()
+}
+
+// threadSummaryTotalLocked is the ThreadSummaryTokens budget in force, 0
+// when the option is off: the value set at run time, else the config's; a
+// positive value as is; zero 3/8 of ctxSize while a peer summary is held.
+// Caller holds a.mu.
+func (a *UnifiedAgent) threadSummaryTotalLocked(cfg *ContextConfig, ctxSize int) int {
+	n := 0
+	if cfg != nil {
+		n = cfg.ThreadSummaryTokens
+	}
+	if a.threadSummarySet {
+		n = a.threadSummaryTokens
+	}
+	switch {
+	case n > 0:
+		return n
+	case n < 0, a.state.PeerSummary == nil, ctxSize <= 0:
 		return 0
 	}
-	left := cfg.ThreadSummaryTokens
+	return ctxSize * threadSummaryAutoNum / threadSummaryAutoDen
+}
+
+// threadContextSizeLocked is the window the automatic budget is sized from:
+// the configured ContextSize, else the smaller of the model's and its
+// fallback's. Caller holds a.mu.
+func (a *UnifiedAgent) threadContextSizeLocked() int {
+	if a.contextCfg != nil && a.contextCfg.ContextSize > 0 {
+		return a.contextCfg.ContextSize
+	}
+	n := model.ResolveContextSize(a.model, defaultContextSize)
+	if a.modelCfg.FallbackModel != nil {
+		n = min(n, model.ResolveContextSize(a.modelCfg.FallbackModel, defaultContextSize))
+	}
+	return n
+}
+
+// ownSummaryShare is the own summary's share of total next to peer, or 0
+// when total is 0. It counts in TruncateToolResult's unit.
+func ownSummaryShare(total int, peer *PeerSummary) int {
+	if total <= 0 {
+		return 0
+	}
+	left := total
 	if peer != nil {
 		left -= len(peer.Text) / 4
 	}
@@ -535,12 +631,11 @@ func ownSummaryShare(cfg *ContextConfig, peer *PeerSummary) int {
 }
 
 // ownSummaryBudget is the budget a newly written own summary is elided to:
-// the SummaryMaxTokens budget, lowered to the ThreadSummaryTokens share when
-// that option is set.
+// the SummaryMaxTokens budget, lowered to its ThreadSummaryTokens share.
 func (a *UnifiedAgent) ownSummaryBudget(cfg *ContextConfig, ctxSize int) int {
 	budget := summaryMaxTokens(cfg, ctxSize)
 	a.mu.Lock()
-	share := ownSummaryShare(cfg, a.state.PeerSummary)
+	share := ownSummaryShare(a.threadSummaryTotalLocked(cfg, ctxSize), a.state.PeerSummary)
 	a.mu.Unlock()
 	if share > 0 && (budget <= 0 || share < budget) {
 		budget = share
@@ -550,18 +645,17 @@ func (a *UnifiedAgent) ownSummaryBudget(cfg *ContextConfig, ctxSize int) int {
 
 // reserveTokens is the reserve a compression keeps for the recent tail. The
 // split charges the thread messages (peer summary and index) with the rest
-// of the head; with ThreadSummaryTokens set they are given back, so a held
-// peer summary does not leave the agent without recent turns. The reserve
-// then stays under 0.75 of the window and under the trigger.
+// of the head; while a ThreadSummaryTokens budget is in force they are given
+// back, so a held peer summary does not leave the agent without recent
+// turns. The reserve then stays under 0.75 of the window and under the
+// trigger.
 func (a *UnifiedAgent) reserveTokens(cfg *ContextConfig, ctxSize int) int {
 	reserve := int(float64(ctxSize) * cfg.ReserveRatio)
-	if cfg.ThreadSummaryTokens <= 0 {
-		return reserve
-	}
 	a.mu.Lock()
+	total := a.threadSummaryTotalLocked(cfg, ctxSize)
 	thread := threadPromptMsgs(a.name, a.state.PeerSummary, a.state.ThreadIndex)
 	a.mu.Unlock()
-	if len(thread) == 0 {
+	if total <= 0 || len(thread) == 0 {
 		return reserve
 	}
 	limit := int(float64(ctxSize) * min(0.75, cfg.TriggerRatio-0.05))
@@ -569,14 +663,14 @@ func (a *UnifiedAgent) reserveTokens(cfg *ContextConfig, ctxSize int) int {
 }
 
 // boundOwnSummaryLocked elides the own summary to its ThreadSummaryTokens
-// share next to the peer summary just set: the share is otherwise applied
-// only when the next summary is written, and the two would exceed the total
-// until then. Caller holds a.mu.
+// share next to the peer summary just set (or the budget just changed): the
+// share is otherwise applied only when the next summary is written, and the
+// two would exceed the total until then. Caller holds a.mu.
 func (a *UnifiedAgent) boundOwnSummaryLocked() {
 	if a.contextCfg == nil || a.state.Summary == "" {
 		return
 	}
-	share := ownSummaryShare(a.contextCfg, a.state.PeerSummary)
+	share := ownSummaryShare(a.threadSummaryTotalLocked(a.contextCfg, a.threadContextSizeLocked()), a.state.PeerSummary)
 	if share <= 0 {
 		return
 	}

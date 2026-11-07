@@ -30,7 +30,9 @@ crosses `ContextSize*PrecompressRatio`, the agent generates the compaction
 summary in a background goroutine from a context snapshot. When the hard
 trigger later fires — or the host calls `Compact` — a still-valid result
 applies instantly; stale results (checkpoint rollback, an interleaved
-compaction) are discarded and the synchronous path runs as before.
+compaction) are discarded and the synchronous path runs as before. At the
+automatic trigger the synchronous path also runs when the context is still
+at the threshold after the result went in.
 
 The summary covers the snapshot prefix: messages appended since the snapshot
 stay raw, so the window refills somewhat sooner after an applied

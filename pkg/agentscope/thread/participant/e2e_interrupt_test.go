@@ -361,3 +361,85 @@ func TestE2EAgentParticipantRestart(t *testing.T) {
 	s.submit(&thread.Query{Text: "Q-EDGE-2: is the lamp still on?", Disclosure: thread.DiscloseShared, Explicit: "edge"})
 	s.settle()
 }
+
+// askedPolicy is the keyword policy, recording every text it is asked
+// about: the Coordinator asks only about what a private edge writes.
+type askedPolicy struct {
+	mu    sync.Mutex
+	texts []string
+}
+
+func (p *askedPolicy) Classify(ctx context.Context, text string) (thread.Visibility, error) {
+	p.mu.Lock()
+	p.texts = append(p.texts, text)
+	p.mu.Unlock()
+	return canaryPolicy{}.Classify(ctx, text)
+}
+
+func (p *askedPolicy) asked(text string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, x := range p.texts {
+		if strings.Contains(x, text) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestE2EPrivateRunSurvivesARestart: the edge answers a shared request with
+// a private tool (door_lock). The tool step's checkpoint already holds the
+// privacy flag next to the result, before the run ends; after a restart the
+// restored edge reports it, and the Coordinator treats the edge as private:
+// its next reply goes to the disclosure policy. Without the private tool
+// nothing of that happens.
+func TestE2EPrivateRunSurvivesARestart(t *testing.T) {
+	for _, private := range []bool{true, false} {
+		t.Run(fmt.Sprintf("private=%v", private), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "thread.jsonl")
+			first, err := thread.OpenFileStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			policy := &askedPolicy{}
+			s := newSession(t, &sessionOptions{store: first, persistEdge: true, disclosure: policy})
+			call := toolCall("device_control", map[string]any{"device": "lamp", "state": "on"})
+			if private {
+				call = toolCall("door_lock", map[string]any{"code": "1234"})
+			}
+			s.edge.script(
+				act("", call),
+				inspect(func(*wireCall) {
+					st, err := agent.LoadCheckpoint(s.ctx, s.saver, "edge")
+					if err != nil || st.Private != private {
+						t.Errorf("the tool step's checkpoint: private %v, want %v (%v)", st != nil && st.Private, private, err)
+					}
+				}, say("EDGE-ANSWER-1: done.")),
+			)
+			s.submit(&thread.Query{Text: "Q-EDGE-1: do it.", Disclosure: thread.DiscloseShared, Explicit: "edge"})
+			s.settle()
+			if err := s.c.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := first.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			second, err := thread.OpenFileStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = second.Close() })
+			s.rebuild(second)
+			if st := s.edgeP.State(); st.Private != private {
+				t.Fatalf("the restored edge reports private %v, want %v", st.Private, private)
+			}
+			s.edge.script(say("EDGE-ANSWER-2: still done."))
+			s.submit(&thread.Query{Text: "Q-EDGE-2: is it done?", Disclosure: thread.DiscloseShared, Explicit: "edge"})
+			s.settle()
+			if got := policy.asked("EDGE-ANSWER-2"); got != private {
+				t.Fatalf("the policy was asked about the reply after the restart: %v, want %v", got, private)
+			}
+		})
+	}
+}

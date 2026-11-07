@@ -745,6 +745,78 @@ func TestApplySummaryKeepsTail(t *testing.T) {
 	}
 }
 
+// TestOfferSummaryAppliesAtTheTrigger: an offered summary changes nothing
+// until the compression trigger, which installs it without a model call,
+// keeping ApplySummary's tail and everything appended since. An offer the
+// context outgrew falls through to the synchronous path.
+func TestOfferSummaryAppliesAtTheTrigger(t *testing.T) {
+	a, snap, msgs, after := tailFixture(t)
+	opt := SummaryApplyOptions{MinTailTokens: 250, MinTailTextMessages: 1, MaxTailTokens: 1000}
+	before := append([]*message.Msg(nil), a.state.Context...)
+	if err := a.OfferSummary(context.Background(), snap, "the notes", opt); err != nil {
+		t.Fatal(err)
+	}
+	if a.state.Summary != "" || !reflect.DeepEqual(before, a.state.Context) {
+		t.Fatal("an offer must not change the context before the trigger")
+	}
+	later := message.UserMsg("u", "later")
+	a.state.Context = append(a.state.Context, later)
+	if !a.applyReadyPrecompress(context.Background()) {
+		t.Fatal("the trigger did not apply the offer")
+	}
+	want := append(append([]*message.Msg(nil), msgs[5:]...), after, later)
+	if a.state.Summary != "the notes" || !reflect.DeepEqual(a.state.Context, want) {
+		t.Fatalf("summary %q, kept %d messages, want %d", a.state.Summary, len(a.state.Context), len(want))
+	}
+
+	b, snapB, _, _ := tailFixture(t)
+	if err := b.OfferSummary(context.Background(), snapB, "the notes", opt); err != nil {
+		t.Fatal(err)
+	}
+	b.state.Summary = "compacted meanwhile"
+	if b.applyReadyPrecompress(context.Background()) || b.state.Summary != "compacted meanwhile" {
+		t.Fatal("a stale offer must fall through")
+	}
+	if err := b.OfferSummary(context.Background(), snapB, "x", opt); !errors.Is(err, ErrStaleSnapshot) {
+		t.Fatalf("offer on a stale snapshot: %v", err)
+	}
+	if err := b.OfferSummary(context.Background(), nil, "x", opt); err == nil {
+		t.Fatal("nil snapshot")
+	}
+}
+
+// TestOfferSummarySurvivesAReload: the offer is part of the checkpointed
+// state, so an agent rebuilt from it (a team master is rebuilt for every
+// activation) still applies it at the trigger, matching by message ID.
+func TestOfferSummarySurvivesAReload(t *testing.T) {
+	saver := newFakeStateSaver()
+	a, snap, _, _ := tailFixture(t)
+	a.stateSaver = saver
+	opt := SummaryApplyOptions{MinTailTokens: 250, MinTailTextMessages: 1, MaxTailTokens: 1000}
+	if err := a.OfferSummary(context.Background(), snap, "the notes", opt); err != nil {
+		t.Fatal(err)
+	}
+	saved := saver.states[a.state.SessionID]
+	if saved == nil || saved.SummaryOffer == nil || saved.SummaryOffer.Text != "the notes" {
+		t.Fatal("an offer made between replies must be persisted")
+	}
+	data, err := json.Marshal(saved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st AgentState
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatal(err)
+	}
+	b := NewUnifiedAgent("edge", "sys", &seamModel{tokens: charTokens}, WithState(&st))
+	if !b.applyReadyPrecompress(context.Background()) {
+		t.Fatal("the reloaded offer was not applied")
+	}
+	if b.state.Summary != "the notes" || len(b.state.Context) != 4 || b.state.SummaryOffer != nil {
+		t.Fatalf("summary %q, %d messages kept, offer %+v", b.state.Summary, len(b.state.Context), b.state.SummaryOffer)
+	}
+}
+
 func TestApplySummaryStale(t *testing.T) {
 	a, snap, _, _ := tailFixture(t)
 	a.state.Summary = "compacted meanwhile"

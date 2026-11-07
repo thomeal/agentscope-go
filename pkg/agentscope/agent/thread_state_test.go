@@ -987,7 +987,7 @@ func TestPrecompressChargesThreadMessages(t *testing.T) {
 		}
 		a.state.PeerSummary = peer
 		// A 2000-token window with a 0.225 reserve ratio reserves 450 tokens.
-		cfg := (&ContextConfig{ContextSize: 2000, TriggerRatio: 0.8, ReserveRatio: 0.225, PrecompressRatio: 0.5}).withDefaults()
+		cfg := (&ContextConfig{ContextSize: 2000, TriggerRatio: 0.8, ReserveRatio: 0.225, PrecompressRatio: 0.5, ThreadSummaryTokens: -1}).withDefaults()
 		a.maybeArmPrecompress(context.Background(), &cfg, 2000, 1500)
 		p := waitPrecompress(t, a)
 		if p == nil {
@@ -1063,13 +1063,80 @@ func TestThreadSummaryTokensSharesTheBudget(t *testing.T) {
 		t.Fatalf("reserve = %d, want %d + %d", got, base, thread)
 	}
 
-	plain := NewUnifiedAgent("b", "sys", m, WithContextConfig(&ContextConfig{ContextSize: 8000}))
-	plain.state.Summary = strings.Repeat("o", 8000)
-	if err := plain.ApplyThreadUpdate(ctx, ThreadUpdate{PeerSummary: peer, Cursor: 3}); err != nil {
+	off := NewUnifiedAgent("b", "sys", m, WithContextConfig(&ContextConfig{ContextSize: 8000, ThreadSummaryTokens: -1}))
+	off.state.Summary = strings.Repeat("o", 8000)
+	if err := off.ApplyThreadUpdate(ctx, ThreadUpdate{PeerSummary: peer, Cursor: 3}); err != nil {
 		t.Fatal(err)
 	}
-	pc := plain.contextCfg.withDefaults()
-	if len(plain.state.Summary) != 8000 || plain.reserveTokens(&pc, 8000) != int(8000*pc.ReserveRatio) {
-		t.Fatal("without ThreadSummaryTokens nothing changes")
+	oc := off.contextCfg.withDefaults()
+	if len(off.state.Summary) != 8000 || off.reserveTokens(&oc, 8000) != int(8000*oc.ReserveRatio) {
+		t.Fatal("with ThreadSummaryTokens off nothing changes")
+	}
+}
+
+// TestThreadSummaryTokensAutoAndAtRunTime: zero sizes the budget at 3/8 of
+// the window, only while a peer summary is held; SetThreadSummaryTokens
+// changes it at run time and elides the own summary to the new share at once.
+func TestThreadSummaryTokensAutoAndAtRunTime(t *testing.T) {
+	m := &seamModel{tokens: func(msgs []*message.Msg) int {
+		n := 0
+		for _, x := range msgs {
+			n += len(msgText(x)) / 4
+		}
+		return n
+	}}
+	a := NewUnifiedAgent("a", "sys", m, WithContextConfig(&ContextConfig{ContextSize: 8192}))
+	c := a.contextCfg.withDefaults()
+	if got, want := a.ownSummaryBudget(&c, 8192), summaryMaxTokens(&c, 8192); got != want {
+		t.Fatalf("budget without a peer summary = %d, want the SummaryMaxTokens budget %d", got, want)
+	}
+	a.state.Summary = strings.Repeat("o", 12000)                      // 3,000 estimated tokens
+	peer := &PeerSummary{Text: strings.Repeat("p", 8000), Through: 3} // 2,000
+	if err := a.ApplyThreadUpdate(context.Background(), ThreadUpdate{PeerSummary: peer, Cursor: 3}); err != nil {
+		t.Fatal(err)
+	}
+	// 3/8 of 8,192 is 3,072; the peer summary leaves 1,072, above the
+	// 1,024-token SummaryMaxTokens budget of this window.
+	if got := a.ownSummaryBudget(&c, 8192); got != 1024 {
+		t.Fatalf("automatic own budget = %d, want 1024", got)
+	}
+	if n := len(a.state.Summary) / 4; n > 1100 || n < 1000 {
+		t.Fatalf("own summary is %d tokens next to the peer summary; want its 1,072-token share", n)
+	}
+	if got := a.ThreadView().SummaryTokens; got != 3072 {
+		t.Fatalf("reported automatic budget = %d, want 3072", got)
+	}
+	a.SetThreadSummaryTokens(2500)
+	if got := a.ThreadView().SummaryTokens; got != 2500 {
+		t.Fatalf("reported budget after SetThreadSummaryTokens(2500) = %d", got)
+	}
+	if got := a.ownSummaryBudget(&c, 8192); got != 500 {
+		t.Fatalf("own budget after SetThreadSummaryTokens(2500) = %d, want 500", got)
+	}
+	if n := len(a.state.Summary) / 4; n > 530 {
+		t.Fatalf("own summary is %d tokens after the budget fell; want its 500-token share", n)
+	}
+	a.SetThreadSummaryTokens(-1)
+	if got := a.ThreadView().SummaryTokens; got != 0 {
+		t.Fatalf("reported budget with the option off = %d", got)
+	}
+	if got, want := a.ownSummaryBudget(&c, 8192), summaryMaxTokens(&c, 8192); got != want {
+		t.Fatalf("budget with the option off = %d, want %d", got, want)
+	}
+}
+
+// TestThreadViewCompactAt: the view reports where automatic compression
+// fires, and 0 without a ContextConfig or a known window.
+func TestThreadViewCompactAt(t *testing.T) {
+	a := NewUnifiedAgent("a", "sys", &seamModel{tokens: charTokens}, WithContextConfig(&ContextConfig{ContextSize: 10000, TriggerRatio: 0.5}))
+	if got := a.ThreadView().CompactAt; got != 5000 {
+		t.Fatalf("CompactAt = %d, want 5000", got)
+	}
+	b := NewUnifiedAgent("b", "sys", &seamModel{tokens: charTokens}, WithContextConfig(&ContextConfig{ContextSize: 10000}))
+	if got := b.ThreadView().CompactAt; got != 8000 {
+		t.Fatalf("CompactAt with the default ratio = %d, want 8000", got)
+	}
+	if got := NewUnifiedAgent("c", "sys", &seamModel{tokens: charTokens}).ThreadView().CompactAt; got != 0 {
+		t.Fatalf("CompactAt without a ContextConfig = %d, want 0", got)
 	}
 }

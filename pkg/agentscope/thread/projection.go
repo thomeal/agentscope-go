@@ -70,6 +70,13 @@ type ProjectionSpec struct {
 	// IncludeOwn renders entries this participant wrote. Only crash recovery
 	// needs it; the participant otherwise already holds them.
 	IncludeOwn bool
+	// OwnBasedAfter, when positive, also renders the participant's own
+	// entries based on a seq after it, and its own progress entries that are
+	// still live: after a restart, what an activation wrote past the
+	// checkpoint may be missing from the context, and a checkpoint taken
+	// mid-run has the run's input (so the cursor) but maybe not its newest
+	// plan.
+	OwnBasedAfter uint64
 }
 
 // Projection is the result of Project.
@@ -96,25 +103,32 @@ type Projection struct {
 // Entries must be in seq order. It is a pure function.
 //
 // Summary entries are consumed but never rendered; they belong in a separate
-// summary slot. Entries covered by spec.Covered, and the participant's own
-// entries unless IncludeOwn, are skipped. Entries the zone may not read are
+// summary slot. Entries covered by spec.Covered, the participant's own
+// entries unless IncludeOwn (or OwnBasedAfter lets them through), and
+// progress entries a later entry replaces are skipped. Entries the zone may not read are
 // withheld: each run of consecutive withheld seqs becomes one gap message.
 // When MaxTokens is set the projection stops before the first message that
 // would exceed it; a first message that alone exceeds it is cut so the
-// projection always makes progress.
-func Project(entries []Entry, spec ProjectionSpec) Projection {
-	p := projector{spec: spec, count: spec.Count, out: Projection{Through: spec.After}}
+// projection always makes progress. Project does not change spec; a nil
+// spec is the zero one.
+func Project(entries []Entry, spec *ProjectionSpec) Projection {
+	if spec == nil {
+		spec = &ProjectionSpec{}
+	}
+	p := projector{spec: *spec, count: spec.Count, out: Projection{Through: spec.After}}
 	if p.count == nil {
 		p.count = estimateTokens
 	}
+	stale := staleProgress(entries)
 	for i := range entries {
 		e := &entries[i]
 		if e.Seq <= spec.After {
 			continue
 		}
-		skip := e.Kind == KindSummary ||
+		skip := e.Kind == KindSummary || stale[e.Seq] ||
 			spec.Covered.Covers(e.Seq) ||
-			(!spec.IncludeOwn && spec.Participant != "" && e.Origin.Participant == spec.Participant)
+			(!spec.IncludeOwn && spec.Participant != "" && e.Origin.Participant == spec.Participant &&
+				(spec.OwnBasedAfter == 0 || (e.BasedOn <= spec.OwnBasedAfter && e.Kind != KindProgress)))
 		if !skip && !spec.Zone.CanRead(e.EffectiveVisibility()) {
 			if n := len(p.run); n > 0 && p.run[n-1]+1 != e.Seq {
 				if !p.flushRun() {
@@ -143,6 +157,66 @@ func Project(entries []Entry, spec ProjectionSpec) Projection {
 	p.flushRun()
 	return p.out
 }
+
+// staleProgress returns the progress entries that a later entry in entries
+// replaces: a newer progress entry of the same run, or the run's end (its
+// reply, transfer, late report, task report or interrupted marker) unless
+// the run failed. The
+// newest progress of a failed run stays: it is what a failover or a restart
+// needs. Entries past the slice cannot replace anything, so a projection of
+// a prefix keeps the newest progress it holds.
+func staleProgress(entries []Entry) map[uint64]bool {
+	var stale map[uint64]bool
+	newest := make(map[string]uint64) // run -> its newest progress seq
+	ended := make(map[string]bool)
+	failed := make(map[string]bool)
+	for i := range entries {
+		e := &entries[i]
+		switch e.Kind {
+		case KindProgress:
+			if prev, ok := newest[e.Run]; ok {
+				if stale == nil {
+					stale = make(map[uint64]bool)
+				}
+				stale[prev] = true
+			}
+			newest[e.Run] = e.Seq
+		case KindMarker:
+			if run, ok := strings.CutPrefix(e.DedupKey, failedPrefix); ok {
+				failed[run] = true
+			} else if run, ok := strings.CutPrefix(e.DedupKey, interruptedPrefix); ok {
+				ended[run] = true
+			}
+		default:
+			for _, p := range runEndPrefixes {
+				if run, ok := strings.CutPrefix(e.DedupKey, p); ok {
+					ended[run] = true
+				}
+			}
+		}
+	}
+	for run, seq := range newest {
+		if ended[run] && !failed[run] {
+			if stale == nil {
+				stale = make(map[uint64]bool)
+			}
+			stale[seq] = true
+		}
+	}
+	return stale
+}
+
+// failedPrefix starts the dedup key of a run's failed marker; the rest is
+// the run's activation ID.
+const failedPrefix = "failed:"
+
+// interruptedPrefix starts the dedup key of the interrupted marker of an
+// activation: "interrupted:" + its ID.
+const interruptedPrefix = "interrupted:"
+
+// runEndPrefixes start the dedup keys of the entries that end a run; the
+// rest is the run's activation ID.
+var runEndPrefixes = []string{"reply:", "transfer:", "late:", taskReportPrefix}
 
 type projector struct {
 	spec  ProjectionSpec
@@ -259,7 +333,7 @@ func renderEntry(e *Entry) string {
 		head = fmt.Sprintf("[#%d reply from %s]", e.Seq, e.Origin)
 		inline = text
 		if d := e.Digest.Render(); d != "" {
-			extra = append(extra, "(tools: "+d+")")
+			extra = append(extra, "Tools:\n"+d)
 		}
 	case KindOwnerChange:
 		var o OwnerChange
@@ -295,6 +369,11 @@ func renderEntry(e *Entry) string {
 		}
 		if len(extra) > 0 {
 			inline, extra = extra[0], extra[1:]
+		}
+	case KindProgress:
+		head = fmt.Sprintf("[#%d progress of %s]", e.Seq, e.Origin)
+		if text != "" {
+			extra = append(extra, text)
 		}
 	case KindMarker:
 		kind := ""
@@ -358,14 +437,14 @@ const edgeIndexLineRunes = 80
 // entries an edge participant may read that are EdgeOnly, newest last, one
 // line each: "#101 user_input: <first line, at most 80 runes>". It keeps the
 // newest lines that fit in maxRunes (0 = unlimited) and starts with
-// "(N older entries omitted)" when it dropped some. Summary entries are not
-// listed. The result never exceeds maxRunes; it is empty when not even the
+// "(N older entries omitted)" when it dropped some. Summary and progress
+// entries are not listed. The result never exceeds maxRunes; it is empty when not even the
 // omission line fits.
 func EdgeIndex(entries []Entry, maxRunes int) string {
 	var lines []string
 	for i := range entries {
 		e := &entries[i]
-		if e.Kind == KindSummary || e.EffectiveVisibility() != EdgeOnly {
+		if e.Kind == KindSummary || e.Kind == KindProgress || e.EffectiveVisibility() != EdgeOnly {
 			continue
 		}
 		lines = append(lines, edgeIndexLine(e))

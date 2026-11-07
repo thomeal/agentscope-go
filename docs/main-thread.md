@@ -4,9 +4,10 @@ The experimental `thread` packages let a cloud agent and an edge (on-device)
 agent serve one continuous user session. Each keeps its own context, model and
 tools. They share an append-only log, the Main Thread, that holds only what
 was published: the user's input, the text the user actually saw, which tools
-ran (names and targets, never outputs), summaries one side wrote for the
-other's window, ownership changes, background tasks, reports, artifacts and
-markers. A Coordinator is the single writer of that log.
+ran (each call's name and arguments, cut at 200 characters, never outputs),
+summaries one side wrote for the other's window, ownership changes, background
+tasks and their progress, reports, artifacts and markers. A Coordinator is the
+single writer of that log.
 
 | Package | Role |
 |---|---|
@@ -67,16 +68,45 @@ The invariants the Coordinator keeps are listed in
 2. If an activation is running, the input is steering for the current owner and
    arrives at its next safe boundary (after a tool step, before the next model
    call). Routing only happens at a query boundary.
-3. Otherwise the router picks the owner. A change appends an owner change.
+3. Otherwise the router picks the owner. A change appends an owner change
+   based on the input.
 4. The Coordinator imports what the owner has not seen (see "Context and
    summaries"), then starts its reply. Events stream to the user.
 5. When the reply ends, the visible text and the tool digest are sealed into a
-   reply entry. An interrupted reply gets an `interrupted` marker; a failed one
-   after tool calls gets `unknown_effects`, then one failover to another
-   participant that may take the query, or `no_owner`. An input that found no
-   owner waits parked: it does not count toward `Limits.MaxPendingInputs`,
-   at most that many are kept (the oldest beyond that is retired and stays in
-   the log as context), and a later cycle imports it as context.
+   reply entry. An interrupted reply gets an `interrupted` marker. A failed
+   one gets a `failed` marker with the error (an edge error's text is
+   withheld), `unknown_effects` when it had called tools, then one failover
+   to another participant that may take the query, or `no_owner`. The entry
+   that ends the run (the `failed` or `interrupted` marker, else the reply)
+   lists the inputs it took besides its trigger (`Entry.Steered`): the
+   steering and the older inputs its cycle carried as context. An input that found no owner waits parked: it does
+   not count toward `Limits.MaxPendingInputs`, at most that many are kept (the
+   oldest beyond that is retired and stays in the log as context), and a
+   later cycle imports it as context.
+
+### Failover
+
+A user message never changes the route while an activation runs: it steers
+the running owner. The failover is the one automatic handover. When the
+owner fails, the Coordinator picks another participant that may take the
+query and queues its activation; if that participant is running a
+background task, the failover waits behind the task instead of interrupting
+it. The new owner's input is one line:
+
+```
+[cloud failed: <reason> (#41). You now answer the user: continue their request #37 "<the request, at most 120 characters>" from where cloud left off. What cloud did is in the summary and the entries above; its latest progress is #40.]
+```
+
+The import that goes with it (a clear with the newest peer summary for the
+edge, an incremental import otherwise) brings the `failed` marker and the
+failed run's last progress, so the new owner reads the error and the task
+state instead of being told them at length. The new owner also takes the
+inputs that steered the failed run, when it may read them; one it may not
+read (edge-only steering of an edge run that fails over to the cloud) starts
+its own cycle after the failover instead of being lost. Without a new owner
+the request ends with `no_owner`, and its steering with it. A failed wake
+does not fail over (its report was already answered); the inputs that
+steered it are queued again.
 
 ## Routing modes and the classifier layer
 
@@ -98,8 +128,15 @@ never blocks the user on the classifier.
 
 The classifier reads a fixed-size state, so it fits a small model's prompt
 (Piccolo's 8,192-token row): the query (cut to 1,500 tokens), the summary the
-cloud wrote for the edge window, recent published entries as text with their
-tool digests (tool calls and outputs never appear) and the participants. A
+cloud wrote for the edge window, recent published entries as text with the
+names of the tools each reply used (arguments and outputs never appear) and
+the participants. The hybrid question is stage 0's word for word, apart from
+the participant names. The participant descriptions are stage 0's too, with
+tool calls in place of the benchmark's records and the host's description in
+place of its record-ID line. The question carries no warning about the
+state's content, because the disclosure rules above run before the
+classifier is asked. A state that steers the classifier can cost
+quality or money, but cannot send an edge-only query to the cloud. A
 hosted classifier only sees shared entries and is not called for an edge-only
 query. A classifier configured as on-device (`Hosted: false`) is accepted only
 when its endpoint is an `http`/`https` URL on `localhost` or a loopback
@@ -107,8 +144,9 @@ address, or the offline fake; anything else needs `Hosted: true`.
 `route.BuildState` returns the exact state for logs.
 
 The three windows involved are therefore bounded separately: the cloud's own
-window (own summary at 0.6), the edge's 8K window (peer summary, index and
-budgeted imports) and the classifier's prompt (fixed state budget).
+window (own notes from 10,000 tokens, installed at its compaction line), the
+edge's 8K window (peer summary, index and budgeted imports) and the
+classifier's prompt (fixed state budget).
 
 ## Handing the foreground over
 
@@ -141,6 +179,19 @@ participant's cursor. `participant.Leased` wraps tools that touch shared
 resources (for example a file path) so two participants cannot use one at the
 same time.
 
+**Progress.** An agent with `agent.WithPlanTool` reports its plan with
+`update_plan`; each update becomes a `progress` entry of its run (edge-only
+for an edge participant), and the call stays out of the reply's tool digest.
+A projection shows only the newest progress of a run that is still going;
+once the run replied, transferred, reported, answered late or was
+interrupted, its progress drops out. A failed run keeps its last progress
+visible, which is what a failover or a recovery points at. A finished run's
+progress is not material the edge holds: a clear drops it instead of
+indexing it, and it never makes the edge private. The edge's progress of a
+running or failed run does count as private material when it is imported
+back into the edge, because the run may have read private data the
+Coordinator cannot see.
+
 ## A cloud master with sub-agents
 
 `participant.TeamParticipant` runs the cloud side as a master with members
@@ -167,25 +218,51 @@ the main request's tool choice and asks the model to rewrite if it calls a
 tool. The main thread is never touched by a fork
 (`agent.WithForkCapture`, `ForkSnapshot`, `ForkSummary`).
 
-* **Peer summary (for the edge).** After every `SummaryPolicy.PeerEvery`
-  tokens of growth (default 20,000), when the cloud hands the foreground to the
-  edge, or when the cloud's own summary falls due, a fork writes a summary for
-  the edge's window (its `SummaryBudget`, about 1K tokens) whenever the newest
-  one is outdated, and appends it as a `summary` entry with its coverage:
+* **Peer summary (for the edge).** At the end of a cloud reply, when what a
+  handover would bring the edge (its newest peer summary plus the entries
+  after it, plus what the reply added) reaches `SummaryPolicy.PeerRatio` of
+  the edge's window (default 0.8), so the edge can always take over within
+  its window, failover included; also when the cloud hands the foreground to
+  the edge, or when its own notes need a covering summary (below). A positive
+  `PeerEvery` adds a refresh every that many tokens of growth; it defaults to
+  20,000 only when the edge's window is unknown. The fork writes a summary
+  for the edge's window whenever the newest one is outdated, within the
+  edge's `SummaryBudget` or, when that is zero, 5/6 of the edge's local
+  summary total (2,560 tokens of an 8,192-token window; see below), and appends it as a `summary` entry with its coverage:
   through the cloud's last sealed entry, excluding edge-only entries and
   entries written by others after the cloud's cursor. The cloud imports what it
   lacks in full, so everything else up to its cursor is in the fork's snapshot.
   `ForkGuard` (participant option) runs the host's guardrail rules on every
   summary a fork writes, since a fork does not pass through the reply loop.
-* **Own summary (for the cloud).** When the cloud's input reaches 0.6 of its
-  window, a fork on the same snapshot writes the cloud's own summary, together
-  with a peer summary when the newest one is outdated: once the own summary
-  replaces the history, its tool work could no longer reach the edge. It is
-  applied between replies, only after the peer fork settled, keeping a recent
-  tail with intact tool pairs (`ApplySummary`). Compression of the cloud is
-  not synchronous on its main thread; the agent's own compression remains the
-  fallback when its window fills before a fork result is applied.
-* **Clear rule (edge takeover).** When the edge is about to run after another
+* **Own notes (for the cloud).** These follow Claude Code's session memory.
+  The first notes are forked once the cloud's input reaches
+  `SummaryPolicy.OwnInit` (default 10,000 tokens), then updated whenever the
+  input grew `OwnEvery` (default 5,000) since the last update; a compaction
+  lowers that baseline. The first fork writes the notes in fixed sections
+  (task, current state, files and identifiers, decisions, errors and fixes,
+  next steps). An update gets the current notes and answers only with
+  FIND/REPLACE edits (a section rewritten whole is one edit) or with
+  `NO CHANGES`, as Claude Code's memory update may only edit its notes file;
+  an answer that is neither, such as complete notes or a remark about them,
+  never replaces the notes. An answer that is not edits, an edit that does
+  not apply, or notes over `OwnMaxTokens` are sent back for one rewrite, and
+  an update that still fails leaves the notes as they were.
+  The notes are not applied when written: the Coordinator offers them to the
+  cloud (`Forker.OfferOwnSummary`, `agent.OfferSummary`), and the agent
+  installs them without a model call when its context reaches its own
+  compaction line, keeping a recent tail with intact tool pairs and
+  everything after the notes' snapshot. The offer is saved with the agent's
+  state, so a team master rebuilt for the next activation still holds it,
+  and notes that finish after the next activation built its master are
+  offered to that master, which matches them by message ID.
+  Notes are offered only once a peer summary covers their snapshot: once they
+  replace the history, its tool work could no longer reach the edge. Near the
+  compaction line (input plus `OwnEvery` reaching it) the peer fork runs on
+  the same snapshot. When an offer no longer matches the context, or the
+  context is still at the compaction line once the notes are in, the agent's
+  synchronous compression runs, as Claude Code falls back from its
+  session-memory compaction.
+* **Clear rule (edge handover).** When the edge is about to run after another
   participant held the foreground since the edge last acted, and the newest
   peer summary is newer than the edge's last activity, the edge's context is
   replaced in one update that goes with the activation: the peer summary, a
@@ -196,7 +273,7 @@ tool. The main thread is never touched by a fork
   chunked or compacted on the way in: what outgrows the window is the edge
   agent's own compression's job, as in any reply; nor is what reaches the edge
   during that reply (steering input, reports). A clear whose activation fails
-  is not recorded, and the next takeover clears again: an agent may have
+  is not recorded, and the next handover clears again: an agent may have
   applied it in memory without saving it, and applying it again is harmless,
   since it carries everything up to the new trigger. An edge that
   kept the foreground (for example while the cloud ran a background task for
@@ -212,12 +289,18 @@ tool. The main thread is never touched by a fork
   which entries to read with `thread_read`.
 
 * **Local summary budget.** The edge's own summary comes from its agent's
-  synchronous compression in the reply loop; nothing forks on the edge. Set
-  `agent.ContextConfig.ThreadSummaryTokens` on the edge agent (the plan's
-  proposal is 1,500 with a 1,000-token `SummaryBudget`): the own summary then
-  gets what the peer summary leaves, a newly arrived peer summary elides an
-  older own summary to that share at once, and the peer summary and index no
-  longer eat the recent tail's `ReserveRatio` share.
+  synchronous compression in the reply loop; nothing forks on the edge.
+  `agent.ContextConfig.ThreadSummaryTokens` is the budget the edge's own
+  summary shares with the peer summary it holds. Zero (the default) sizes it
+  from the window, 3/8 of it (3,072 tokens of an 8,192-token window; stage 0
+  used 3,000), applied while a peer summary is held. A positive value fixes
+  it, a negative one turns it off, and `UnifiedAgent.SetThreadSummaryTokens`
+  changes it at run time. The own summary gets what the peer summary leaves,
+  a newly arrived peer summary elides an older own summary to that share at
+  once, and the peer summary and index no longer eat the recent tail's
+  `ReserveRatio` share. The peer summary's own budget, when the edge's
+  descriptor leaves `SummaryBudget` at zero, is 5/6 of that total (stage 0:
+  2,500 of 3,000).
 
 The event list is opt-in (stage 0 measured no gain from it): with
 `CaptureOutputs` set on the cloud participant and `event_read` installed on the
@@ -232,7 +315,17 @@ private tools, or recorded while the edge context was private).
 * An edge participant's writes are `edge_only` while its context holds
   edge-only material, unless the host's `DisclosurePolicy` classifies the text
   (including the tool digest) as shareable. A clear that imports nothing
-  edge-only resets this.
+  edge-only resets this, unless the private edge agent keeps a plan across
+  the clear (the plan may name what a private run read): it then stays
+  private until a clear finds it without a plan. A plan never makes an edge
+  private that was not.
+* The edge agent saves this privacy in its checkpoint (`AgentState.Private`),
+  in the same state that holds what made it private. A Sync that imports
+  edge-only material carries `Sync.Private`; the participant's privacy probe
+  (`agent.WithPrivacyProbe`) marks every checkpoint written after the run took
+  an edge-only trigger or import, read an edge-only entry or ran a private
+  tool; and the run's end sets the flag once more. `ParticipantState.Private`
+  reports it.
 * Tools listed as tainting (web fetch, search, mail) mark the activation and
   its entries `Tainted`; importing a tainted entry taints the importer. With
   `agent.WithTaintGate` and a permission engine, a tainted agent's allowed
@@ -321,10 +414,51 @@ the directory when it creates the file); a torn final line is dropped on open,
 anything else malformed is an error. After an fsync failure the batch may or
 may not be durable, so the store refuses further writes. Duplicate
 writes with the same dedup key are idempotent. On restart the owner and epoch
-come from the log, participants' cursors from their agent checkpoints, and a
-user input left without an answer gets a `recovered` marker. It is not re-run,
-because its effects are unknown; a background task left without a report gets a
-report saying it did not finish. A participant accepts one Coordinator at a
+come from the log, and participants' cursors from their agent checkpoints.
+
+Cycles run one at a time, so the stopped process was answering one turn:
+one cycle and the inputs that steered it or waited for it. A routing owner
+change is based on its input, but the router writes one only when the owner
+changes, and a run writes nothing before it ends unless it reports
+progress. So the turn holds every open input that no entry is based on,
+wherever it stands in the log (an input sent while the previous reply was
+still streaming, or right after an interrupt, ran after that reply or
+marker), and the open requests with an entry after the newest finished
+request (such as an input skipped by an earlier cycle that got its own
+cycle afterwards). The owner resumes the turn's requests it may take as
+one: the newest of them that an entry is based on (an owner change,
+progress, a marker), else the newest, with the others joined to it. An
+input a failed or interrupted run listed (`Entry.Steered`) goes with that
+run's request: it is joined when the request is resumed and ends when the
+request ended without an answer.
+
+The owner gets a `restarted` marker and an input that quotes the request
+and the inputs joined to it, the host's `Config.RecoveryNote` (why the
+process stopped, on one line), the failure before the restart if any, and
+the latest progress. The input also warns that work done before the restart
+may or may not have taken effect, so the owner checks the actual state
+before redoing anything. The marker is shared whenever the request is, so
+the recovery note must never hold edge-only material. After the restart an
+edge counts as private exactly when its checkpoint says so
+(`ParticipantState.Private`): a run's private reading, also one the stop cut
+off, is saved with the flag, and the log shows neither. A custom edge
+participant must report the flag from its restored state. If the owner is gone
+or may take none of the turn's requests, the turn's routing never finished:
+its request is routed again behind a `requeue:` marker that counts the
+restart. A turn input the owner may not take that nothing is based on never
+ran on it and is queued again as Submit would queue it (an edge-only input
+is routed on its own after the cloud's resumed run); one that something is
+based on, and an open request whose entries all precede the newest finished
+one, gets a `recovered` marker and is not re-run. A run that ends normally
+with no text and no tool calls writes no reply, so recovery cannot tell it
+finished; such a request is taken as in flight. After two restarts of the same
+request it gets a `recovered` marker on its newest restart and waits for
+the next message, and the inputs that would have joined it get `recovered`
+markers too. Every marker has a dedup key of its own, so repeated restarts
+are each recorded. A background task left without a report gets a report
+saying it did not finish, which points at its last progress. A restored
+participant re-imports its own entries past its checkpoint, its live progress
+included. A participant accepts one Coordinator at a
 time: `Coordinator.Close` releases the participants from this package
 (`thread.Releaser`), so a new Coordinator over the reopened log can bind them
 again. A graceful `Close` seals a running reply as interrupted instead of
@@ -342,8 +476,22 @@ leaving it for recovery.
   Claude Code session-memory style the cloud's forks follow) is stable enough
   on a weak local model has not been evaluated; compare the two on task
   correctness and cloud cost before changing the edge's default.
-* Steering inputs delivered mid-reply leave no trace on the reply entry; after
-  a restart one can receive a harmless `recovered` marker.
+* The cloud's own notes are scheduled at the end of each reply; Claude Code
+  checks after every model response, so a long tool-heavy reply here can
+  reach the compaction line before its notes are due, and the agent then
+  compresses synchronously.
+* Resuming a request after a restart cannot tell which of its tool calls took
+  effect; the resumed owner is told to check the actual state.
+* An edge-only request the edge handed to the cloud through a Transfer is not
+  resumed on the cloud after a restart: the restart note would quote the
+  request. It is routed back to the edge behind a `requeue:` marker and
+  starts over there.
+* An edge agent built without `Prepare` has no privacy probe: a checkpoint it
+  saves during a reply lacks that reply's privacy, which is saved when the
+  activation ends. A crash in between restores the edge as shared.
+* A plan the edge agent keeps across clears keeps the edge private until a
+  clear finds it without a plan, even when the plan no longer names private
+  data.
 * Providers that report no usage show up as unknown usage; the agent's
   per-call event reports zeros in that case, which the participant treats as
   unknown.

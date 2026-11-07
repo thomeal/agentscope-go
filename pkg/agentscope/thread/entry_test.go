@@ -23,7 +23,7 @@ func TestEntryJSONRoundTrip(t *testing.T) {
 			message.DataBlock{Type: "data", ID: "d1", Name: "chart.png", Source: message.Base64Source{Type: "base64", Data: "aGk=", MediaType: "image/png"}},
 			message.DataBlock{Type: "data", ID: "d2", Source: message.URLSource{Type: "url", URL: "https://example.com/a.mp3", MediaType: "audio/mpeg"}},
 		},
-		Digest:   &ToolDigest{Calls: []ToolCallDigest{{Name: "Read", Target: "a.go", Count: 2}}},
+		Digest:   &ToolDigest{Calls: []ToolCallDigest{{Name: "Read", Args: `{"path":"a.go"}`}}},
 		Refs:     []ArtifactRef{{URI: "file:///chart.png", Summary: "chart", Size: 2048}},
 		Coverage: &Coverage{Through: 4, Excluded: []uint64{3}},
 		Summary:  &SummaryMeta{Target: "edge", Budget: 900, Lossy: true},

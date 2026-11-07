@@ -1,6 +1,7 @@
 package thread
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -42,13 +43,13 @@ func TestProjectRendersEveryKind(t *testing.T) {
 		{"user input", at1(12, userInput("hello")), "[#12 user] hello"},
 		{"tainted user input", tainted(at1(12, userInput("hello"))), "[#12 user] (untrusted source) hello"},
 		{"reply with digest", Entry{Seq: 13, Kind: KindReply, Origin: cloudMaster, Visibility: Shared, Content: textBlocks("done"),
-			Digest: &ToolDigest{Calls: []ToolCallDigest{{Name: "Read", Target: "a.go", Count: 2}, {Name: "Grep", Count: 1}}}},
-			"[#13 reply from cloud/master] done\n(tools: Read a.go ×2, Grep)"},
+			Digest: &ToolDigest{Calls: []ToolCallDigest{{Name: "Read", Args: `{"path":"a.go"}`}, {Name: "Grep"}}}},
+			"[#13 reply from cloud/master] done\nTools:\nRead {\"path\":\"a.go\"}\nGrep"},
 		{"reply without digest", Entry{Seq: 13, Kind: KindReply, Origin: cloudMaster, Visibility: Shared, Content: textBlocks("done")},
 			"[#13 reply from cloud/master] done"},
 		{"reply with only a digest", Entry{Seq: 13, Kind: KindReply, Origin: cloudMaster, Visibility: Shared,
-			Digest: &ToolDigest{Calls: []ToolCallDigest{{Name: "Bash", Count: 1}}}},
-			"[#13 reply from cloud/master]\n(tools: Bash)"},
+			Digest: &ToolDigest{Calls: []ToolCallDigest{{Name: "Bash"}}}},
+			"[#13 reply from cloud/master]\nTools:\nBash"},
 		{"owner change with brief", Entry{Seq: 14, Kind: KindOwnerChange, Visibility: Shared,
 			Owner: &OwnerChange{From: "edge", To: "cloud", Reason: ReasonTransfer, Brief: &Brief{Goal: "fix", Remaining: []string{"test"}}}},
 			"[#14 foreground: edge → cloud, reason transfer]\nBrief:\nGoal: fix\nRemaining:\n- test"},
@@ -76,7 +77,7 @@ func TestProjectRendersEveryKind(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := Project([]Entry{tc.entry}, ProjectionSpec{Participant: "observer", Zone: ZoneEdge})
+			p := Project([]Entry{tc.entry}, &ProjectionSpec{Participant: "observer", Zone: ZoneEdge})
 			if len(p.Messages) != 1 {
 				t.Fatalf("%d messages, want 1", len(p.Messages))
 			}
@@ -144,7 +145,7 @@ func TestProjectWithheldRuns(t *testing.T) {
 		tainted(edgeOnly(at1(7, report("edge", "secret")))),
 		edgeOnly(at1(8, report("edge", "secret"))),
 	}
-	p := Project(entries, ProjectionSpec{Participant: "cloud", Zone: ZoneCloud})
+	p := Project(entries, &ProjectionSpec{Participant: "cloud", Zone: ZoneCloud})
 	want := []string{
 		"[#1 user] a",
 		"[#2–#3 withheld: edge-only entries]",
@@ -173,7 +174,7 @@ func TestProjectWithheldRuns(t *testing.T) {
 
 	// The edge reads every entry; edge-only ones say so, including the one
 	// with no visibility set.
-	for _, m := range Project(entries, ProjectionSpec{Participant: "edge2", Zone: ZoneEdge}).Messages {
+	for _, m := range Project(entries, &ProjectionSpec{Participant: "edge2", Zone: ZoneEdge}).Messages {
 		seq := m.Metadata[SeqMetadataKey].(uint64)
 		want := entries[seq-1].EffectiveVisibility()
 		if v, ok := MsgVisibility(m); !ok || v != want {
@@ -190,13 +191,13 @@ func TestProjectWithheldRuns(t *testing.T) {
 	}
 
 	// The edge reads every entry.
-	edge := Project(entries, ProjectionSpec{Participant: "edge2", Zone: ZoneEdge})
+	edge := Project(entries, &ProjectionSpec{Participant: "edge2", Zone: ZoneEdge})
 	if len(edge.Messages) != 7 || len(edge.Withheld) != 0 || !edge.Tainted {
 		t.Errorf("edge projection: %d messages, withheld %v, tainted %v", len(edge.Messages), edge.Withheld, edge.Tainted)
 	}
 
 	// A hole in the input splits the run.
-	holes := Project([]Entry{edgeOnly(at1(2, userInput("x"))), edgeOnly(at1(4, userInput("y")))}, ProjectionSpec{Zone: ZoneCloud})
+	holes := Project([]Entry{edgeOnly(at1(2, userInput("x"))), edgeOnly(at1(4, userInput("y")))}, &ProjectionSpec{Zone: ZoneCloud})
 	if got := texts(holes.Messages); !reflect.DeepEqual(got, []string{"[#2 withheld: edge-only entry]", "[#4 withheld: edge-only entry]"}) {
 		t.Errorf("runs across a hole: %q", got)
 	}
@@ -237,7 +238,7 @@ func TestProjectSkips(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s := spec
 			tc.mutate(&s)
-			p := Project(entries, s)
+			p := Project(entries, &s)
 			if got := texts(p.Messages); !reflect.DeepEqual(got, tc.want) && (len(got) > 0 || len(tc.want) > 0) {
 				t.Fatalf("messages\n got %q\nwant %q", got, tc.want)
 			}
@@ -248,9 +249,69 @@ func TestProjectSkips(t *testing.T) {
 	}
 
 	// Skipped entries at the end still move the cursor.
-	p := Project(entries[:6], ProjectionSpec{Participant: "edge", Zone: ZoneEdge, After: 3})
+	p := Project(entries[:6], &ProjectionSpec{Participant: "edge", Zone: ZoneEdge, After: 3})
 	if p.Through != 6 || len(p.Messages) != 1 {
 		t.Errorf("trailing skips: through %d with %d messages, want 6 with 1", p.Through, len(p.Messages))
+	}
+}
+
+// TestProjectShowsOnlyLiveProgress: a projection renders the newest progress
+// entry of a run, and none of a run that ended unless it failed. A restored
+// participant's own live progress comes back even when it is based on its
+// cursor.
+func TestProjectShowsOnlyLiveProgress(t *testing.T) {
+	progress := func(seq uint64, who, run, plan string) Entry {
+		return at1(seq, Entry{Kind: KindProgress, Origin: Origin{Participant: who}, Visibility: Shared, BasedOn: 1, Run: run,
+			Content: textBlocks(plan), DedupKey: fmt.Sprintf("progress:%s:%d", run, seq)})
+	}
+	end := func(seq uint64, e Entry, key string) Entry {
+		e.DedupKey = key
+		return at1(seq, e)
+	}
+	failed := markerEntry(MarkerFailed, 1, "cloud failed: down")
+	entries := []Entry{
+		at1(1, userInput("plan my day")),
+		progress(2, "cloud", "a", "a: first"),
+		progress(3, "cloud", "a", "a: second"),
+		progress(4, "cloud", "b", "b: only"),
+		end(5, replyFrom("cloud", "b done"), "reply:b"),
+		progress(6, "cloud", "c", "c: only"),
+		end(7, replyFrom("cloud", "c partial"), "reply:c"),
+		end(8, failed, "failed:c"),
+		progress(9, "edge", "d", "d: mine"),
+	}
+	p := Project(entries, &ProjectionSpec{Participant: "edge", Zone: ZoneEdge})
+	want := []string{
+		"[#1 user] plan my day",
+		"[#3 progress of cloud]\na: second",
+		"[#5 reply from cloud/master] b done",
+		"[#6 progress of cloud]\nc: only",
+		"[#7 reply from cloud/master] c partial",
+		"[#8 marker failed] cloud failed: down",
+	}
+	if got := texts(p.Messages); !reflect.DeepEqual(got, want) {
+		t.Fatalf("messages\n got %q\nwant %q", got, want)
+	}
+	if p.Through != 9 {
+		t.Fatalf("through %d, want 9", p.Through)
+	}
+	// After a restart the participant's own live progress comes back, though
+	// it is based on the cursor; its other own entries there do not.
+	p = Project(entries, &ProjectionSpec{Participant: "edge", Zone: ZoneEdge, After: 8, OwnBasedAfter: 1})
+	if got := texts(p.Messages); !reflect.DeepEqual(got, []string{"[#9 progress of edge]\nd: mine"}) {
+		t.Fatalf("restored own progress: %q", got)
+	}
+	// A run that published one plan and ended leaves no progress; a nil spec
+	// is the zero one.
+	short := []Entry{at1(1, userInput("hi")), progress(2, "cloud", "e", "e: only"), end(3, replyFrom("cloud", "e done"), "reply:e")}
+	if got := texts(Project(short, nil).Messages); !reflect.DeepEqual(got, []string{"[#1 user] hi", "[#3 reply from cloud/master] e done"}) {
+		t.Fatalf("ended run: %q", got)
+	}
+	// An interrupt that leaves no reply still ends the run.
+	stopped := []Entry{at1(1, userInput("hi")), progress(2, "cloud", "f", "f: only"),
+		end(3, markerEntry(MarkerInterrupted, 1, "cloud was interrupted while answering #1"), interruptedPrefix+"f")}
+	if got := texts(Project(stopped, nil).Messages); len(got) != 2 || strings.Contains(strings.Join(got, "\n"), "f: only") {
+		t.Fatalf("interrupted run: %q", got)
 	}
 }
 
@@ -275,7 +336,7 @@ func TestProjectBudget(t *testing.T) {
 		{max: 10, messages: 1, through: 1, remaining: true},
 	}
 	for _, tc := range cases {
-		p := Project(entries, ProjectionSpec{Zone: ZoneEdge, MaxTokens: tc.max, Count: ten})
+		p := Project(entries, &ProjectionSpec{Zone: ZoneEdge, MaxTokens: tc.max, Count: ten})
 		if len(p.Messages) != tc.messages || p.Through != tc.through || p.Remaining != tc.remaining {
 			t.Errorf("max %d: %d messages through %d remaining %v; want %d through %d remaining %v",
 				tc.max, len(p.Messages), p.Through, p.Remaining, tc.messages, tc.through, tc.remaining)
@@ -284,17 +345,17 @@ func TestProjectBudget(t *testing.T) {
 
 	// A gap that does not fit is not consumed.
 	gap := Project([]Entry{at1(1, userInput("a")), edgeOnly(at1(2, userInput("b"))), at1(3, userInput("c"))},
-		ProjectionSpec{Zone: ZoneCloud, MaxTokens: 15, Count: ten})
+		&ProjectionSpec{Zone: ZoneCloud, MaxTokens: 15, Count: ten})
 	if len(gap.Messages) != 1 || gap.Through != 1 || len(gap.Withheld) != 0 || !gap.Remaining {
 		t.Errorf("gap over budget: %d messages through %d withheld %v remaining %v", len(gap.Messages), gap.Through, gap.Withheld, gap.Remaining)
 	}
 	trailing := Project([]Entry{at1(1, userInput("a")), edgeOnly(at1(2, userInput("b")))},
-		ProjectionSpec{Zone: ZoneCloud, MaxTokens: 15, Count: ten})
+		&ProjectionSpec{Zone: ZoneCloud, MaxTokens: 15, Count: ten})
 	if trailing.Through != 1 || !trailing.Remaining {
 		t.Errorf("trailing gap over budget: through %d remaining %v", trailing.Through, trailing.Remaining)
 	}
 	// A first gap message over budget is still emitted whole.
-	first := Project([]Entry{edgeOnly(at1(2, userInput("b")))}, ProjectionSpec{Zone: ZoneCloud, MaxTokens: 1})
+	first := Project([]Entry{edgeOnly(at1(2, userInput("b")))}, &ProjectionSpec{Zone: ZoneCloud, MaxTokens: 1})
 	if got := texts(first.Messages); len(got) != 1 || got[0] != "[#2 withheld: edge-only entry]" || first.Through != 2 {
 		t.Errorf("first gap over budget: %q through %d", got, first.Through)
 	}
@@ -303,14 +364,14 @@ func TestProjectBudget(t *testing.T) {
 func TestProjectCutsOversizeFirstMessage(t *testing.T) {
 	long := strings.Repeat("x", 400) + "TAIL"
 	entries := []Entry{at1(9, userInput(long)), at1(10, userInput("short"))}
-	p := Project(entries, ProjectionSpec{Zone: ZoneEdge, MaxTokens: 30})
+	p := Project(entries, &ProjectionSpec{Zone: ZoneEdge, MaxTokens: 30})
 	if len(p.Messages) != 1 || p.Through != 9 || !p.Remaining {
 		t.Fatalf("%d messages through %d remaining %v; want the cut entry alone", len(p.Messages), p.Through, p.Remaining)
 	}
 	if !reflect.DeepEqual(p.Cut, []uint64{9}) {
 		t.Fatalf("Cut = %v, want [9]", p.Cut)
 	}
-	if whole := Project(entries[1:], ProjectionSpec{Zone: ZoneEdge, MaxTokens: 30}); len(whole.Cut) != 0 {
+	if whole := Project(entries[1:], &ProjectionSpec{Zone: ZoneEdge, MaxTokens: 30}); len(whole.Cut) != 0 {
 		t.Fatalf("an entry that fits is reported cut: %v", whole.Cut)
 	}
 	got := msgText(p.Messages[0])
@@ -326,7 +387,7 @@ func TestProjectCutsOversizeFirstMessage(t *testing.T) {
 		t.Errorf("cut message counts %d tokens, budget 30", n)
 	}
 
-	tiny := Project(entries, ProjectionSpec{Zone: ZoneEdge, MaxTokens: 1})
+	tiny := Project(entries, &ProjectionSpec{Zone: ZoneEdge, MaxTokens: 1})
 	if got := texts(tiny.Messages); len(got) != 1 || got[0] != notice || tiny.Through != 9 {
 		t.Errorf("budget below the notice: %q through %d", got, tiny.Through)
 	}
@@ -334,13 +395,13 @@ func TestProjectCutsOversizeFirstMessage(t *testing.T) {
 
 func TestProjectTaint(t *testing.T) {
 	entries := []Entry{tainted(edgeOnly(at1(1, userInput("x")))), at1(2, userInput("y"))}
-	if p := Project(entries, ProjectionSpec{Zone: ZoneCloud}); p.Tainted {
+	if p := Project(entries, &ProjectionSpec{Zone: ZoneCloud}); p.Tainted {
 		t.Error("a withheld tainted entry tainted the projection")
 	}
-	if p := Project(entries, ProjectionSpec{Zone: ZoneEdge}); !p.Tainted {
+	if p := Project(entries, &ProjectionSpec{Zone: ZoneEdge}); !p.Tainted {
 		t.Error("a rendered tainted entry did not taint the projection")
 	}
-	covered := Project(entries, ProjectionSpec{Zone: ZoneEdge, Covered: &Coverage{Through: 1}})
+	covered := Project(entries, &ProjectionSpec{Zone: ZoneEdge, Covered: &Coverage{Through: 1}})
 	if covered.Tainted {
 		t.Error("a covered tainted entry tainted the projection")
 	}

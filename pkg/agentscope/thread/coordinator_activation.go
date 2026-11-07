@@ -20,6 +20,7 @@ const (
 	actFailover                    // a failover owner_change
 	actAssign                      // a background task
 	actWake                        // a Notify report waking the idle owner
+	actRecover                     // a request the stopped process was answering
 )
 
 var (
@@ -41,6 +42,11 @@ type activation struct {
 	failFrom   string
 	failReason string
 	userText   string
+	// failSeq and progress point a failover or a restart at the failed
+	// marker and the newest progress entry of the run it continues; 0 when
+	// there is none it may read.
+	failSeq  uint64
+	progress uint64
 	// cycleInput is the user_input this activation answers: the trigger of
 	// a routed input, passed on through Transfer and failover; 0 for wakes
 	// and tasks. Only such an activation fails over.
@@ -54,8 +60,19 @@ type activation struct {
 
 	started  bool
 	handedTo string // set when a Transfer of this activation sealed it
-	limited  bool   // Pending is budgeted
-	budget   int    // tokens Pending may still deliver when limited
+	// steered lists the user inputs it takes besides its trigger: older
+	// inputs its cycle carried as context, inputs a recovery joined to the
+	// request it resumes, inputs Pending delivered to it while it held the
+	// foreground, and a failed run's inputs its failover took over. The
+	// entry that ends it records them (Entry.Steered).
+	steered []*inputRec
+	// recoverWith are the user inputs a recovery joined to the request this
+	// activation resumes, in log order; its input quotes them.
+	recoverWith []*Entry
+	// progressN counts the progress entries it wrote.
+	progressN int
+	limited   bool // Pending is budgeted
+	budget    int  // tokens Pending may still deliver when limited
 	// eventsBefore is the TransferRequest.EventsBefore of the Transfer that
 	// sealed it; forwarded counts the Event items processed so far. While
 	// forwarded < eventsBefore after the Transfer, backlog is open and held
@@ -111,7 +128,7 @@ func (c *Coordinator) enqueueActivationLocked(a *activation) {
 // kickLocked starts the participant's next queued activation when it is
 // idle.
 func (c *Coordinator) kickLocked(ps *partState) {
-	if c.closed || ps.running != nil || ps.maint || len(ps.queue) == 0 {
+	if c.closed || ps.running != nil || len(ps.queue) == 0 {
 		return
 	}
 	a := ps.queue[0]
@@ -132,7 +149,7 @@ func (c *Coordinator) holdsForegroundLocked(a *activation) bool {
 // queued while the foreground is free.
 func (c *Coordinator) idleOwnerLocked(ps *partState) bool {
 	return !c.closed && c.owner == ps.name && ps.running == nil && len(ps.queue) == 0 &&
-		!ps.maint && c.fg == nil && !c.routing
+		c.fg == nil && !c.routing
 }
 
 // runActivation runs one activation from import to settlement.
@@ -215,12 +232,15 @@ func (c *Coordinator) execute(a *activation) (*ActivationEnd, bool) {
 		c.mu.Unlock()
 		return &ActivationEnd{Reason: types.ReplyError, Err: fmt.Errorf("thread: activate %s: %w", ps.name, err)}, true
 	}
+	// A participant that stays private after the clear (a plan it kept may
+	// name what a private run read) keeps the Coordinator's flag up too.
+	held := im.clear != nil && ps.p.State().Private
 	c.mu.Lock()
 	// The reply started, so its Sync was applied: a clear it carried is now
 	// in force, and a foreground activation holds everything up to its
 	// cursor.
 	if im.clear != nil {
-		c.commitClearLocked(ps, im.clear)
+		c.commitClearLocked(ps, im.clear, held)
 	}
 	if c.holdsForegroundLocked(a) {
 		through := max(st.Cursor, a.trigger.Seq)
@@ -242,6 +262,11 @@ func (c *Coordinator) execute(a *activation) (*ActivationEnd, bool) {
 		case ev.Event != nil:
 			n++
 			c.forwardAgent(a, &ev, n)
+			if ev.Path == "" {
+				if plan := planText(ev.Event); plan != "" {
+					c.recordProgress(a, plan)
+				}
+			}
 		}
 	}
 	c.mu.Lock()
@@ -311,10 +336,11 @@ func (c *Coordinator) flushBacklogLocked(a *activation, force bool) {
 // commitClearLocked records a clear whose reset the participant applied:
 // the summary it now holds, the summary's seq (so the same summary does not
 // clear it again), and its privacy, lowered only when nothing set it since
-// the import marked it.
-func (c *Coordinator) commitClearLocked(ps *partState, cc *clearCommit) {
+// the import marked it and the participant itself (held) did not stay
+// private.
+func (c *Coordinator) commitClearLocked(ps *partState, cc *clearCommit, held bool) {
 	if ps.privGen == cc.gen {
-		ps.private = cc.private
+		ps.private = cc.private || held
 	}
 	ps.heldCoverage = cloneCoverage(cc.coverage)
 	ps.resetFrom = cc.seq
@@ -342,7 +368,9 @@ func (c *Coordinator) inputText(a *activation) string {
 		}
 		return "[The foreground was handed to you by " + from + "]\n" + brief.Render() + "\nContinue with the user from here."
 	case actFailover:
-		return fmt.Sprintf("[%s failed: %s. Continue the user's request below.]\n%s", a.failFrom, a.failReason, a.userText)
+		return failoverNote(a)
+	case actRecover:
+		return restartNote(a, c.cfg.RecoveryNote)
 	case actAssign:
 		id, origin := "", t.Origin.Participant
 		if t.Task != nil {
@@ -377,6 +405,7 @@ type sealFacts struct {
 	vis         Visibility
 	avail       map[string]bool
 	edgeTainted bool
+	failed      uint64 // the failed marker the seal wrote, 0 when none
 }
 
 // finish seals the end, releases leases, runs summary bookkeeping and
@@ -523,14 +552,26 @@ func (c *Coordinator) classify(ctx context.Context, content string) (Visibility,
 	return EdgeOnly, true
 }
 
+// steeredSeqs returns the seqs of the user inputs a took besides its
+// trigger.
+func (a *activation) steeredSeqs() []uint64 {
+	var out []uint64
+	for _, r := range a.steered {
+		out = append(out, r.entry.Seq)
+	}
+	return out
+}
+
 // sealForegroundLocked seals the end of the activation holding the
-// foreground and releases the foreground.
+// foreground and releases the foreground. The entry that ends the run
+// records the inputs it took (Entry.Steered): its failed or interrupted
+// marker, else its reply.
 func (c *Coordinator) sealForegroundLocked(a *activation, end *ActivationEnd, reason types.ReplyFinishedReason, f *sealFacts) {
 	ps := a.part
 	t := a.trigger.Seq
 	var batch []Entry
 	if strings.TrimSpace(end.Text) != "" || cloneDigest(end.Digest) != nil {
-		batch = append(batch, Entry{
+		rep := Entry{
 			Kind:       KindReply,
 			Origin:     Origin{Participant: ps.name},
 			Visibility: f.vis,
@@ -539,10 +580,23 @@ func (c *Coordinator) sealForegroundLocked(a *activation, end *ActivationEnd, re
 			Digest:     cloneDigest(end.Digest),
 			Tainted:    end.Tainted,
 			DedupKey:   "reply:" + a.id,
-		})
+		}
+		if !isFailure(reason) {
+			rep.Steered = a.steeredSeqs()
+		}
+		batch = append(batch, rep)
+	}
+	if reason == types.ReplyError {
+		mk := markerEntry(MarkerFailed, t, failDetail(ps, end.Err))
+		mk.DedupKey = failedPrefix + a.id
+		mk.Steered = a.steeredSeqs()
+		batch = append(batch, mk)
 	}
 	if reason == types.ReplyInterrupted {
-		batch = append(batch, markerEntry(MarkerInterrupted, t, fmt.Sprintf("%s was interrupted while answering #%d", ps.name, t)))
+		mk := markerEntry(MarkerInterrupted, t, fmt.Sprintf("%s was interrupted while answering #%d", ps.name, t))
+		mk.DedupKey = interruptedPrefix + a.id
+		mk.Steered = a.steeredSeqs()
+		batch = append(batch, mk)
 	}
 	if isFailure(reason) && end.ToolCalls > 0 {
 		batch = append(batch, unknownEffects(ps.name, end.ToolCalls, t))
@@ -550,18 +604,30 @@ func (c *Coordinator) sealForegroundLocked(a *activation, end *ActivationEnd, re
 	if len(batch) > 0 {
 		stored := c.commitLocked(ps.name, batch, &Guard{Owner: ps.name, Epoch: a.epoch})
 		for i := range stored {
-			if e := &stored[i]; e.Kind == KindReply {
+			switch e := &stored[i]; {
+			case e.Kind == KindReply:
 				ps.lastSealed = e.Seq
 				if e.Visibility == EdgeOnly {
 					ps.raisePrivateLocked()
 				}
+			case e.Kind == KindMarker && e.Marker.Kind == MarkerFailed:
+				f.failed = e.Seq
 			}
 		}
 	}
 	c.fg = nil
 	c.fgCancel = nil
-	if reason == types.ReplyError && !c.closed && c.answersCycleLocked(a) {
-		c.failoverLocked(a, end, f)
+	if reason == types.ReplyError && !c.closed {
+		if c.answersCycleLocked(a) {
+			c.failoverLocked(a, end, f)
+		} else {
+			// A failed wake does not fail over: the user's messages it took
+			// are queued again instead of being lost.
+			for _, r := range a.steered {
+				r.parked, r.skipped = false, false
+				c.queueInputLocked(r)
+			}
+		}
 	}
 	c.maybeStartCycleLocked()
 }
@@ -581,7 +647,9 @@ func unknownEffects(who string, calls int, basedOn uint64) Entry {
 
 // failoverLocked moves the foreground away from a failed owner, once per
 // query cycle, to another available participant that may take the cycle's
-// input. Without one it writes a no_owner marker.
+// input. The new owner takes the failed run's other inputs it may read; the
+// rest start their own cycle after it, as skipped inputs do. Without a new
+// owner it writes a no_owner marker, and those inputs end with the request.
 func (c *Coordinator) failoverLocked(a *activation, end *ActivationEnd, f *sealFacts) {
 	from := a.part
 	t := a.trigger.Seq
@@ -616,7 +684,32 @@ func (c *Coordinator) failoverLocked(a *activation, end *ActivationEnd, f *sealF
 	na.failReason = failReason(from, to, end.Err)
 	na.userText = c.cycle.text
 	na.cycleInput = a.cycleInput
+	na.failSeq = f.failed
+	if p := c.cycle.progress; p != nil && to.desc.Zone.CanRead(p.EffectiveVisibility()) {
+		na.progress = p.Seq
+	}
+	for _, r := range a.steered {
+		if to.desc.Zone.CanRead(r.entry.EffectiveVisibility()) {
+			na.steered = append(na.steered, r)
+			continue
+		}
+		r.skipped, r.parked = true, false
+		c.queueInputLocked(r)
+	}
 	c.startForegroundLocked(na)
+}
+
+// failDetail is what the failed marker says. The log is shared, so an edge
+// error's own text is left out: it may name private data.
+func failDetail(ps *partState, err error) string {
+	why := "its activation ended with an error"
+	switch {
+	case errors.Is(err, errUnavailable):
+		why = "it is unavailable"
+	case err != nil && ps.desc.Zone != ZoneEdge:
+		why = truncateRunes(oneLine(err.Error()), 200)
+	}
+	return ps.name + " failed: " + why
 }
 
 // failReason explains a failure to the participant taking over. An edge
@@ -810,21 +903,6 @@ func (c *Coordinator) settle(a *activation) {
 		c.checkAddressedLocked(owner, ownerCur)
 	}
 	c.kickLocked(ps)
-	// An own summary that finished after afterEnd looked for one, while
-	// the activation was still running, is applied now that the
-	// participant is idle; it is not left for the end of its next
-	// activation.
-	if own := ps.pendingOwn; own != nil && ps.running == nil && !ps.maint && !c.closed {
-		ps.pendingOwn = nil
-		ps.maint = true
-		c.addWorkLocked()
-		c.wg.Add(1)
-		go func() {
-			defer c.wg.Done()
-			c.applyOwn(ps, own)
-			c.endMaint(ps)
-		}()
-	}
 	c.doneWorkLocked()
 }
 

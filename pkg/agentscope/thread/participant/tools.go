@@ -543,7 +543,7 @@ func (c *core) renderForRead(one []thread.Entry) string {
 		}
 		return fmt.Sprintf("[#%d summary from %s%s%s]\n%s", e.Seq, e.Origin, target, through, e.Text())
 	}
-	p := thread.Project(one, thread.ProjectionSpec{Participant: c.desc.Name, Zone: c.desc.Zone, IncludeOwn: true})
+	p := thread.Project(one, &thread.ProjectionSpec{Participant: c.desc.Name, Zone: c.desc.Zone, IncludeOwn: true})
 	parts := make([]string, 0, len(p.Messages))
 	for _, m := range p.Messages {
 		if t := m.GetTextContent("\n"); t != nil {

@@ -173,6 +173,7 @@ func (h *coordHost) Transfer(ctx context.Context, req TransferRequest) (uint64, 
 	defer c.mu.Unlock()
 	t := a.trigger.Seq
 	var batch []Entry
+	steered := a.steeredSeqs()
 	if strings.TrimSpace(req.Text) != "" || cloneDigest(req.Digest) != nil {
 		batch = append(batch, Entry{
 			Kind:       KindReply,
@@ -182,8 +183,10 @@ func (h *coordHost) Transfer(ctx context.Context, req TransferRequest) (uint64, 
 			Content:    textContent(req.Text),
 			Digest:     cloneDigest(req.Digest),
 			Tainted:    req.Tainted,
+			Steered:    steered,
 			DedupKey:   "reply:" + a.id,
 		})
+		steered = nil
 	}
 	b := req.Brief
 	batch = append(batch, Entry{
@@ -191,6 +194,7 @@ func (h *coordHost) Transfer(ctx context.Context, req TransferRequest) (uint64, 
 		Origin:     req.From,
 		Visibility: briefVis,
 		BasedOn:    t,
+		Steered:    steered,
 		Owner:      &OwnerChange{From: h.ps.name, To: to.name, Reason: ReasonTransfer, Brief: cloneBrief(&b)},
 		Tainted:    req.Tainted,
 		DedupKey:   "transfer:" + a.id,

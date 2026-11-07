@@ -302,6 +302,10 @@ func validateEntry(e *Entry) error {
 		if e.Marker == nil {
 			return errors.New("thread: marker needs a marker payload")
 		}
+	case KindProgress:
+		if strings.TrimSpace(e.Run) == "" {
+			return errors.New("thread: progress needs the run it reports on")
+		}
 	default:
 		return fmt.Errorf("thread: unknown entry kind %q", e.Kind)
 	}
@@ -426,6 +430,7 @@ func cloneEntry(e *Entry) Entry {
 	c.To = slices.Clone(e.To)
 	c.Content = cloneBlocks(e.Content)
 	c.Refs = slices.Clone(e.Refs)
+	c.Steered = slices.Clone(e.Steered)
 	if e.Digest != nil {
 		d := *e.Digest
 		d.Calls = slices.Clone(d.Calls)

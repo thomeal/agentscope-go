@@ -295,7 +295,14 @@ import, read, brief or classifier state. `thread/participant` adapts
 `types.ReplyHandedOff` ends a reply after a committed transfer and, like an
 interrupted end, cannot be swallowed by `OnReply`. A participant fails
 `Activate` when its Sync was not applied; no Sync moves the cursor back (an
-edge clear is one Reset Sync with the activation). Agents match external results and confirmations by reply ID too,
+edge clear is one Reset Sync with the activation). A failed owner's request
+fails over to the other side, queued behind any task running there (no
+takeover); a crash resumes the newest unanswered request on its owner. The
+cloud's own notes are offered (`OfferSummary`, checkpointed) and installed
+at its compression trigger. An edge agent's privacy is checkpointed with
+what caused it (`AgentState.Private`: `Sync.Private` and the participant's
+`WithPrivacyProbe`, asked before every checkpoint), and recovery trusts it
+instead of the log. Agents match external results and confirmations by reply ID too,
 since tool-call IDs can repeat across replies. Checkpoints carry schema 3
 only when thread state is set. See [Main Thread](docs/main-thread.md).
 
@@ -344,7 +351,8 @@ overview head and next-steps tail survive.
 moves summarization latency off the reply's critical path: crossing the lower
 ratio starts a background generation from a context snapshot
 ([precompress.go](pkg/agentscope/agent/precompress.go)), and the hard trigger
-applies a still-valid result without a blocking model call. Validity is
+applies a still-valid result without a blocking model call (and still
+compresses synchronously when the context stays at the threshold). Validity is
 structural — same base summary plus the snapshot's boundary message identity
 — so checkpoint rollbacks and interleaved compactions safely discard it; the
 reserved suffix keeps the LIVE message versions so in-place truncation from

@@ -12,13 +12,6 @@ import (
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/types"
 )
 
-// ownResult is an own summary waiting to be applied while its participant
-// is idle.
-type ownResult struct {
-	snap Snapshot
-	text string
-}
-
 // forkJob is one background summary job of a Forker participant: a peer
 // fork, an own fork, or both, on the same snapshot.
 type forkJob struct {
@@ -26,6 +19,9 @@ type forkJob struct {
 	ps     *partState
 	snap   Snapshot
 	growth int // growth when the job started; a successful peer fork subtracts it
+	// through is the participant's last sealed output at the snapshot: what
+	// a peer summary must cover before the own notes may be offered.
+	through uint64
 
 	peer     bool
 	target   *partState
@@ -35,23 +31,16 @@ type forkJob struct {
 	peerSpec ForkSpec
 
 	own     bool
+	ownBase string // the notes the own fork updates, "" for the first ones
 	ownSpec ForkSpec
 }
 
-// afterEnd applies an own summary that waited for the activation to end,
-// then decides whether the participant's sealed activation calls for a peer
-// or own summary and starts the job. It runs without the mutex.
+// afterEnd decides whether the participant's sealed activation calls for a
+// peer summary or own notes and starts the job. It runs without the mutex.
 func (c *Coordinator) afterEnd(a *activation, reason types.ReplyFinishedReason, started bool) {
 	ps := a.part
 	if ps.forker == nil {
 		return
-	}
-	c.mu.Lock()
-	own := ps.pendingOwn
-	ps.pendingOwn = nil
-	c.mu.Unlock()
-	if own != nil {
-		c.applyOwn(ps, own)
 	}
 	if c.cfg.Summaries.Disabled || !started || reason == types.ReplyError {
 		return
@@ -84,6 +73,8 @@ func (c *Coordinator) planForks(a *activation) *forkJob {
 	ps.growth += max(0, st.InputTokens-ps.lastInput)
 	ps.lastInput = st.InputTokens
 	growth, through, handedTo, busy := ps.growth, ps.lastSealed, a.handedTo, ps.forking
+	needOwn := !busy && c.ownDueLocked(ps, st.InputTokens)
+	base := ps.ownNotes
 	c.mu.Unlock()
 	if busy {
 		return nil
@@ -97,14 +88,14 @@ func (c *Coordinator) planForks(a *activation) *forkJob {
 		// sealed nothing new would buy the same summary again.
 		prev := c.newestSummary(c.ctx, target.name)
 		stale := prev == nil || prev.Coverage.Through < through
-		needPeer = stale && (growth >= pol.PeerEvery || handedTo == target.name)
+		needPeer = stale && (handedTo == target.name || c.peerDue(ps, target, prev, growth))
 	}
-	needOwn := st.Window > 0 && float64(st.InputTokens) >= pol.OwnRatio*float64(st.Window)
-	// An own summary replaces the history it covers, so the tool work in it
-	// could no longer reach a peer summary: a stale peer summary is written
-	// from the same snapshot, and runForkJob applies the own one only after
-	// the peer fork settled.
-	if needOwn && !needPeer && target != nil && target != ps && through > 0 {
+	// Own notes replace the history they cover once the participant reaches
+	// its compaction line, so the tool work in it could no longer reach a
+	// peer summary: notes are offered only once a peer summary covers their
+	// snapshot. Near the line, a stale peer summary is written from the
+	// notes' snapshot so the notes the line installs are the newest.
+	if needOwn && !needPeer && target != nil && target != ps && through > 0 && nearCompaction(&st, pol.OwnEvery) {
 		prev := c.newestSummary(c.ctx, target.name)
 		needPeer = prev == nil || prev.Coverage.Through < through
 	}
@@ -118,7 +109,7 @@ func (c *Coordinator) planForks(a *activation) *forkJob {
 		}
 		return nil
 	}
-	job := &forkJob{ps: ps, snap: snap, growth: growth, tainted: st.Tainted}
+	job := &forkJob{ps: ps, snap: snap, growth: growth, through: through, tainted: st.Tainted}
 	if needPeer {
 		if err := c.planPeer(job, target, through); err != nil {
 			agentscope.Log().WithError(err).WithField("participant", ps.name).Warn("thread: plan peer summary")
@@ -126,12 +117,46 @@ func (c *Coordinator) planForks(a *activation) *forkJob {
 	}
 	if needOwn {
 		job.own = true
-		job.ownSpec = ForkSpec{Prompt: pol.OwnPrompt, MaxTokens: pol.OwnMaxTokens}
+		job.ownBase = base
+		job.ownSpec = ForkSpec{Prompt: pol.OwnPrompt, MaxTokens: pol.OwnMaxTokens,
+			Validate: notesValidator(base, pol.OwnMaxTokens), MaxRewrites: pol.MaxRewrites}
+		if base != "" {
+			job.ownSpec.Prompt = pol.OwnUpdatePrompt
+			job.ownSpec.Appendix = "Your notes so far:\n" + base
+		}
+		c.mu.Lock()
+		ps.ownAt = st.InputTokens
+		c.mu.Unlock()
 	}
 	if !job.peer && !job.own {
 		return nil
 	}
 	return job
+}
+
+// ownDueLocked applies Claude Code's session-memory schedule at the end of a
+// reply: the first notes once the input reaches OwnInit, then an update
+// whenever it grew OwnEvery since the last own fork started. Claude Code
+// also waits for three tool calls when a turn's last response called tools;
+// a reply ends on a response that called none, so that never applies here.
+// A compaction since the last fork lowers the baseline to the new input.
+func (c *Coordinator) ownDueLocked(ps *partState, input int) bool {
+	pol := &c.cfg.Summaries
+	if input < ps.ownAt {
+		ps.ownAt = input
+		return false
+	}
+	if input < pol.OwnInit {
+		return false
+	}
+	return ps.ownAt == 0 || input-ps.ownAt >= pol.OwnEvery
+}
+
+// nearCompaction reports whether the participant may reach its compaction
+// line before its next own update: its input is within one update interval
+// of the line. An unknown line counts as near.
+func nearCompaction(st *ParticipantState, every int) bool {
+	return st.CompactAt <= 0 || st.InputTokens+every >= st.CompactAt
 }
 
 // planPeer fills the peer fork of job: its coverage, recorded before the
@@ -153,10 +178,7 @@ func (c *Coordinator) planPeer(job *forkJob, target *partState, through uint64) 
 			cov.Excluded = append(cov.Excluded, e.Seq)
 		}
 	}
-	budget := target.desc.SummaryBudget
-	if budget <= 0 {
-		budget = defaultPeerBudget
-	}
+	budget := peerBudget(&target.desc, target.p.State())
 	maxTokens := pol.PeerMaxTokens
 	if maxTokens <= 0 {
 		maxTokens = max(2*budget, 512)
@@ -184,6 +206,78 @@ func (c *Coordinator) planPeer(job *forkJob, target *partState, through uint64) 
 	return nil
 }
 
+// peerDue reports whether the writer ps must refresh target's summary at the
+// end of this reply: its growth reached a positive PeerEvery, or the
+// takeover load, the newest summary plus the entries after it that a clear
+// would bring, will reach PeerRatio of target's window by the end of the
+// next reply, judged by how much this reply added. Without a known window,
+// PeerEvery's default decides.
+func (c *Coordinator) peerDue(ps, target *partState, prev *Entry, growth int) bool {
+	pol := &c.cfg.Summaries
+	if pol.PeerEvery > 0 && growth >= pol.PeerEvery {
+		return true
+	}
+	if pol.PeerRatio < 0 {
+		return false
+	}
+	w := target.p.State().Window
+	if w <= 0 {
+		w = target.desc.Window
+	}
+	if w <= 0 {
+		return pol.PeerEvery == 0 && growth >= defaultPeerEvery
+	}
+	load, ok := c.handoverLoad(target, prev)
+	if !ok {
+		return false
+	}
+	c.mu.Lock()
+	rise := max(load-ps.peerLoad, 0)
+	ps.peerLoad = load
+	c.mu.Unlock()
+	return float64(load+rise) >= pol.PeerRatio*float64(w)
+}
+
+// handoverLoad estimates what a clear would bring target now: the newest
+// summary written for it and every entry after that summary it may read
+// (its own included, which a clear also brings). It reads the store.
+func (c *Coordinator) handoverLoad(target *partState, prev *Entry) (int, bool) {
+	var after uint64
+	n := 0
+	if prev != nil {
+		after = prev.Coverage.Through
+		n = estimateText(prev.Text())
+	}
+	entries, err := c.store.Read(c.ctx, after, Filter{}, 0)
+	if err != nil {
+		agentscope.Log().WithError(err).WithField("participant", target.name).Warn("thread: read entries for the peer summary rule")
+		return 0, false
+	}
+	proj := Project(entries, &ProjectionSpec{Participant: target.name, Zone: target.desc.Zone, After: after, IncludeOwn: true})
+	return n + countTokens(proj.Messages), true
+}
+
+// peerBudget is the target size of a summary written for a participant:
+// its Descriptor.SummaryBudget, else 5/6 of the summary budget its State
+// reports (stage 0 gave 2,500 of 3,000 tokens to the peer summary), else
+// 5/16 of its window (5/6 of the agent's automatic 3/8), else 1,024; at
+// least 256.
+func peerBudget(d *Descriptor, st ParticipantState) int {
+	w := st.Window
+	if w <= 0 {
+		w = d.Window
+	}
+	switch {
+	case d.SummaryBudget > 0:
+		return d.SummaryBudget
+	case st.SummaryTokens > 0:
+		return max(st.SummaryTokens*5/6, 256)
+	case w > 0:
+		return max(w*5/16, 256)
+	}
+	return defaultPeerBudget
+}
+
 // peerValidator accepts a summary of at most 1.5 x budget estimated tokens.
 func peerValidator(budget int) func(string) (string, bool) {
 	return func(text string) (string, bool) {
@@ -196,7 +290,7 @@ func peerValidator(budget int) func(string) (string, bool) {
 }
 
 // runForkJob runs the job's forks concurrently, appends the peer summary,
-// then applies the own summary once the peer fork settled.
+// then offers the own notes once the peer fork settled.
 func (c *Coordinator) runForkJob(job *forkJob) {
 	defer c.wg.Done()
 	ps := job.ps
@@ -259,8 +353,10 @@ func (c *Coordinator) finishPeer(job *forkJob, out *ForkOutput, err error) {
 	}
 }
 
-// finishOwn records the own fork and applies its summary while the
-// participant is idle, or keeps it for the end of its current activation.
+// finishOwn records the own fork, keeps its notes and offers them to the
+// participant once a peer summary covers their snapshot. Notes whose edits
+// do not apply are dropped; notes over the limit after the rewrites are cut
+// in the middle. It runs without the mutex.
 func (c *Coordinator) finishOwn(job *forkJob, out *ForkOutput, err error) {
 	ps := job.ps
 	c.recordForkUsage(ps.name, UsageForkOwn, out, err)
@@ -268,61 +364,35 @@ func (c *Coordinator) finishOwn(job *forkJob, out *ForkOutput, err error) {
 		agentscope.Log().WithError(err).WithField("participant", ps.name).Warn("thread: own summary fork")
 		return
 	}
-	text := strings.TrimSpace(out.Text)
-	if text == "" {
+	notes, err := applyNoteEdits(job.ownBase, out.Text)
+	if err != nil {
+		agentscope.Log().WithError(err).WithField("participant", ps.name).Warn("thread: own notes update does not apply")
 		return
 	}
-	own := &ownResult{snap: job.snap, text: text}
+	if limit := c.cfg.Summaries.OwnMaxTokens; estimateText(notes) > limit {
+		notes = middleCut(notes, limit)
+	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return
 	}
-	if ps.running != nil || ps.maint {
-		ps.pendingOwn = own
-		c.mu.Unlock()
-		return
-	}
-	ps.maint = true
-	c.addWorkLocked()
+	ps.ownNotes = notes
 	c.mu.Unlock()
-
-	c.applyOwn(ps, own)
-	c.endMaint(ps)
-}
-
-// endMaint ends the own-summary maintenance of an idle participant. It
-// starts the participant's next queued activation, or else schedules what
-// was addressed to it meanwhile: a Notify report could not wake it while
-// the summary was applied. It runs without the mutex.
-func (c *Coordinator) endMaint(ps *partState) {
-	cur := ps.p.State().Cursor
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	ps.maint = false
-	c.kickLocked(ps)
-	if ps.running == nil {
-		c.checkAddressedLocked(ps, cur)
+	if target := c.parts[c.edge]; target != nil && target != ps && job.through > 0 {
+		if prev := c.newestSummary(c.ctx, target.name); prev == nil || prev.Coverage.Through < job.through {
+			// The participant keeps the notes it was offered last; these
+			// become the base of the next update.
+			return
+		}
 	}
-	c.doneWorkLocked()
-}
-
-// applyOwn applies an own summary; a stale snapshot drops it. It runs
-// without the mutex while the participant is idle.
-func (c *Coordinator) applyOwn(ps *partState, own *ownResult) {
-	err := ps.forker.ApplyOwnSummary(c.ctx, own.snap, own.text)
+	err = ps.forker.OfferOwnSummary(c.ctx, job.snap, notes)
 	switch {
 	case errors.Is(err, ErrStale):
-		agentscope.Log().WithField("participant", ps.name).Debug("thread: own summary is stale; dropped")
-		return
+		agentscope.Log().WithError(err).WithField("participant", ps.name).Info("thread: own notes are stale; not offered")
 	case err != nil:
-		agentscope.Log().WithError(err).WithField("participant", ps.name).Warn("thread: apply own summary")
-		return
+		agentscope.Log().WithError(err).WithField("participant", ps.name).Warn("thread: offer own notes")
 	}
-	st := ps.p.State()
-	c.mu.Lock()
-	ps.lastInput = st.InputTokens
-	c.mu.Unlock()
 }
 
 // recordForkUsage records a fork's calls: one entry with its usage when it

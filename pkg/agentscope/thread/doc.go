@@ -6,7 +6,8 @@
 //
 // Each participant keeps its own agent context, tools and summaries. The log
 // holds only published content: user input, the text the user actually saw,
-// tool digests (names and targets, never outputs), summaries a cloud fork
+// tool digests (names and arguments cut at 200 runes, never outputs),
+// progress of running work, summaries a cloud fork
 // wrote for another participant's window, ownership changes, background
 // assignments, reports, artifacts and markers. A Coordinator is the single
 // writer. It routes each query, owns the foreground owner and its epoch,

@@ -68,9 +68,13 @@ type UnifiedAgent struct {
 	reactCfg     ReactConfig
 	modelCfg     ModelConfig
 	contextCfg   *ContextConfig
-	readCache    *tool.ReadCache
-	engine       *permission.Engine
-	skills       []skill.Skill
+	// threadSummaryTokens replaces ContextConfig.ThreadSummaryTokens once
+	// SetThreadSummaryTokens set it (threadSummarySet). Guarded by mu.
+	threadSummaryTokens int
+	threadSummarySet    bool
+	readCache           *tool.ReadCache
+	engine              *permission.Engine
+	skills              []skill.Skill
 
 	contentBlockCompaction bool
 	compactionVersion      uint64
@@ -152,6 +156,7 @@ type UnifiedAgent struct {
 	handedOff      atomic.Bool
 	exclusiveTools map[string]bool
 	taintGate      []string
+	privacyProbe   func() bool
 }
 
 // ReactConfig controls the ReAct reasoning-acting loop.
@@ -201,6 +206,11 @@ type AgentState struct {
 	// Plan is the current update_plan tracker state (see WithPlanTool). It
 	// lives outside Context so compression and crash-resume preserve it.
 	Plan []tool.PlanItem `json:"plan,omitempty"`
+	// SummaryOffer is a summary of the agent's own context waiting for the
+	// compression trigger (OfferSummary). It is checkpointed so an agent
+	// rebuilt from its checkpoint still holds it; a loader that predates the
+	// field drops it, and the trigger then compresses synchronously.
+	SummaryOffer *SummaryOffer `json:"summary_offer,omitempty"`
 
 	// Thread state (EXPERIMENTAL, see ThreadUpdate). Any of these set makes
 	// checkpoints carry schema version 3.
@@ -216,6 +226,11 @@ type AgentState struct {
 	ThreadCursor uint64 `json:"thread_cursor,omitempty"`
 	// Tainted is set once the agent has read untrusted content (see the taint gate).
 	Tainted bool `json:"tainted,omitempty"`
+	// Private is set once the agent's state may hold data that must stay on
+	// the device (see WithPrivacyProbe and ThreadUpdate.Private). It is
+	// saved with the state that holds that data, so a host restoring a
+	// checkpoint learns whether the restored context is private.
+	Private bool `json:"private,omitempty"`
 }
 
 // ToolStateContext captures which tool groups are active for serialization.
@@ -981,7 +996,7 @@ reactLoop:
 			if err := a.checkpointBoundary(ctx); err != nil {
 				return types.ReplyError, madeProgress, checkpointError(err)
 			}
-			if a.repromptAwaitingCalls(ctx, ch, replyID, actingHandler) {
+			if a.repromptAwaitingCalls(ctx, ch, replyID, actingHandler, hooks, iter) {
 				// Checkpoint again after the inline execution of resumed
 				// calls: the pre-reprompt snapshot still holds the
 				// ASKING/SUBMITTED call, and a crash before the next

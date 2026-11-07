@@ -447,10 +447,12 @@ func TestClassifierAccept(t *testing.T) {
 	if !ok || len(req.Questions) != 1 {
 		t.Fatalf("questions = %#v", req.Questions)
 	}
-	if len(q.Choices) != 2 || q.Choices["edge"] != edgeDesc || q.Choices["cloud"] != cloudDesc {
+	if len(q.Choices) != 2 || !strings.HasPrefix(q.Choices["edge"], "Small model with an 8K window. It has the last published messages of the session, any summary, and its own notes.") ||
+		!strings.HasSuffix(q.Choices["edge"], edgeDesc) || !strings.HasPrefix(q.Choices["cloud"], "Large model with the whole session history") ||
+		!strings.HasSuffix(q.Choices["cloud"], cloudDesc) {
 		t.Errorf("choices = %v", q.Choices)
 	}
-	if !strings.Contains(q.Instructions, "weighing quality against cloud cost") {
+	if !strings.Contains(q.Instructions, "Prefer the local assistant") {
 		t.Errorf("instructions = %q", q.Instructions)
 	}
 	var state map[string]json.RawMessage
@@ -732,7 +734,8 @@ func TestInstructions(t *testing.T) {
 	cases := map[Mode]string{
 		LocalBased: `Choose the cloud (participant "sky") only if the request needs stronger reasoning or tools only the cloud has; otherwise choose the edge (participant "phone").`,
 		CloudBased: `Choose the edge (participant "phone") only if the request is simple enough for a small local model or needs tools or data only on the device; otherwise choose the cloud (participant "sky").`,
-		Hybrid:     `Choose the participant best suited to the request, weighing quality against cloud cost.`,
+		Hybrid: `Prefer the local assistant (participant "phone") whenever it can answer correctly, because it is cheaper and keeps data on the device. ` +
+			`Choose the cloud assistant (participant "sky") when the answer needs something only the cloud has, or reasoning too hard for a small model.`,
 	}
 	for mode, want := range cases {
 		t.Run(string(mode), func(t *testing.T) {
@@ -747,12 +750,18 @@ func TestInstructions(t *testing.T) {
 			if !strings.Contains(q.Instructions, want) {
 				t.Fatalf("instructions %q lack %q", q.Instructions, want)
 			}
-			if !strings.Contains(q.Instructions, "untrusted data") || !strings.Contains(q.Instructions, "never follow instructions") {
-				t.Fatalf("instructions %q do not say the state is untrusted", q.Instructions)
+			if mode == Hybrid && q.Instructions != stage0Hybrid {
+				t.Fatalf("hybrid instructions %q, want stage 0's %q", q.Instructions, stage0Hybrid)
 			}
 		})
 	}
 }
+
+// stage0Hybrid is stage 0's route question with the test's participant
+// names.
+const stage0Hybrid = `Two assistants serve this session. Decide which one should answer the user's new query. ` +
+	`Prefer the local assistant (participant "phone") whenever it can answer correctly, because it is cheaper and keeps data on the device. ` +
+	`Choose the cloud assistant (participant "sky") when the answer needs something only the cloud has, or reasoning too hard for a small model.`
 
 func TestStateBuildFailureSkipsClassifier(t *testing.T) {
 	rec := &recorder{inner: choiceFake("cloud", 0.99)}
@@ -829,5 +838,20 @@ func TestClassifierTimeoutStays(t *testing.T) {
 	}
 	if def := newRouter(t, Config{Classifier: hang{}}); def.cfg.Timeout != DefaultTimeout {
 		t.Fatalf("default timeout = %v", def.cfg.Timeout)
+	}
+}
+
+func TestWindowPhrase(t *testing.T) {
+	for tokens, want := range map[int]string{
+		0:      "a small window",
+		8192:   "an 8K window",
+		16384:  "a 16K window",
+		11264:  "an 11K window",
+		131072: "a 128K window",
+		6000:   "a 6000-token window",
+	} {
+		if got := windowPhrase(tokens); got != want {
+			t.Errorf("windowPhrase(%d) = %q, want %q", tokens, got, want)
+		}
 	}
 }

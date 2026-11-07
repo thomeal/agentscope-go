@@ -73,6 +73,31 @@ func waitPrecompress(t *testing.T, a *UnifiedAgent) *precompressResult {
 	return nil
 }
 
+// TestPrecompress_StillOverAfterApplyCompresses: a ready summary that covers
+// too little leaves the context at the threshold; the trigger then also runs
+// the synchronous compression instead of sending an over-long request.
+func TestPrecompress_StillOverAfterApplyCompresses(t *testing.T) {
+	mock := &precompressMockModel{contextSize: 1000, perMessageTokens: 100}
+	a := newPrecompressAgent(mock, &ContextConfig{ContextSize: 1000, TriggerRatio: 0.8, ReserveRatio: 0.3})
+	seedContext(a, 2)
+	a.mu.Lock()
+	first := a.state.Context[0]
+	a.pendingPrecompress = &precompressResult{summary: "covers one message", snapshotLen: 1, lastMsg: first, lastMsgID: first.ID}
+	a.mu.Unlock()
+	seedContext(a, 8) // ten messages; nine remain after the ready summary
+	if err := a.compressContext(context.Background()); err != nil {
+		t.Fatalf("compressContext: %v", err)
+	}
+	if got := mock.chatCalls.Load(); got != 1 {
+		t.Fatalf("chat calls = %d, want 1: the synchronous compression must follow", got)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.state.Summary == "covers one message" || len(a.state.Context) >= 9 {
+		t.Fatalf("summary %q with %d messages: the context was not compressed further", a.state.Summary, len(a.state.Context))
+	}
+}
+
 // TestPrecompress_ArmsUnderThreshold: between the precompress ratio and the
 // hard trigger, compressContext kicks off background generation without
 // touching the live state.

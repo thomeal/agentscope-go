@@ -57,7 +57,7 @@ func TestBuildStateShape(t *testing.T) {
 		Recent: []thread.Entry{
 			{Seq: 10, Kind: thread.KindUserInput, Visibility: thread.Shared, Content: textBlocks("Find flights")},
 			{Seq: 11, Kind: thread.KindReply, Origin: thread.Origin{Participant: "cloud", Path: "master"}, Visibility: thread.Shared,
-				Content: textBlocks("Found two."), Digest: &thread.ToolDigest{Calls: []thread.ToolCallDigest{{Name: "WebSearch", Count: 2}}}},
+				Content: textBlocks("Found two."), Digest: &thread.ToolDigest{Calls: []thread.ToolCallDigest{{Name: "WebSearch", Args: `{"query":"x"}`}, {Name: "WebSearch", Args: `{"query":"y"}`}}}},
 			{Seq: 12, Kind: thread.KindSummary, Visibility: thread.Shared, Content: textBlocks("a summary entry")},
 			{Seq: 13, Kind: thread.KindMarker, Visibility: thread.Shared, Marker: &thread.Marker{Kind: thread.MarkerInterrupted}},
 			{Seq: 14, Kind: thread.KindOwnerChange, Visibility: thread.Shared, Owner: &thread.OwnerChange{From: "cloud", To: "edge", Reason: thread.ReasonRouter}},

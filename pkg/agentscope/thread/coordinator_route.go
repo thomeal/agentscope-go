@@ -1,6 +1,7 @@
 package thread
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -75,6 +76,15 @@ func (c *Coordinator) parkLocked(in *inputRec) {
 	}
 }
 
+// queueInputLocked adds in to the undelivered inputs, keeping them in log
+// order.
+func (c *Coordinator) queueInputLocked(in *inputRec) {
+	i, _ := slices.BinarySearchFunc(c.inputs, in.entry.Seq, func(r *inputRec, seq uint64) int {
+		return cmp.Compare(r.entry.Seq, seq)
+	})
+	c.inputs = slices.Insert(c.inputs, i, in)
+}
+
 // removeInputLocked drops in from the undelivered inputs.
 func (c *Coordinator) removeInputLocked(in *inputRec) {
 	c.inputs = slices.DeleteFunc(c.inputs, func(r *inputRec) bool { return r == in })
@@ -94,14 +104,17 @@ func (c *Coordinator) olderInputsLocked(in *inputRec) []*inputRec {
 
 // dropContextInputsLocked settles the inputs older than in once its cycle
 // went to ps: those ps may read are dropped, because its activation imports
-// them; an unparked one it may not read is skipped and starts its own cycle
-// later, so it is never dropped unanswered.
-func (c *Coordinator) dropContextInputsLocked(in *inputRec, ps *partState) {
+// them, and returned so the entry that ends its run records them
+// (Entry.Steered); an unparked one it may not read is skipped and starts its
+// own cycle later, so it is never dropped unanswered.
+func (c *Coordinator) dropContextInputsLocked(in *inputRec, ps *partState) []*inputRec {
+	var dropped []*inputRec
 	c.inputs = slices.DeleteFunc(c.inputs, func(r *inputRec) bool {
 		if r.entry.Seq >= in.entry.Seq {
 			return false
 		}
 		if ps.desc.Zone.CanRead(r.entry.EffectiveVisibility()) {
+			dropped = append(dropped, r)
 			return true
 		}
 		if !r.parked {
@@ -109,6 +122,7 @@ func (c *Coordinator) dropContextInputsLocked(in *inputRec, ps *partState) {
 		}
 		return false
 	})
+	return dropped
 }
 
 // undeliveredLocked reports whether the user input seq is still waiting.
@@ -170,9 +184,12 @@ func (c *Coordinator) finishRoutingLocked(ctx context.Context, in *inputRec, dec
 	}
 	ps := c.parts[dec.Target]
 	if dec.Target != c.owner {
+		// Based on the input, so recovery knows which request the new
+		// owner was answering.
 		oc := Entry{
 			Kind:       KindOwnerChange,
 			Visibility: Shared,
+			BasedOn:    seq,
 			Owner:      &OwnerChange{From: c.owner, To: dec.Target, Reason: ReasonRouter},
 		}
 		if c.commitLocked("", []Entry{oc}, &Guard{Owner: c.owner, Epoch: c.epoch}) == nil {
@@ -182,9 +199,10 @@ func (c *Coordinator) finishRoutingLocked(ctx context.Context, in *inputRec, dec
 		}
 	}
 	c.removeInputLocked(in)
-	c.dropContextInputsLocked(in, ps)
+	carried := c.dropContextInputsLocked(in, ps)
 	a := c.newActivationLocked(ps, actUser, &in.entry, true, 0)
 	a.cycleInput = seq
+	a.steered = carried
 	c.startForegroundLocked(a)
 	return nil
 }

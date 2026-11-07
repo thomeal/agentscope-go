@@ -202,8 +202,9 @@ func newSession(ctx context.Context) (*session, error) {
 		Router:       router,
 		Disclosure:   codePolicy{},
 		// Peer summaries are written only when the cloud hands the
-		// foreground to the edge, which keeps the log short.
-		Summaries: thread.SummaryPolicy{PeerEvery: 1 << 30},
+		// foreground to the edge, which keeps the log short: the window
+		// share rule is off and the growth rule never fires.
+		Summaries: thread.SummaryPolicy{PeerEvery: 1 << 30, PeerRatio: -1},
 	})
 	if err != nil {
 		return nil, err

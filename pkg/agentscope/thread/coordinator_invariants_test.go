@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -119,6 +120,77 @@ func TestCoordinatorClearCommitsOnlyWhenApplied(t *testing.T) {
 	if private || held == nil || held.Through != 3 || from != 4 {
 		t.Fatalf("after the clear: private %v held %+v resetFrom %d", private, held, from)
 	}
+}
+
+// A clear that imports nothing edge-only lowers the edge's privacy only
+// when the edge itself does: a private edge that keeps a plan across the
+// clear (it may name what a private run read) stays private, and the
+// clear's Sync says to clear the flag either way. A plan never makes an
+// edge that was not private private.
+func TestCoordinatorClearKeepsAPrivatePlan(t *testing.T) {
+	for _, plan := range []bool{false, true} {
+		t.Run(fmt.Sprintf("plan=%v", plan), func(t *testing.T) {
+			store := NewMemoryStore(WithClock(fixedClock()))
+			mustAppend(t, store, nil, userInput("plan"))
+			mustAppend(t, store, &Guard{}, ownerChange("", "cloud"))
+			rep := replyFrom("cloud", "the plan")
+			mustAppend(t, store, &Guard{Owner: "cloud", Epoch: 1}, rep)
+			mustAppend(t, store, nil, Entry{
+				Kind: KindSummary, Origin: Origin{Participant: "cloud"}, Visibility: Shared,
+				Summary: &SummaryMeta{Target: "edge"}, Coverage: &Coverage{Through: 3}, Content: textBlocks("SUMMARY"),
+			}) // #4
+			edge, cloud := edgeCloud()
+			edge.planHeld = plan
+			edge.setState(func(s *ParticipantState) { s.Private = true })
+			env := newCoEnv(t, store, nil, edge, cloud)
+			env.c.mu.Lock()
+			env.c.parts["edge"].raisePrivateLocked()
+			env.c.mu.Unlock()
+
+			env.submit(Query{Text: "continue", Explicit: "edge"})
+			env.idle()
+			acts := edge.activations()
+			if len(acts) != 1 || acts[0].Sync == nil || !acts[0].Sync.Reset || acts[0].Sync.Private == nil || *acts[0].Sync.Private {
+				t.Fatalf("the clear did not say to clear the flag: %+v", acts)
+			}
+			if got := edgePrivate(env, "edge"); got != plan {
+				t.Fatalf("private after the clear = %v, want %v", got, plan)
+			}
+			if got := edge.State().Private; got != plan {
+				t.Fatalf("the edge's own flag = %v, want %v", got, plan)
+			}
+		})
+	}
+	t.Run("plan, never private", func(t *testing.T) {
+		store := NewMemoryStore(WithClock(fixedClock()))
+		mustAppend(t, store, nil, userInput("plan"))
+		mustAppend(t, store, &Guard{}, ownerChange("", "cloud"))
+		mustAppend(t, store, &Guard{Owner: "cloud", Epoch: 1}, replyFrom("cloud", "the plan"))
+		mustAppend(t, store, nil, Entry{
+			Kind: KindSummary, Origin: Origin{Participant: "cloud"}, Visibility: Shared,
+			Summary: &SummaryMeta{Target: "edge"}, Coverage: &Coverage{Through: 3}, Content: textBlocks("SUMMARY"),
+		}) // #4
+		edge, cloud := edgeCloud()
+		edge.planHeld = true
+		env := newCoEnv(t, store, nil, edge, cloud)
+		env.submit(Query{Text: "continue", Explicit: "edge"})
+		env.idle()
+		if acts := edge.activations(); len(acts) != 1 || acts[0].Sync == nil || !acts[0].Sync.Reset {
+			t.Fatalf("no clear: %+v", acts)
+		}
+		if edgePrivate(env, "edge") || edge.State().Private {
+			t.Fatal("a clear made an edge that was never private private")
+		}
+		var replies []Entry
+		for _, e := range findEntries(env.log(), KindReply, "") {
+			if e.Origin.Participant == "edge" {
+				replies = append(replies, e)
+			}
+		}
+		if len(replies) != 1 || replies[0].Visibility != Shared {
+			t.Fatalf("edge replies = %+v", replies)
+		}
+	})
 }
 
 // An edge-only input that arrived while the cloud answered is never dropped
@@ -351,6 +423,50 @@ func TestCoordinatorFailedWakeDoesNotFailOver(t *testing.T) {
 		t.Fatalf("owner = %s", owner)
 	}
 	checkNotStranded(t, env, map[string]*fakePart{"edge": edge, "cloud": cloud})
+}
+
+// A wake that fails does not fail over, so a user message that steered it
+// is queued again and gets a cycle of its own instead of being lost. The
+// failed marker records it, and recovery would leave it open.
+func TestCoordinatorFailedWakeQueuesItsSteering(t *testing.T) {
+	edge, cloud := edgeCloud()
+	cloud.started = make(chan Activation, 8)
+	release := make(chan struct{})
+	cloud.push(func(r *fakeRun) *ActivationEnd {
+		if _, _, err := r.assign("edge", "count the photos", true); err != nil {
+			t.Errorf("assign: %v", err)
+		}
+		return r.reply("asked the edge")
+	}, gate(release, func(r *fakeRun) *ActivationEnd {
+		r.pending()
+		return &ActivationEnd{Reason: types.ReplyError, Err: errors.New("cloud down")}
+	}), replyWith("the album is sorted"))
+	edge.push(replyWith("42 photos"))
+	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = zoneRouter() }, edge, cloud)
+	env.say("count my photos")
+	waitStarted(t, cloud)
+	wake := waitStarted(t, cloud)
+	steer := env.say("then sort the album")
+	close(release)
+	env.idle()
+
+	if wake.Trigger.Kind != KindReport {
+		t.Fatalf("second cloud activation = %+v", wake)
+	}
+	log := env.log()
+	failed := findEntries(log, KindMarker, MarkerFailed)
+	if len(failed) != 1 || !slices.Equal(failed[0].Steered, []uint64{steer}) {
+		t.Fatalf("failed markers = %+v", failed)
+	}
+	acts := cloud.activations()
+	if len(acts) != 3 || acts[2].Trigger.Seq != steer || acts[2].Input != "then sort the album" {
+		t.Fatalf("cloud activations = %+v", acts)
+	}
+	chains := map[uint64]*reqChain{steer: {root: &Entry{Seq: steer}, leaf: steer, last: steer}}
+	recordChainEntry(chains, &failed[0], nil)
+	if chains[steer].done() {
+		t.Fatal("recovery takes a failed wake's steering for answered")
+	}
 }
 
 // A wake that cannot start leaves its report for the owner's next

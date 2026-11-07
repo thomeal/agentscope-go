@@ -588,7 +588,7 @@ func (a *UnifiedAgent) ApplySummary(ctx context.Context, snap *ForkSnapshot, tex
 	a.state.Context = kept
 	a.state.Summary = text
 	a.lastModelInputTokens = 0
-	a.pendingPrecompress = nil
+	a.dropReadyLocked()
 	a.compactionVersion++
 	a.mu.Unlock()
 
@@ -596,6 +596,90 @@ func (a *UnifiedAgent) ApplySummary(ctx context.Context, snap *ForkSnapshot, tex
 		cleanReadCacheForReserved(a.readCache, kept)
 	}
 	return a.persistBetweenReplies(ctx)
+}
+
+// SummaryOffer is an offered summary (OfferSummary) as AgentState keeps it.
+type SummaryOffer struct {
+	Text string `json:"text"`
+	// Base is the agent's Summary the offer was built on.
+	Base string `json:"base,omitempty"`
+	// Boundary is the ID of the last context message the summary covers, at
+	// index Len-1 of the context. Keep is how many messages up to it stay
+	// raw next to the summary.
+	Boundary string `json:"boundary,omitempty"`
+	Len      int    `json:"len"`
+	Keep     int    `json:"keep"`
+}
+
+// OfferSummary hands the agent text, a summary of its own context built from
+// snap (ForkSummary), to install when its context next reaches the
+// compression trigger (EXPERIMENTAL). The trigger then applies it without a
+// model call, the way it applies a background pre-compression result
+// (ContextConfig.PrecompressRatio), and falls back to the synchronous path
+// when the offer no longer matches the context or the context is still at
+// the threshold once it is in. Unlike ApplySummary it may be called while a
+// reply runs, and it changes nothing until the trigger. snap may come from
+// another instance built from the same checkpoint: it matches by its
+// boundary message's ID.
+//
+// The kept tail is chosen as ApplySummary chooses it, from the
+// snapshot-time context; every message appended after the boundary is kept
+// as well. A newer offer replaces an older one, and ApplySummary, a strict
+// compaction, a thread update that resets the context, or a precompression
+// that finds the offer stale drops it. The offer is part of the state
+// (AgentState.SummaryOffer), saved here between replies and by the reply's
+// own checkpoints otherwise; after a reload it matches by the boundary
+// message's ID. It returns ErrStaleSnapshot and changes nothing unless snap
+// is still valid.
+func (a *UnifiedAgent) OfferSummary(ctx context.Context, snap *ForkSnapshot, text string, opt SummaryApplyOptions) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if snap == nil {
+		return errors.New("agent: offer summary: nil snapshot")
+	}
+	if strings.TrimSpace(text) == "" {
+		return errors.New("agent: offer summary: empty summary")
+	}
+	a.mu.Lock()
+	var cfgSize int
+	if a.contextCfg != nil {
+		cfgSize = a.contextCfg.ContextSize
+	}
+	if !snap.validLocked(a.state) {
+		a.mu.Unlock()
+		return ErrStaleSnapshot
+	}
+	if snap.contextLen == 0 {
+		a.mu.Unlock()
+		return errors.New("agent: offer summary: the snapshot holds no context to replace")
+	}
+	prefix := cloneMsgs(a.state.Context[:snap.contextLen])
+	a.mu.Unlock()
+
+	opt = opt.withDefaults(a.knownWindow(cfgSize))
+	start := min(a.summaryTailStart(prefix, snap.contextLen, opt), snap.contextLen)
+
+	a.mu.Lock()
+	if !snap.validLocked(a.state) {
+		a.mu.Unlock()
+		return ErrStaleSnapshot
+	}
+	offer := &SummaryOffer{Text: text, Base: snap.summary, Boundary: snap.boundaryID, Len: snap.contextLen, Keep: snap.contextLen - start}
+	a.state.SummaryOffer = offer
+	a.pendingPrecompress = offer.result()
+	a.pendingPrecompress.lastMsg = a.state.Context[snap.contextLen-1]
+	busy := a.busyLocked("offer summary") != nil
+	a.mu.Unlock()
+	if busy {
+		return nil
+	}
+	return a.persistBetweenReplies(ctx)
+}
+
+// result is the pending application the offer stands for.
+func (o *SummaryOffer) result() *precompressResult {
+	return &precompressResult{prevSummary: o.Base, summary: o.Text, snapshotLen: o.Len, reservedLen: o.Keep, lastMsgID: o.Boundary}
 }
 
 // summaryTailStart picks the index where ApplySummary's kept tail starts.

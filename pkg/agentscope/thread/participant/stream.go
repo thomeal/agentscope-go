@@ -27,11 +27,15 @@ const partialResponseEvent = "model_partial_response"
 const exclusiveRejectionSuffix = " must be called alone; call it again by itself"
 
 // errNoTerminal reports a reply stream that closed without its ReplyEnd.
+// planToolName is the tool agent.WithPlanTool installs.
+const planToolName = "update_plan"
+
 var errNoTerminal = errors.New("participant: the reply stream ended without a terminal event")
 
 // callRecord is one tool call seen in the stream.
 type callRecord struct {
 	id, name, path string
+	input          string // raw JSON arguments
 	args           map[string]any
 	state          message.ToolResultState
 	done           bool
@@ -212,7 +216,7 @@ func (t *tracker) startCall(rp *replyPath, id, name, input string) {
 	if rp.calls[id] != nil {
 		return
 	}
-	r := &callRecord{id: id, name: name, path: rp.path}
+	r := &callRecord{id: id, name: name, path: rp.path, input: input}
 	if input != "" {
 		var args map[string]any
 		if json.Unmarshal([]byte(input), &args) == nil {
@@ -299,7 +303,7 @@ func (t *tracker) capture(r *callRecord) {
 		Origin:  thread.Origin{Participant: t.c.desc.Name, Path: r.path},
 		Zone:    t.c.desc.Zone,
 		Tool:    r.name,
-		Target:  digestTarget(r.name, r.args),
+		Target:  thread.ToolTarget(r.args),
 		Output:  r.output.String(),
 		Tainted: r.tainted,
 	}
@@ -343,12 +347,13 @@ func usageOf(e *event.ModelCallEndEvent) *model.ChatUsage {
 }
 
 // digest returns the digest of the current segment, leaving out the call
-// with ID skip (the transfer that hands the segment over).
+// with ID skip (the transfer that hands the segment over) and the main
+// agent's update_plan calls, whose plans are the run's progress entries.
 func (t *tracker) digest(skip string) *thread.ToolDigest {
 	var b thread.DigestBuilder
 	for _, r := range t.segment {
-		if r.counts() && r.id != skip {
-			b.Add(r.displayName(), r.args)
+		if r.counts() && r.id != skip && (r.path != "" || r.name != planToolName) {
+			b.Add(r.displayName(), r.input)
 		}
 	}
 	return b.Digest()
@@ -495,16 +500,6 @@ func errorResult(call *message.ToolCallBlock, text string) message.ToolResultBlo
 
 func successResult(call *message.ToolCallBlock, text string) message.ToolResultBlock {
 	return message.ToolResultBlock{Type: "tool_result", ID: call.ID, Name: call.Name, Output: text, State: message.ToolResultSuccess}
-}
-
-// digestTarget applies the digest's target rule to one call.
-func digestTarget(name string, args map[string]any) string {
-	var b thread.DigestBuilder
-	b.Add(name, args)
-	if d := b.Digest(); d != nil {
-		return d.Calls[0].Target
-	}
-	return ""
 }
 
 // cutBytes returns the longest prefix of s within n bytes that ends on a

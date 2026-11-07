@@ -3,10 +3,13 @@ package thread
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/event"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/model"
@@ -851,7 +854,7 @@ func TestCoordinatorAssignReportAndWake(t *testing.T) {
 		return r.reply("working on it")
 	}, replyWith("there are 42 photos"))
 	edge.push(func(r *fakeRun) *ActivationEnd {
-		return &ActivationEnd{Reason: types.ReplyCompleted, Text: "42 photos", Digest: &ToolDigest{Calls: []ToolCallDigest{{Name: "Glob", Count: 1}}}}
+		return &ActivationEnd{Reason: types.ReplyCompleted, Text: "42 photos", Digest: &ToolDigest{Calls: []ToolCallDigest{{Name: "Glob"}}}}
 	})
 	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = zoneRouter() }, edge, cloud)
 	env.say("how many photos?")
@@ -1005,24 +1008,158 @@ func TestCoordinatorFailover(t *testing.T) {
 	env.idle()
 
 	log := env.log()
-	want := []string{"user_input", "owner_change", "reply", "marker:unknown_effects", "owner_change", "marker:no_owner"}
+	want := []string{"user_input", "owner_change", "reply", "marker:failed", "marker:unknown_effects", "owner_change", "marker:failed", "marker:no_owner"}
 	if got := kindsOf(log); !reflect.DeepEqual(got, want) {
 		t.Fatalf("log = %v", got)
 	}
-	if log[2].Text() != "partial" || log[3].BasedOn != q {
-		t.Fatalf("partial reply / marker = %+v %+v", log[2], log[3])
+	if log[2].Text() != "partial" || log[3].BasedOn != q || log[4].BasedOn != q {
+		t.Fatalf("partial reply / markers = %+v %+v %+v", log[2], log[3], log[4])
 	}
-	fo := log[4]
+	if log[3].Marker.Detail != "edge failed: its activation ended with an error" || log[6].Marker.Detail != "cloud failed: cloud down" {
+		t.Fatalf("failed markers = %q, %q", log[3].Marker.Detail, log[6].Marker.Detail)
+	}
+	fo := log[5]
 	if fo.Owner.Reason != ReasonFailover || fo.Owner.From != "edge" || fo.Owner.To != "cloud" || fo.Origin != (Origin{}) {
 		t.Fatalf("failover = %+v", fo.Owner)
 	}
 	acts := cloud.activations()
-	wantInput := "[edge failed: its activation ended with an error. Continue the user's request below.]\nfix it"
+	wantInput := `[edge failed: its activation ended with an error (#4). You now answer the user: continue their request #1 "fix it" ` +
+		`from where edge left off. What edge did is in the summary and the entries above.]`
 	if len(acts) != 1 || acts[0].Input != wantInput || acts[0].Trigger.Seq != fo.Seq {
 		t.Fatalf("failover activation = %+v", acts)
 	}
-	if strings.Contains(acts[0].Input, "/private") {
-		t.Fatal("the edge's error text reached the cloud")
+	for _, e := range log {
+		if strings.Contains(e.Text(), "/private") || (e.Marker != nil && strings.Contains(e.Marker.Detail, "/private")) {
+			t.Fatalf("the edge's error text reached the shared log: %+v", e)
+		}
+	}
+}
+
+// TestCoordinatorFailoverHandsOnSteering: the user steered the edge's run
+// twice before it failed. The failed marker records both messages, since
+// the run ended there. The cloud's failover takes the shared one, which its
+// reply records; the edge-only one, which the cloud may not read, starts
+// its own cycle on the edge afterwards instead of being lost.
+func TestCoordinatorFailoverHandsOnSteering(t *testing.T) {
+	edge, cloud := edgeCloud()
+	edge.started = make(chan Activation, 8)
+	release := make(chan struct{})
+	edge.push(gate(release, func(r *fakeRun) *ActivationEnd {
+		r.pending()
+		return &ActivationEnd{Reason: types.ReplyError, Err: errors.New("model crashed")}
+	}), replyWith("noted privately"))
+	cloud.push(replyWith("planned, in metric"))
+	env := newCoEnv(t, nil, nil, edge, cloud)
+	env.say("plan my trip")
+	waitStarted(t, edge)
+	metric := env.say("use metric units")
+	passport := env.submit(Query{Text: "my passport number is X", Disclosure: DiscloseEdgeOnly})
+	close(release)
+	env.idle()
+
+	log := env.log()
+	failed := findEntries(log, KindMarker, MarkerFailed)
+	if len(failed) != 1 || !slices.Equal(failed[0].Steered, []uint64{metric, passport}) {
+		t.Fatalf("failed markers = %+v", failed)
+	}
+	replies := findEntries(log, KindReply, "")
+	if len(replies) != 2 || replies[0].Origin.Participant != "cloud" || !slices.Equal(replies[0].Steered, []uint64{metric}) ||
+		replies[1].Origin.Participant != "edge" || len(replies[1].Steered) != 0 {
+		t.Fatalf("replies = %+v", replies)
+	}
+	acts := edge.activations()
+	if len(acts) != 2 || acts[1].Trigger.Seq != passport || acts[1].Input != "my passport number is X" {
+		t.Fatalf("edge activations = %+v", acts)
+	}
+	if oc := log[len(log)-2]; oc.Kind != KindOwnerChange || oc.Owner.To != "edge" || oc.BasedOn != passport {
+		t.Fatalf("the routing of the edge-only input = %+v", oc)
+	}
+	if containsText(cloud.seenTexts(), "passport") {
+		t.Fatal("the edge-only steering reached the cloud")
+	}
+}
+
+// TestCoordinatorEdgeProgressIsNotPrivateMaterial: the edge's own progress
+// is edge-only, but it is a run's working state, not material the edge
+// holds: a later clear neither indexes it nor makes the edge private, so
+// the edge's next reply to a shared request stays shared.
+func TestCoordinatorEdgeProgressIsNotPrivateMaterial(t *testing.T) {
+	edge := newFakePart("edge", ZoneEdge)
+	cloud := newFakeForker("cloud")
+	env := newCoEnv(t, nil, func(cfg *Config) {
+		cfg.Router = &fakeRouter{fn: func(_ context.Context, req *RouteRequest) (RouteDecision, error) {
+			if strings.HasPrefix(req.Query, "edge:") {
+				return RouteDecision{Target: "edge", Source: RouteRule}, nil
+			}
+			return RouteDecision{Target: "cloud", Source: RouteRule}, nil
+		}}
+		cfg.Summaries.PeerEvery = 100
+	}, edge, cloud)
+	edge.push(func(r *fakeRun) *ActivationEnd {
+		r.plan("read the sensors", "report them")
+		return r.reply("sensors ok")
+	}, replyWith("lights on"))
+	cloud.push(grow(500, "week planned"))
+	env.say("edge: check the sensors")
+	env.idle()
+	env.say("cloud: plan the week")
+	env.idle()
+	last := env.say("edge: lights on")
+	env.idle()
+
+	if p := findEntries(env.log(), KindProgress, ""); len(p) != 1 || p[0].Visibility != EdgeOnly {
+		t.Fatalf("edge progress = %+v", p)
+	}
+	acts := edge.activations()
+	if len(acts) != 2 || acts[1].Sync == nil || !acts[1].Sync.Reset {
+		t.Fatalf("the edge's second activation must clear: %+v", acts)
+	}
+	if idx := acts[1].Sync.Index; idx != nil && *idx != "" {
+		t.Fatalf("the clear indexed the edge's progress: %q", *idx)
+	}
+	var reply *Entry
+	for _, e := range env.log() {
+		if e.Kind == KindReply && e.BasedOn == last {
+			reply = &e
+		}
+	}
+	if reply == nil || reply.Visibility != Shared {
+		t.Fatalf("the edge's reply after the clear = %+v; its own progress must not make it private", reply)
+	}
+	env.c.mu.Lock()
+	private := env.c.parts["edge"].private
+	env.c.mu.Unlock()
+	if private {
+		t.Fatal("the edge stays private after the clear")
+	}
+}
+
+// TestCoordinatorEdgeProgressStaysOnTheEdge: an edge run's plan may name
+// private material, so its progress is edge-only. When the edge fails, the
+// cloud's failover import withholds it and the failover note does not point
+// at it.
+func TestCoordinatorEdgeProgressStaysOnTheEdge(t *testing.T) {
+	edge, cloud := edgeCloud()
+	edge.push(func(r *fakeRun) *ActivationEnd {
+		r.plan("read /private/diary", "fix it")
+		return &ActivationEnd{Reason: types.ReplyError, Err: errors.New("model crashed")}
+	})
+	cloud.push(replyWith("fixed"))
+	env := newCoEnv(t, nil, nil, edge, cloud)
+	env.say("fix it")
+	env.idle()
+
+	progress := findEntries(env.log(), KindProgress, "")
+	if len(progress) != 1 || progress[0].Origin.Participant != "edge" || progress[0].Visibility != EdgeOnly || !strings.Contains(progress[0].Text(), "/private/diary") {
+		t.Fatalf("edge progress = %+v", progress)
+	}
+	acts := cloud.activations()
+	if len(acts) != 1 || strings.Contains(acts[0].Input, "progress") {
+		t.Fatalf("cloud failover activation = %+v", acts)
+	}
+	texts := syncTexts(acts[0].Sync)
+	if containsText(texts, "/private") || !containsText(texts, fmt.Sprintf("#%d withheld", progress[0].Seq)) {
+		t.Fatalf("the cloud's import must withhold the edge's progress: %q", texts)
 	}
 }
 
@@ -1041,7 +1178,7 @@ func TestCoordinatorFailoverWhenUnavailable(t *testing.T) {
 		t.Fatalf("unavailable edge ran %d times", n)
 	}
 	acts := cloud.activations()
-	if len(acts) != 1 || !strings.HasPrefix(acts[0].Input, "[edge failed: it is unavailable.") {
+	if len(acts) != 1 || !strings.HasPrefix(acts[0].Input, "[edge failed: it is unavailable (#") {
 		t.Fatalf("cloud activation = %+v", acts)
 	}
 }
@@ -1242,5 +1379,144 @@ func TestCoordinatorAppendFailureIsReported(t *testing.T) {
 	}
 	if errs == 0 {
 		t.Fatal("append failure not reported")
+	}
+}
+
+// queuedForeground waits until the foreground activation of name is queued
+// behind its running work.
+func queuedForeground(t *testing.T, c *Coordinator, name string) {
+	t.Helper()
+	for range 500 {
+		c.mu.Lock()
+		ok := c.fg != nil && c.fg.part.name == name && !c.fg.started && c.owner == name
+		c.mu.Unlock()
+		if ok {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("no queued foreground activation of %s", name)
+}
+
+// failingCloudWithEdgeTask sets up a failover to a busy participant: the
+// cloud owns the query, assigns the edge a background task, publishes its
+// plan and fails while the task runs. It returns the user input's seq once
+// the failover is queued behind the edge's task; the task waits for release.
+func failingCloudWithEdgeTask(t *testing.T, edgeTask fakeScript, more ...fakeScript) (*coEnv, *fakePart, uint64, chan struct{}) {
+	t.Helper()
+	edge, cloud := edgeCloud()
+	edge.started = make(chan Activation, 4)
+	cloud.started = make(chan Activation, 4)
+	failCloud, release := make(chan struct{}), make(chan struct{})
+	cloud.push(func(r *fakeRun) *ActivationEnd {
+		if _, _, err := r.assign("edge", "check the sensors", false); err != nil {
+			t.Errorf("assign: %v", err)
+		}
+		r.plan("ask the edge for the sensors", "draft the morning")
+		<-failCloud
+		r.say("Planning your day. ")
+		return &ActivationEnd{Reason: types.ReplyError, Err: errors.New("cloud model unreachable"), Text: r.text()}
+	})
+	edge.push(append([]fakeScript{gate(release, edgeTask)}, more...)...)
+	env := newCoEnv(t, nil, nil, edge, cloud)
+	seq := env.submit(Query{Text: "plan my day", Explicit: "cloud"})
+	waitStarted(t, cloud)
+	waitStarted(t, edge)
+	close(failCloud)
+	queuedForeground(t, env.c, "edge")
+	return env, edge, seq, release
+}
+
+// TestCoordinatorFailoverWaitsForTheTask: a failover to a participant that
+// runs a background task queues behind the task; the running task is never
+// steered. The failover's input is one line pointing at the failed marker,
+// the request and the newest progress, which its import holds in full.
+func TestCoordinatorFailoverWaitsForTheTask(t *testing.T) {
+	env, edge, seq, release := failingCloudWithEdgeTask(t, func(r *fakeRun) *ActivationEnd {
+		for range 20 {
+			if s := r.pending(); s != nil {
+				for _, m := range syncTexts(s) {
+					if strings.Contains(m, "failed") {
+						t.Errorf("the running task was told about the failure: %q", m)
+					}
+				}
+			}
+		}
+		return r.reply("sensors checked")
+	}, replyWith("Here is your plan."))
+	close(release)
+	env.idle()
+
+	acts := edge.activations()
+	if len(acts) != 2 || !acts[1].Foreground || acts[1].Trigger.Kind != KindOwnerChange ||
+		acts[1].Trigger.Owner.Reason != ReasonFailover {
+		t.Fatalf("edge activations = %+v", acts)
+	}
+	log := env.log()
+	var failed, progress *Entry
+	for i := range log {
+		e := &log[i]
+		switch {
+		case e.Kind == KindMarker && e.Marker.Kind == MarkerFailed:
+			failed = e
+		case e.Kind == KindProgress:
+			progress = e
+		}
+	}
+	if failed == nil || failed.BasedOn != seq || failed.Marker.Detail != "cloud failed: cloud model unreachable" {
+		t.Fatalf("failed marker = %+v", failed)
+	}
+	if progress == nil || progress.Origin.Participant != "cloud" || progress.BasedOn != seq || progress.Visibility != Shared ||
+		!strings.Contains(progress.Text(), "2. [in_progress] draft the morning") {
+		t.Fatalf("progress = %+v", progress)
+	}
+	in := acts[1].Input
+	for _, want := range []string{
+		fmt.Sprintf("[cloud failed: cloud model unreachable (#%d)", failed.Seq),
+		fmt.Sprintf(`request #%d "plan my day"`, seq),
+		fmt.Sprintf("latest progress is #%d.]", progress.Seq),
+	} {
+		if !strings.Contains(in, want) {
+			t.Fatalf("failover input %q lacks %q", in, want)
+		}
+	}
+	if strings.Contains(in, "\n") {
+		t.Fatalf("failover input is not one line: %q", in)
+	}
+	imported := strings.Join(syncTexts(acts[1].Sync), "\n")
+	if !strings.Contains(imported, fmt.Sprintf("[#%d progress of cloud]", progress.Seq)) ||
+		!strings.Contains(imported, fmt.Sprintf("[#%d marker failed]", failed.Seq)) {
+		t.Fatalf("the failover's import lacks the progress or the failure:\n%s", imported)
+	}
+}
+
+// TestCoordinatorRoutedQueryWaitsForTheTask: a query routed to a participant
+// that runs a background task does not take the task over; it waits.
+func TestCoordinatorRoutedQueryWaitsForTheTask(t *testing.T) {
+	edge, cloud := edgeCloud()
+	cloud.started = make(chan Activation, 4)
+	release := make(chan struct{})
+	edge.push(func(r *fakeRun) *ActivationEnd {
+		if _, _, err := r.assign("cloud", "check the forecast", false); err != nil {
+			t.Errorf("assign: %v", err)
+		}
+		return r.reply("asked the cloud")
+	})
+	cloud.push(gate(release, func(r *fakeRun) *ActivationEnd {
+		for range 20 {
+			r.pending()
+		}
+		return r.reply("forecast checked")
+	}), replyWith("rain at noon"))
+	env := newCoEnv(t, nil, nil, edge, cloud)
+	env.say("start")
+	waitStarted(t, cloud)
+	seq := env.submit(Query{Text: "will it rain today?", Explicit: "cloud"})
+	queuedForeground(t, env.c, "cloud")
+	close(release)
+	env.idle()
+	acts := cloud.activations()
+	if len(acts) != 2 || acts[1].Trigger.Seq != seq || !acts[1].Foreground {
+		t.Fatalf("cloud activations = %+v", acts)
 	}
 }

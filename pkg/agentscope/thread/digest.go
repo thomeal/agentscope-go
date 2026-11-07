@@ -4,88 +4,75 @@ import (
 	"strings"
 )
 
-// digestTargetKeys are the arguments that name what a tool acted on, in the
+// toolTargetKeys are the arguments that name what a tool acted on, in the
 // order they are tried.
-var digestTargetKeys = []string{
+var toolTargetKeys = []string{
 	"path", "file_path", "file", "filename", "url", "uri", "dir", "directory", "pattern", "query",
 }
 
-// digestCommandKeys are the arguments whose first word names the target
-// when no digestTargetKeys argument is present.
-var digestCommandKeys = []string{"command", "cmd"}
+// toolCommandKeys are the arguments whose first word names the target when
+// no toolTargetKeys argument is present.
+var toolCommandKeys = []string{"command", "cmd"}
 
-// digestTargetRunes bounds a digest target.
-const digestTargetRunes = 80
+// toolTargetRunes bounds a tool target.
+const toolTargetRunes = 80
 
-// DigestBuilder collects the tool calls of one reply into a ToolDigest. The
-// zero value is ready to use. It is not safe for concurrent use.
+// DigestArgsRunes bounds the arguments of one call in a ToolDigest. Longer
+// arguments are cut and end in "...": a write_file call carries a whole
+// file, which belongs in the workspace and would fill an edge window as a
+// log entry.
+const DigestArgsRunes = 200
+
+// DigestBuilder collects the tool calls of one reply into a ToolDigest: one
+// item per call, in call order, with the tool name and the arguments as the
+// model wrote them, cut at DigestArgsRunes (stage 0's tool summary). The zero
+// value is ready to use. It is not safe for concurrent use.
 type DigestBuilder struct {
-	order []string
-	calls map[string]*digestCall
+	calls []ToolCallDigest
 }
 
-type digestCall struct {
-	target string
-	mixed  bool
-	count  int
-}
-
-// Add records one tool call. The target is the first present, non-empty
-// string argument among: path, file_path, file, filename, url, uri, dir,
-// directory, pattern, query; for command or cmd, the first word. At most 80
-// runes. A call with an empty name is ignored.
-func (b *DigestBuilder) Add(name string, args map[string]any) {
+// Add records one call; args is its raw JSON arguments. A call with an empty
+// name is ignored.
+func (b *DigestBuilder) Add(name, args string) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return
 	}
-	target := digestTarget(args)
-	if b.calls == nil {
-		b.calls = make(map[string]*digestCall)
-	}
-	c, ok := b.calls[name]
-	if !ok {
-		b.calls[name] = &digestCall{target: target, count: 1}
-		b.order = append(b.order, name)
-		return
-	}
-	c.count++
-	if c.target != target {
-		c.mixed = true
-	}
+	b.calls = append(b.calls, ToolCallDigest{Name: name, Args: clipArgs(strings.TrimSpace(args))})
 }
 
-// Digest groups calls by tool name in first-seen order. Target is kept only
-// when every call to that tool had the same target. Nil when nothing was
-// added.
+// Digest returns the calls added so far, nil when there are none. The
+// result is a snapshot: later calls do not change it.
 func (b *DigestBuilder) Digest() *ToolDigest {
-	if len(b.order) == 0 {
+	if len(b.calls) == 0 {
 		return nil
 	}
-	d := &ToolDigest{Calls: make([]ToolCallDigest, 0, len(b.order))}
-	for _, name := range b.order {
-		c := b.calls[name]
-		call := ToolCallDigest{Name: name, Count: c.count}
-		if !c.mixed {
-			call.Target = c.target
-		}
-		d.Calls = append(d.Calls, call)
-	}
-	return d
+	return &ToolDigest{Calls: append([]ToolCallDigest(nil), b.calls...)}
 }
 
-func digestTarget(args map[string]any) string {
-	for _, k := range digestTargetKeys {
+func clipArgs(args string) string {
+	if r := []rune(args); len(r) > DigestArgsRunes {
+		return string(r[:DigestArgsRunes]) + "..."
+	}
+	return args
+}
+
+// ToolTarget names what a call acted on: the first present, non-empty string
+// argument among path, file_path, file, filename, url, uri, dir, directory,
+// pattern and query; else the first word of command or cmd; else "". It is at
+// most 80 runes and on one line. The event list records it with each output.
+func ToolTarget(args map[string]any) string {
+	for _, k := range toolTargetKeys {
 		if s, ok := args[k].(string); ok {
 			if t := oneLine(s); t != "" {
-				return truncateRunes(t, digestTargetRunes)
+				return truncateRunes(t, toolTargetRunes)
 			}
 		}
 	}
-	for _, k := range digestCommandKeys {
+	for _, k := range toolCommandKeys {
 		if s, ok := args[k].(string); ok {
 			if f := strings.Fields(s); len(f) > 0 {
-				return truncateRunes(f[0], digestTargetRunes)
+				return truncateRunes(f[0], toolTargetRunes)
 			}
 		}
 	}

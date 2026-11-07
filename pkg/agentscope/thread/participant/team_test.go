@@ -93,6 +93,7 @@ type teamFixture struct {
 }
 
 type teamOptions struct {
+	desc          thread.Descriptor // cloudDesc when empty
 	cfg           TeamConfig
 	master        func(context.Context, int, *model.CallOptions) (*model.ChatResponse, error)
 	member        func(context.Context, int, *model.CallOptions) (*model.ChatResponse, error)
@@ -106,7 +107,10 @@ func newTeamFixture(t *testing.T, o teamOptions) *teamFixture { //nolint:gocriti
 	f := &teamFixture{host: newFakeHost(cloudDesc, edgeDesc), master: &scriptModel{respond: o.master}, member: &scriptModel{respond: o.member}, saver: newMemSaver()}
 	cfg := o.cfg
 	cfg.Descriptor = cloudDesc
-	optIntoEvents(cloudDesc, &cfg.Prepare, &cfg.CaptureOutputs)
+	if o.desc.Name != "" {
+		cfg.Descriptor = o.desc
+	}
+	optIntoEvents(cfg.Descriptor, &cfg.Prepare, &cfg.CaptureOutputs)
 	cfg.Master = func(ctx context.Context, assign tool.Tool, threadTools []tool.Tool, opts []agent.AgentOption) (*agent.UnifiedAgent, error) {
 		if o.factory != nil {
 			return o.factory(f, ctx, assign, threadTools, opts)
@@ -286,8 +290,8 @@ func TestTeamQueuedSyncAndContinuity(t *testing.T) {
 	if _, err := f.tp.Fork(ctx, nil, thread.ForkSpec{Prompt: "x"}); !errors.Is(err, thread.ErrNoSnapshot) {
 		t.Fatalf("fork before a master: %v", err)
 	}
-	if err := f.tp.ApplyOwnSummary(ctx, nil, "x"); !errors.Is(err, thread.ErrStale) {
-		t.Fatalf("apply before a master: %v", err)
+	if err := f.tp.OfferOwnSummary(ctx, nil, "x"); !errors.Is(err, thread.ErrStale) {
+		t.Fatalf("offer before a master: %v", err)
 	}
 	if changed, err := f.tp.Compact(ctx, ""); changed || err != nil {
 		t.Fatalf("compact before a master: %v %v", changed, err)
@@ -351,8 +355,33 @@ func TestTeamQueuedSyncAndContinuity(t *testing.T) {
 	if v := f.masters[1].ThreadView(); v.Cursor != 7 || !v.Tainted || len(f.tp.queued) != 0 {
 		t.Fatalf("second master view = %+v queued=%d", v, len(f.tp.queued))
 	}
-	if err := f.tp.ApplyOwnSummary(ctx, snap, "old"); !errors.Is(err, thread.ErrStale) {
-		t.Fatalf("a snapshot of an earlier master is stale: %v", err)
+	if err := f.tp.OfferOwnSummary(ctx, snap, "old"); !errors.Is(err, thread.ErrStale) {
+		t.Fatalf("a snapshot the context moved past (compacted since) is stale: %v", err)
+	}
+}
+
+// TestTeamOfferReachesTheRebuiltMaster: notes forked from one activation's
+// master may finish after the next activation built a new master from the
+// checkpoint. The offer goes to the new master, which matches the snapshot
+// by message ID, and is saved with its state instead of being lost.
+func TestTeamOfferReachesTheRebuiltMaster(t *testing.T) {
+	ctx := context.Background()
+	f := newTeamFixture(t, teamOptions{master: queued(textResp("first"), textResp("second")), member: queued()})
+	activate(t, f.tp, foreground(1, "hi"), nil)
+	snap, err := f.tp.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	activate(t, f.tp, foreground(2, "again"), nil)
+	if len(f.masters) != 2 {
+		t.Fatalf("masters = %d", len(f.masters))
+	}
+	if err := f.tp.OfferOwnSummary(ctx, snap, "the notes"); err != nil {
+		t.Fatalf("an offer forked from the earlier master: %v", err)
+	}
+	st, err := agent.LoadCheckpoint(ctx, f.saver, "master-session")
+	if err != nil || st.SummaryOffer == nil || st.SummaryOffer.Text != "the notes" {
+		t.Fatalf("the rebuilt master's checkpoint = %+v (%v)", st, err)
 	}
 }
 
@@ -423,6 +452,55 @@ func TestTeamToolsAndDescriptor(t *testing.T) {
 	}
 	if err := f.tp.Bind(f.host); err == nil {
 		t.Fatal("a second Bind must fail")
+	}
+}
+
+// TestTeamQueuedPrivacy: before the first master, State reports the loaded
+// privacy with the queued updates on top; a queued clear lowers it unless
+// the loaded state holds a plan, as the agent does, and never raises it.
+func TestTeamQueuedPrivacy(t *testing.T) {
+	no := false
+	for _, private := range []bool{false, true} {
+		for _, plan := range []bool{false, true} {
+			st := &agent.AgentState{SessionID: "master-session", Private: private, ThreadCursor: 2}
+			if plan {
+				st.Plan = []tool.PlanItem{{Step: "read the sensor", Status: tool.PlanStatusCompleted}}
+			}
+			f := newTeamFixture(t, teamOptions{master: queued(), member: queued(),
+				cfg: TeamConfig{Load: func(context.Context) (*agent.AgentState, error) { return st, nil }}})
+			if f.tp.State().Private != private {
+				t.Fatal("the loaded privacy is not reported")
+			}
+			if err := f.tp.Sync(t.Context(), thread.Sync{Reset: true, Private: &no}); err != nil {
+				t.Fatal(err)
+			}
+			if got, want := f.tp.State().Private, private && plan; got != want {
+				t.Fatalf("private %v, plan %v: private after a queued clear = %v", private, plan, got)
+			}
+		}
+	}
+}
+
+// TestTeamEdgePrivateRunIsSaved: an edge team's private run (here an
+// edge-only trigger, answered without a tool step, so no checkpoint ran
+// during it) leaves the master's saved state private, and the next master
+// rebuilt from it starts private.
+func TestTeamEdgePrivateRunIsSaved(t *testing.T) {
+	f := newTeamFixture(t, teamOptions{desc: edgeDesc, master: queued(textResp("142 bpm"), textResp("rest a bit"))})
+	act := foreground(1, "how is my heart rate")
+	act.Trigger.Visibility = thread.EdgeOnly
+	if _, end := activate(t, f.tp, act, nil); !end.Private || end.Err != nil {
+		t.Fatalf("end: %+v", end)
+	}
+	if !f.tp.State().Private {
+		t.Fatal("the master's state is not private after the run")
+	}
+	st, err := agent.LoadCheckpoint(t.Context(), f.saver, "master-session")
+	if err != nil || !st.Private {
+		t.Fatalf("saved state: %+v %v", st, err)
+	}
+	if _, end := activate(t, f.tp, foreground(2, "thanks"), nil); !end.Private {
+		t.Fatalf("the next run on the rebuilt master is not private: %+v", end)
 	}
 }
 

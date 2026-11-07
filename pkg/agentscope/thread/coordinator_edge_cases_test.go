@@ -244,9 +244,9 @@ func readAll(t *testing.T, s Store) []Entry {
 	return got
 }
 
-// TestCoordinatorRecoveryKeepsTheDisclosure: a waiting input restored after a
+// TestCoordinatorRecoveryKeepsTheDisclosure: a request restored after a
 // restart keeps the disclosure Submit resolved; an entry without one falls
-// back to its visibility.
+// back to its visibility. A parked request keeps it too.
 func TestCoordinatorRecoveryKeepsTheDisclosure(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -260,9 +260,18 @@ func TestCoordinatorRecoveryKeepsTheDisclosure(t *testing.T) {
 		{"contradicting", Entry{Kind: KindUserInput, Visibility: EdgeOnly, Disclosure: DiscloseShared}, DiscloseEdgeOnly},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			store := NewMemoryStore(WithClock(fixedClock()))
 			tc.in.Content = textBlocks("a question")
+			if got := recoveredQuery(&tc.in).Disclosure; got != tc.want {
+				t.Fatalf("restored disclosure = %q, want %q", got, tc.want)
+			}
+			// Restarted twice already: the request is parked, not resumed.
+			store := NewMemoryStore(WithClock(fixedClock()))
 			mustAppend(t, store, nil, tc.in)
+			for _, key := range []string{"requeue:1", "requeue:1:again"} {
+				mk := markerEntry(MarkerRestarted, 1, "restarted")
+				mk.DedupKey = key
+				mustAppend(t, store, nil, mk)
+			}
 			edge, cloud := edgeCloud()
 			env := newCoEnv(t, store, nil, edge, cloud)
 			env.c.mu.Lock()

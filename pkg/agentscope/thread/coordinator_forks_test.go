@@ -3,6 +3,7 @@ package thread
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -143,146 +144,184 @@ func TestCoordinatorPeerForkNeedsNewSealedOutput(t *testing.T) {
 	}
 }
 
-func TestCoordinatorOwnForkAppliedAfterPeer(t *testing.T) {
-	env, _, cloud := forkEnv(t, nil, nil)
-	cloud.setState(func(s *ParticipantState) { s.Window = 1000 })
-	var summaryFirst bool
-	cloud.beforeApply = func() { summaryFirst = len(findEntries(env.log(), KindSummary, "")) == 1 }
-	cloud.push(grow(700, "big answer"))
-	env.say("go")
-	env.idle()
-	if got := cloud.appliedOwn(); len(got) != 1 || got[0] != "own summary text" {
-		t.Fatalf("applied = %v", got)
+// ownEnv is forkEnv with the own notes scheduled at small sizes and the
+// peer summary rules off, so peer summaries come only with own notes.
+func ownEnv(t *testing.T) (*coEnv, *fakeForker) {
+	t.Helper()
+	env, _, cloud := forkEnv(t, nil, func(cfg *Config) {
+		cfg.Summaries.PeerEvery = 1 << 30
+		cfg.Summaries.PeerRatio = -1
+		cfg.Summaries.OwnInit = 600
+		cfg.Summaries.OwnEvery = 300
+	})
+	return env, cloud
+}
+
+// TestCoordinatorOwnNotesFollowClaudeCode: the own notes start once the
+// input reaches OwnInit, then update whenever it grew OwnEvery, as Claude
+// Code's session memory does. An update sends the notes and gets edits
+// back; the edited notes are offered, not applied. A compaction (the input
+// dropping) lowers the baseline.
+func TestCoordinatorOwnNotesFollowClaudeCode(t *testing.T) {
+	env, cloud := ownEnv(t)
+	cloud.push(grow(500, "a"), grow(700, "b"), grow(800, "c"), grow(1000, "d"), grow(400, "e"), grow(650, "f"), grow(700, "g"))
+	ownSpecs := func() []ForkSpec {
+		var out []ForkSpec
+		for _, sp := range cloud.forkSpecs() {
+			if sp.Prompt == DefaultOwnPrompt || sp.Prompt == DefaultOwnUpdatePrompt {
+				out = append(out, sp)
+			}
+		}
+		return out
 	}
-	if !summaryFirst {
-		t.Fatal("the own summary was applied before the peer summary was written")
-	}
-	specs := cloud.forkSpecs()
-	var own *ForkSpec
-	for i := range specs {
-		if specs[i].Validate == nil {
-			own = &specs[i]
+	step := func(q string, wantOwn int) {
+		t.Helper()
+		env.say(q)
+		env.idle()
+		if n := len(ownSpecs()); n != wantOwn {
+			t.Fatalf("after %q: %d own forks, want %d", q, n, wantOwn)
 		}
 	}
-	if own == nil || own.Prompt != DefaultOwnPrompt || own.MaxTokens != defaultOwnMaxTokens {
-		t.Fatalf("own spec = %+v", own)
+	step("a", 0) // 500: below OwnInit
+	step("b", 1) // 700: the first notes
+	first := ownSpecs()[0]
+	if first.Prompt != DefaultOwnPrompt || first.Appendix != "" || first.Validate == nil || first.MaxTokens != defaultOwnMaxTokens {
+		t.Fatalf("first own spec = %+v", first)
 	}
-	if tot := env.c.Ledger().TotalsByKind()[UsageForkOwn]; tot.Calls != 1 || tot.InputTokens != 20 {
+	step("c", 1) // 800: grew 100
+	cloud.fmu.Lock()
+	cloud.ownOut = ForkOutput{Text: editFind + "\nown summary text\n" + editSep + "\nown notes v2\n" + editReplace, Calls: 1}
+	cloud.fmu.Unlock()
+	step("d", 2) // 1000: grew 300 since the first notes
+	upd := ownSpecs()[1]
+	if upd.Prompt != DefaultOwnUpdatePrompt || upd.Appendix != "Your notes so far:\nown summary text" {
+		t.Fatalf("update spec = %+v", upd)
+	}
+	if fb, ok := upd.Validate("not an edit of anything\n" + editFind + "\nmissing\n" + editSep + "\nx\n" + editReplace); ok || !strings.Contains(fb, "edit 1") {
+		t.Fatalf("the update validator accepted an edit that does not apply: %q", fb)
+	}
+	if got := cloud.offeredOwn(); len(got) != 2 || got[0] != "own summary text" || got[1] != "own notes v2" {
+		t.Fatalf("offered = %q", got)
+	}
+	step("e", 2) // 400: compacted; the baseline drops to 400
+	step("f", 2) // 650: grew 250
+	cloud.fmu.Lock()
+	cloud.ownOut = ForkOutput{Text: editFind + "\n" + editSep + "\nnext: book the hotel\n" + editReplace, Calls: 1}
+	cloud.fmu.Unlock()
+	step("g", 3) // 700: grew 300 since the compaction
+	if got := cloud.offeredOwn(); len(got) != 3 || got[2] != "own notes v2\nnext: book the hotel" {
+		t.Fatalf("offered = %q", got)
+	}
+	if tot := env.c.Ledger().TotalsByKind()[UsageForkOwn]; tot.Calls != 3 {
 		t.Fatalf("own fork ledger = %+v", tot)
 	}
+}
+
+// TestCoordinatorOwnNotesFailures: a failed own fork and an update whose
+// edits do not apply leave the notes as they were; notes over OwnMaxTokens
+// are middle-cut; an offer the participant refuses still leaves the notes as
+// the base of the next update.
+func TestCoordinatorOwnNotesFailures(t *testing.T) {
+	env, _, cloud := forkEnv(t, nil, func(cfg *Config) {
+		cfg.Summaries.PeerEvery = 1 << 30
+		cfg.Summaries.PeerRatio = -1
+		cfg.Summaries.OwnInit = 600
+		cfg.Summaries.OwnEvery = 300
+		cfg.Summaries.OwnMaxTokens = 50
+	})
+	cloud.push(grow(700, "a"), grow(1000, "b"), grow(1300, "c"), grow(1600, "d"), grow(1900, "e"), grow(2200, "f"),
+		grow(2500, "g"), grow(2800, "h"))
+	notes := func() string {
+		env.c.mu.Lock()
+		defer env.c.mu.Unlock()
+		return env.c.parts["cloud"].ownNotes
+	}
+	step := func(q string, set func()) {
+		t.Helper()
+		cloud.fmu.Lock()
+		set()
+		cloud.fmu.Unlock()
+		env.say(q)
+		env.idle()
+	}
+	step("a", func() { cloud.forkErr = errors.New("rate limited") })
+	if n, got := notes(), cloud.offeredOwn(); n != "" || len(got) != 0 {
+		t.Fatalf("after a failed fork: notes %q, offered %q", n, got)
+	}
+	step("b", func() { cloud.forkErr = nil })
+	if n := notes(); n != "own summary text" {
+		t.Fatalf("notes = %q", n)
+	}
+	step("c", func() {
+		cloud.ownOut = ForkOutput{Text: editFind + "\nnot in the notes\n" + editSep + "\nx\n" + editReplace, Calls: 1}
+	})
+	if n, got := notes(), cloud.offeredOwn(); n != "own summary text" || len(got) != 1 {
+		t.Fatalf("an update that does not apply: notes %q, offered %q", n, got)
+	}
+	step("d", func() {
+		cloud.ownOut = ForkOutput{Text: editFind + "\n" + editSep + "\n" + strings.Repeat("hotel ", 100) + "\n" + editReplace, Calls: 1}
+	})
+	if got := cloud.offeredOwn(); len(got) != 2 || !strings.Contains(got[1], "[…]") || estimateText(got[1]) > 50 {
+		t.Fatalf("notes over the cap: %q", got)
+	}
+	motels := strings.TrimSpace(strings.Repeat("motel ", 25))
+	cut := notes()
+	step("e", func() {
+		cloud.ownOut = ForkOutput{Text: editFind + "\n" + cut + "\n" + editSep + "\nHotel list:\n" + motels + "\n" + editReplace, Calls: 1}
+		cloud.offerErr = fmt.Errorf("%w: the master was rebuilt", ErrStale)
+	})
+	step("f", func() {
+		cloud.ownOut = ForkOutput{Text: editFind + "\nHotel list:\n" + editSep + "\nInn list:\n" + editReplace + "\n" +
+			editFind + "\n" + editSep + "\nnext: book\n" + editReplace, Calls: 1}
+		cloud.offerErr = errors.New("disk full")
+	})
+	want := "Inn list:\n" + motels + "\nnext: book"
+	if n, got := notes(), cloud.offeredOwn(); n != want || len(got) != 2 {
+		t.Fatalf("after refused offers: notes %q, offered %q", n, got)
+	}
+	// A remark in place of the edits is dropped; NO CHANGES keeps the notes.
+	step("g", func() {
+		cloud.ownOut = ForkOutput{Text: "The notes are current.", Calls: 1}
+		cloud.offerErr = nil
+	})
+	step("h", func() { cloud.ownOut = ForkOutput{Text: "NO CHANGES", Calls: 1} })
+	if n, got := notes(), cloud.offeredOwn(); n != want || len(got) != 3 || got[2] != want {
+		t.Fatalf("after a remark and NO CHANGES: notes %q, offered %q", n, got)
+	}
+}
+
+// TestCoordinatorOwnNotesWaitForThePeerSummary: notes are offered only once a
+// peer summary covers their snapshot, because installing them drops the
+// history a peer summary still needs. Far from the participant's
+// compaction line the notes are kept but not offered; near it a stale peer
+// summary is written from the same snapshot first.
+func TestCoordinatorOwnNotesWaitForThePeerSummary(t *testing.T) {
+	env, cloud := ownEnv(t)
+	cloud.setState(func(s *ParticipantState) { s.CompactAt = 100000 })
+	var summaries int
+	cloud.beforeOffer = func() { summaries = len(findEntries(env.log(), KindSummary, "")) }
+	cloud.push(grow(700, "far from the line"), func(r *fakeRun) *ActivationEnd {
+		r.f.setState(func(s *ParticipantState) { s.InputTokens, s.CompactAt = 1000, 1200 })
+		return r.reply("near the line")
+	})
+	env.say("a")
+	env.idle()
+	if n := len(findEntries(env.log(), KindSummary, "")); n != 0 || len(cloud.offeredOwn()) != 0 {
+		t.Fatalf("far from the line: %d peer summaries, offered %q", n, cloud.offeredOwn())
+	}
 	env.c.mu.Lock()
-	last := env.c.parts["cloud"].lastInput
+	kept := env.c.parts["cloud"].ownNotes
 	env.c.mu.Unlock()
-	if last != 1000 {
-		t.Fatalf("lastInput after the own summary = %d", last)
+	if kept != "own summary text" {
+		t.Fatalf("kept notes = %q", kept)
 	}
-}
-
-func TestCoordinatorOwnSummaryWaitsForIdle(t *testing.T) {
-	env, _, cloud := forkEnv(t, nil, nil)
-	c := env.c
-	ps := c.parts["cloud"]
-	c.mu.Lock()
-	ps.running = &activation{part: ps}
-	c.mu.Unlock()
-	c.finishOwn(&forkJob{ps: ps, snap: fakeSnap{}}, &ForkOutput{Text: "own text", Calls: 1}, nil)
-	if got := cloud.appliedOwn(); len(got) != 0 {
-		t.Fatalf("applied while busy: %v", got)
-	}
-	c.mu.Lock()
-	pending := ps.pendingOwn != nil
-	ps.running = nil
-	c.mu.Unlock()
-	if !pending {
-		t.Fatal("the result was not kept for later")
-	}
-	c.afterEnd(&activation{part: ps}, types.ReplyError, true)
-	if got := cloud.appliedOwn(); len(got) != 1 || got[0] != "own text" {
-		t.Fatalf("applied = %v", got)
-	}
-
-	// A stale snapshot drops the summary.
 	cloud.fmu.Lock()
-	cloud.applyErr = ErrStale
+	cloud.ownOut = ForkOutput{Text: noteNoChange, Calls: 1}
 	cloud.fmu.Unlock()
-	cloud.setState(func(s *ParticipantState) { s.InputTokens = 5 })
-	c.finishOwn(&forkJob{ps: ps, snap: fakeSnap{}}, &ForkOutput{Text: "stale text", Calls: 1}, nil)
-	c.mu.Lock()
-	last, maint, kept := ps.lastInput, ps.maint, ps.pendingOwn
-	c.mu.Unlock()
-	if last == 5 || maint || kept != nil {
-		t.Fatalf("stale summary: lastInput %d maint %v pending %v", last, maint, kept)
-	}
-	// An error or an empty text applies nothing.
-	c.finishOwn(&forkJob{ps: ps, snap: fakeSnap{}}, &ForkOutput{}, errors.New("fork failed"))
-	c.finishOwn(&forkJob{ps: ps, snap: fakeSnap{}}, &ForkOutput{Text: "  "}, nil)
-	if got := cloud.appliedOwn(); len(got) != 2 {
-		t.Fatalf("applied = %v", got)
-	}
+	env.say("b")
 	env.idle()
-}
-
-// TestCoordinatorOwnSummaryFinishedBeforeSettle covers an own summary that
-// finished after afterEnd looked for one but before its activation settled:
-// settle applies it, instead of leaving it for the end of the next
-// activation while the Coordinator reports idle.
-func TestCoordinatorOwnSummaryFinishedBeforeSettle(t *testing.T) {
-	env, _, cloud := forkEnv(t, nil, nil)
-	c := env.c
-	ps := c.parts["cloud"]
-	a := &activation{part: ps}
-	c.mu.Lock()
-	ps.running = a
-	c.addWorkLocked() // the activation's unit, which settle releases
-	c.mu.Unlock()
-	c.finishOwn(&forkJob{ps: ps, snap: fakeSnap{}}, &ForkOutput{Text: "own text", Calls: 1}, nil)
-	if got := cloud.appliedOwn(); len(got) != 0 {
-		t.Fatalf("applied while running: %v", got)
-	}
-	c.settle(a)
-	env.idle()
-	if got := cloud.appliedOwn(); len(got) != 1 || got[0] != "own text" {
-		t.Fatalf("applied = %v", got)
-	}
-	c.mu.Lock()
-	maint, kept := ps.maint, ps.pendingOwn
-	c.mu.Unlock()
-	if maint || kept != nil {
-		t.Fatalf("after settle: maint %v pending %v", maint, kept)
-	}
-}
-
-// TestCoordinatorWakeAfterOwnSummary covers a Notify report that reaches
-// the idle owner while its own summary is applied: it cannot wake the owner
-// then, so ending the maintenance does.
-func TestCoordinatorWakeAfterOwnSummary(t *testing.T) {
-	env, edge, cloud := forkEnv(t, nil, nil)
-	env.say("go")
-	env.idle()
-	c := env.c
-	ps := c.parts["cloud"]
-	if owner, _ := c.Owner(); owner != "cloud" {
-		t.Fatalf("owner = %s", owner)
-	}
-	c.mu.Lock()
-	ps.maint = true
-	c.addWorkLocked()
-	c.mu.Unlock()
-	edge.mu.Lock()
-	h := edge.host
-	edge.mu.Unlock()
-	rep, err := h.Report(context.Background(), ReportRequest{From: Origin{Participant: "edge"}, Text: "the scan finished", To: []string{"cloud"}, Notify: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n := len(cloud.activations()); n != 1 {
-		t.Fatalf("woken during maintenance: %d activations", n)
-	}
-	c.endMaint(ps)
-	env.idle()
-	acts := cloud.activations()
-	if len(acts) != 2 || acts[1].Trigger.Seq != rep || acts[1].Trigger.Kind != KindReport {
-		t.Fatalf("the report did not wake the owner after maintenance: %+v", acts)
+	if got := cloud.offeredOwn(); len(got) != 1 || summaries != 1 {
+		t.Fatalf("near the line: offered %q after %d peer summaries", got, summaries)
 	}
 }
 
@@ -373,27 +412,57 @@ func TestMiddleCut(t *testing.T) {
 	}
 }
 
-// TestCoordinatorOwnForkBringsThePeerFork: an own summary replaces the
-// history it covers, so when it falls due a stale peer summary is written
-// from the same snapshot even though the growth since the last one is below
-// PeerEvery; the own summary is applied after it.
-func TestCoordinatorOwnForkBringsThePeerFork(t *testing.T) {
-	env, _, cloud := forkEnv(t, nil, func(cfg *Config) { cfg.Summaries.PeerEvery = 1 << 30 })
-	cloud.setState(func(s *ParticipantState) { s.Window = 1000 })
-	var summaryFirst bool
-	cloud.beforeApply = func() { summaryFirst = len(findEntries(env.log(), KindSummary, "")) == 1 }
-	cloud.push(grow(700, "big answer"))
-	env.say("go")
+// TestCoordinatorPeerForkByEdgeWindow: without PeerEvery, the summary for the
+// edge is refreshed when what a takeover would bring it (the newest summary
+// and the entries after it) plus what the last reply added reaches 0.8 of
+// the edge's window, and not before; after the refresh the load is small
+// again.
+func TestCoordinatorPeerForkByEdgeWindow(t *testing.T) {
+	edge := newFakePart("edge", ZoneEdge)
+	edge.desc.Window = 1000 // the limit is 800 tokens
+	cloud := newFakeForker("cloud")
+	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = zoneRouter() }, edge, cloud)
+	long := strings.Repeat("w", 1200) // about 300 tokens a reply
+	cloud.push(replyWith(long), replyWith(long+"."), replyWith("short"))
+
+	env.say("first")
+	env.idle()
+	if n := len(findEntries(env.log(), KindSummary, "")); n != 0 {
+		t.Fatalf("a summary after the first reply (load about 320 + 320 < 800): %d", n)
+	}
+	env.say("second")
 	env.idle()
 	sums := findEntries(env.log(), KindSummary, "")
-	if len(sums) != 1 || len(cloud.appliedOwn()) != 1 {
-		t.Fatalf("want one peer summary and one own summary: %d and %v", len(sums), cloud.appliedOwn())
+	if len(sums) != 1 {
+		t.Fatalf("want one summary once load and rise pass 800: %d", len(sums))
 	}
-	if !summaryFirst {
-		t.Fatal("the own summary was applied before the peer summary was written")
+	env.say("third")
+	env.idle()
+	if n := len(findEntries(env.log(), KindSummary, "")); n != 1 {
+		t.Fatalf("the refresh left a small load, yet another summary was written: %d", n)
 	}
-	specs := cloud.forkSpecs()
-	if len(specs) != 2 {
-		t.Fatalf("forks = %d, want the peer and own forks", len(specs))
+}
+
+// TestPeerBudget: the peer summary's size follows the target: its
+// SummaryBudget, else 5/6 of the summary budget it reports, else 5/16 of
+// its window, else 1,024.
+func TestPeerBudget(t *testing.T) {
+	cases := []struct {
+		name string
+		d    Descriptor
+		st   ParticipantState
+		want int
+	}{
+		{"descriptor", Descriptor{SummaryBudget: 700, Window: 8192}, ParticipantState{SummaryTokens: 3000}, 700},
+		{"reported budget", Descriptor{Window: 8192}, ParticipantState{SummaryTokens: 3000}, 2500},
+		{"reported window", Descriptor{Window: 4096}, ParticipantState{Window: 8192}, 2560},
+		{"descriptor window", Descriptor{Window: 8192}, ParticipantState{}, 2560},
+		{"floor", Descriptor{Window: 400}, ParticipantState{}, 256},
+		{"unknown", Descriptor{}, ParticipantState{}, 1024},
+	}
+	for _, tc := range cases {
+		if got := peerBudget(&tc.d, tc.st); got != tc.want {
+			t.Errorf("%s: %d, want %d", tc.name, got, tc.want)
+		}
 	}
 }

@@ -126,14 +126,18 @@ type ContextConfig struct {
 	SummaryMaxTokens int
 
 	// ThreadSummaryTokens (EXPERIMENTAL) is the budget the agent's own summary
-	// shares with a peer summary it holds (see ThreadUpdate.PeerSummary).
-	// When positive, the own summary gets what the peer summary leaves, at
-	// least 256 estimated tokens and never more than the SummaryMaxTokens
-	// budget; a peer summary that arrives leaves the own summary
-	// middle-elided to that share at once. The peer summary and thread index
-	// are then also left out of the reserve, so the recent tail keeps its
-	// ReserveRatio share (the reserve stays under 0.75 of the window). Zero
-	// (the default) changes nothing.
+	// shares with a peer summary it holds (see ThreadUpdate.PeerSummary):
+	// the own summary gets what the peer summary leaves, at least 256
+	// estimated tokens and never more than the SummaryMaxTokens budget, and
+	// a peer summary that arrives leaves the own summary middle-elided to
+	// that share at once. The peer summary and thread index are then also
+	// left out of the reserve, so the recent tail keeps its ReserveRatio
+	// share (the reserve stays under 0.75 of the window). Zero (the default)
+	// sizes the budget from the context window, 3/8 of it (stage 0 gave
+	// 3,000 tokens of an 8,192-token window), and applies it only while a
+	// peer summary is held; a positive value is the budget; a negative value
+	// turns the option off. UnifiedAgent.SetThreadSummaryTokens changes it
+	// at run time.
 	ThreadSummaryTokens int
 
 	// CompactStrategy selects the window layout after compression:
@@ -148,7 +152,9 @@ type ContextConfig struct {
 	// hard threshold (TriggerRatio) later triggers — or Compact is called —
 	// a still-valid snapshot result is applied instantly instead of blocking
 	// the reply on a summarization call; a stale or missing result falls
-	// back to the synchronous path. The applied summary covers the snapshot
+	// back to the synchronous path, and so does an automatic trigger whose
+	// context is still at the threshold after the result went in. The
+	// applied summary covers the snapshot
 	// prefix, so messages appended since the snapshot stay raw: precompression
 	// trades a slightly earlier next compaction for hiding the latency.
 	//
@@ -380,12 +386,17 @@ func (a *UnifiedAgent) compressContextImpl(ctx context.Context, cfg *ContextConf
 		"threshold": threshold,
 	}).Info("context compression triggered")
 
-	// A background pre-compression (PrecompressRatio) that already finished
-	// against a still-valid snapshot applies instantly, skipping the blocking
-	// summarization call. Stale or missing results fall through to the
-	// synchronous path.
+	// A background pre-compression (PrecompressRatio) or an offered summary
+	// (OfferSummary) that is still valid applies instantly, skipping the
+	// blocking summarization call. Stale or missing results fall through to
+	// the synchronous path, and so does an automatic trigger whose context is
+	// still at the threshold after the summary went in (as Claude Code falls
+	// back from its session-memory compaction).
 	if a.applyReadyPrecompress(ctx) {
-		return nil
+		if force || a.model.CountTokens(a.prepareModelInput(ctx), toolSchemas) < threshold {
+			return nil
+		}
+		logrus.WithField("agent", a.name).Info("context still at the threshold after the ready summary; compressing")
 	}
 
 	reserveTokens := a.reserveTokens(cfg, ctxSize)

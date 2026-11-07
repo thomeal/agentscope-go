@@ -52,7 +52,7 @@ func (a *UnifiedAgent) maybeArmPrecompress(ctx context.Context, cfg *ContextConf
 	}
 
 	a.mu.Lock()
-	if p := a.pendingPrecompress; p != nil {
+	if p := a.readyLocked(); p != nil {
 		// A result that no longer matches the live state is dropped so a
 		// fresh generation can start; a still-valid one is left for the hard
 		// trigger to consume.
@@ -60,7 +60,7 @@ func (a *UnifiedAgent) maybeArmPrecompress(ctx context.Context, cfg *ContextConf
 			a.mu.Unlock()
 			return
 		}
-		a.pendingPrecompress = nil
+		a.dropReadyLocked()
 	}
 	if a.precompressRunning || len(a.state.Context) == 0 {
 		a.mu.Unlock()
@@ -130,6 +130,8 @@ func (a *UnifiedAgent) runPrecompress(ctx context.Context, cfg *ContextConfig, c
 
 	last := snapshot[len(snapshot)-1]
 	a.mu.Lock()
+	// The background result replaces whatever waited, an offer included.
+	a.dropReadyLocked()
 	a.pendingPrecompress = &precompressResult{
 		prevSummary: prevSummary,
 		summary:     newSummary,
@@ -140,6 +142,23 @@ func (a *UnifiedAgent) runPrecompress(ctx context.Context, cfg *ContextConfig, c
 	}
 	a.mu.Unlock()
 	logrus.WithField("agent", a.name).Info("background pre-compression ready")
+}
+
+// readyLocked returns the summary waiting for the trigger: the pending
+// background result or offer, else the offer the state carries after a
+// reload. Caller holds a.mu.
+func (a *UnifiedAgent) readyLocked() *precompressResult {
+	if a.pendingPrecompress == nil && a.state.SummaryOffer != nil {
+		a.pendingPrecompress = a.state.SummaryOffer.result()
+	}
+	return a.pendingPrecompress
+}
+
+// dropReadyLocked drops the summary waiting for the trigger, the state's
+// offer included. Caller holds a.mu.
+func (a *UnifiedAgent) dropReadyLocked() {
+	a.pendingPrecompress = nil
+	a.state.SummaryOffer = nil
 }
 
 // validLocked reports whether the result still matches the live state: the
@@ -162,7 +181,7 @@ func (p *precompressResult) validLocked(state *AgentState) bool {
 // applicable is pending.
 func (a *UnifiedAgent) applyReadyPrecompress(ctx context.Context) bool {
 	a.mu.Lock()
-	p := a.pendingPrecompress
+	p := a.readyLocked()
 	if p == nil {
 		a.mu.Unlock()
 		return false
@@ -170,11 +189,11 @@ func (a *UnifiedAgent) applyReadyPrecompress(ctx context.Context) bool {
 	if !p.validLocked(a.state) {
 		// Stale at the hard trigger stays stale (summary and context only
 		// diverge further): drop it so later rounds can arm afresh.
-		a.pendingPrecompress = nil
+		a.dropReadyLocked()
 		a.mu.Unlock()
 		return false
 	}
-	a.pendingPrecompress = nil
+	a.dropReadyLocked()
 	a.mu.Unlock()
 
 	newSummary := p.summary

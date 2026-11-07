@@ -79,8 +79,12 @@ type TeamParticipant struct {
 	queued       []agent.ThreadUpdate
 	queuedCursor uint64
 	queuedTaint  bool
-	queuedTokens int // estimated input before the first master: the loaded state plus the queued updates
-	actSync      *thread.Sync
+	// queuedPrivate is the loaded state's Private with the queued updates
+	// on top; queuedPlan keeps a clear from lowering it, as on the agent.
+	queuedPrivate bool
+	queuedPlan    bool
+	queuedTokens  int // estimated input before the first master: the loaded state plus the queued updates
+	actSync       *thread.Sync
 	// syncApplied is set once the leader applied actSync (or it was empty).
 	syncApplied bool
 	run         *pipeline.TeamRun
@@ -116,6 +120,7 @@ func NewTeamParticipant(cfg TeamConfig) (*TeamParticipant, error) { //nolint:goc
 					c.desc.Name, st.SchemaVersion, agent.StateSchemaVersion)
 			}
 			tp.restored, tp.queuedCursor, tp.queuedTaint = st.ThreadCursor, st.ThreadCursor, st.Tainted
+			tp.queuedPrivate, tp.queuedPlan = st.Private, len(st.Plan) > 0
 			tp.queuedTokens = stateTokens(st)
 		}
 	}
@@ -216,13 +221,14 @@ func (tp *TeamParticipant) Release(h thread.Host) { tp.c.release(h) }
 func (tp *TeamParticipant) State() thread.ParticipantState {
 	busy := tp.c.busy()
 	tp.mu.Lock()
-	m, cursor, tainted, tokens := tp.master, tp.queuedCursor, tp.queuedTaint, tp.queuedTokens
+	m, cursor, tainted, private, tokens := tp.master, tp.queuedCursor, tp.queuedTaint, tp.queuedPrivate, tp.queuedTokens
 	tp.mu.Unlock()
 	if m == nil {
-		return thread.ParticipantState{Cursor: cursor, InputTokens: tokens, Tainted: tainted, Busy: busy}
+		return thread.ParticipantState{Cursor: cursor, InputTokens: tokens, Tainted: tainted, Private: private, Busy: busy}
 	}
 	v := m.ThreadView()
-	return thread.ParticipantState{Cursor: v.Cursor, InputTokens: v.InputTokens, Window: v.Window, Tainted: v.Tainted, Busy: busy}
+	return thread.ParticipantState{Cursor: v.Cursor, InputTokens: v.InputTokens, Window: v.Window, SummaryTokens: v.SummaryTokens,
+		CompactAt: v.CompactAt, Tainted: v.Tainted, Private: v.Private, Busy: busy}
 }
 
 // Sync applies s to the last master between activations, or queues it
@@ -252,6 +258,9 @@ func (tp *TeamParticipant) Sync(ctx context.Context, s thread.Sync) error { //no
 	}
 	if u.Taint != nil {
 		tp.queuedTaint = *u.Taint
+	}
+	if u.Private != nil {
+		tp.queuedPrivate = *u.Private || (tp.queuedPrivate && tp.queuedPlan)
 	}
 	if u.Reset {
 		tp.queuedTokens = 0
@@ -374,20 +383,26 @@ func (tp *TeamParticipant) Activate(ctx context.Context, act thread.Activation) 
 }
 
 // settle brings the master in line with what the run did once it ended, like
-// AgentParticipant.settle (the taint it was not told about, a note for each
-// writing call whose answer it did not record), and saves its state. The next
+// AgentParticipant.settle (the taint it was not told about, an edge run's
+// privacy, a note for each writing call whose answer it did not record), and
+// saves its state. The next
 // activation builds a new master from the checkpoint, and the agent saves one
 // after each tool step but not after its final answer, so the finished state
 // is saved now, also after a cancellation.
 func (tp *TeamParticipant) settle(ctx context.Context, master *agent.UnifiedAgent, t *tracker, end *thread.ActivationEnd) {
 	ctx = context.WithoutCancel(ctx)
 	u := agent.ThreadUpdate{Messages: t.notes()}
-	if end.Tainted && !master.ThreadView().Tainted {
+	view := master.ThreadView()
+	if end.Tainted && !view.Tainted {
 		v := true
 		u.Taint = &v
 	}
+	if _, private := t.act.flags(); private && !view.Private && tp.c.desc.Zone == thread.ZoneEdge {
+		v := true
+		u.Private = &v
+	}
 	var err error
-	if len(u.Messages) > 0 || u.Taint != nil {
+	if len(u.Messages) > 0 || u.Taint != nil || u.Private != nil {
 		// The run joined the master's reply core, but after a cancellation it
 		// stops reading the master's events, and the goroutine that ends the
 		// event stream may still be finishing: the agent refuses updates
@@ -524,16 +539,17 @@ func msgRunes(msgs []*message.Msg) int {
 	return n
 }
 
-// ApplyOwnSummary installs a summary of the master's own context between
-// activations. A snapshot of an earlier master instance is stale.
-func (tp *TeamParticipant) ApplyOwnSummary(ctx context.Context, snap thread.Snapshot, text string) error {
-	if err := tp.c.beginOp(); err != nil {
-		return err
-	}
-	defer tp.c.endOp()
+// OfferOwnSummary hands the master a summary of its own context to install
+// at its compaction line (agent.OfferSummary). The offer is saved with the
+// master's state, so the master the next activation builds from that state
+// still holds it. A snapshot an earlier master instance took is offered to
+// the current one, which is built from the same checkpoint and matches it
+// by message ID, so notes forked while the next activation started are not
+// lost.
+func (tp *TeamParticipant) OfferOwnSummary(ctx context.Context, snap thread.Snapshot, text string) error {
 	m := tp.currentMaster()
 	if m == nil {
 		return fmt.Errorf("%w: no master has run yet", thread.ErrStale)
 	}
-	return applyOn(ctx, m, snap, text)
+	return offerOn(ctx, m, snap, text, true)
 }

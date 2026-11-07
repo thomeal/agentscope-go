@@ -132,11 +132,17 @@ type Sync struct {
 	Cursor uint64
 	// Taint, when non-nil, sets or clears the participant's taint state.
 	Taint *bool
+	// Private, when non-nil, sets or clears the participant's privacy
+	// (ParticipantState.Private) in the same update: set when the Sync
+	// brings edge-only material into an edge participant, cleared by a
+	// clear that brings none.
+	Private *bool
 }
 
 // Empty reports whether s changes nothing.
 func (s *Sync) Empty() bool {
-	return s == nil || (!s.Reset && s.PeerSummary == nil && s.Index == nil && len(s.Messages) == 0 && s.Cursor == 0 && s.Taint == nil)
+	return s == nil || (!s.Reset && s.PeerSummary == nil && s.Index == nil && len(s.Messages) == 0 && s.Cursor == 0 &&
+		s.Taint == nil && s.Private == nil)
 }
 
 // ParticipantState is a participant's current view of itself.
@@ -144,8 +150,22 @@ type ParticipantState struct {
 	Cursor      uint64
 	InputTokens int // estimated tokens of its next model input
 	Window      int // resolved context window, 0 when unknown
-	Tainted     bool
-	Busy        bool // an activation is running
+	// SummaryTokens is the budget its own summary shares with a peer summary
+	// (agent.ContextConfig.ThreadSummaryTokens in force), 0 when unknown or
+	// off. Peer summaries written for it are sized from it.
+	SummaryTokens int
+	// CompactAt is the estimated input at which the participant compacts
+	// its context (agent.ThreadView.CompactAt), 0 when unknown.
+	CompactAt int
+	Tainted   bool
+	// Private reports whether an edge participant's context may hold
+	// edge-only material: anything edge-only it imported, read or produced
+	// since its last clear, saved with the state that holds it (see
+	// agent.WithPrivacyProbe); an activation that ends Private leaves it
+	// set. After a restart the Coordinator trusts it, so an edge participant
+	// must report it from its restored checkpoint.
+	Private bool
+	Busy    bool // an activation is running
 }
 
 // Activation starts one reply of a participant.
@@ -254,9 +274,11 @@ var ErrStale = errors.New("thread: snapshot is stale")
 type Forker interface {
 	Snapshot() (Snapshot, error)
 	Fork(ctx context.Context, snap Snapshot, spec ForkSpec) (ForkOutput, error)
-	// ApplyOwnSummary replaces the participant's own context with text plus a
-	// recent tail. Between activations only; ErrStale when outdated.
-	ApplyOwnSummary(ctx context.Context, snap Snapshot, text string) error
+	// OfferOwnSummary hands the participant text, a summary of its own
+	// context built from snap, to install when its context next reaches its
+	// compaction line, without a model call (agent.OfferSummary). It may be
+	// called while an activation runs; ErrStale when snap is outdated.
+	OfferOwnSummary(ctx context.Context, snap Snapshot, text string) error
 }
 
 // ---------------------------------------------------------------- host

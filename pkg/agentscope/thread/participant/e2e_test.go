@@ -3,6 +3,7 @@ package participant_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -439,6 +440,8 @@ type sessionOptions struct {
 	store       thread.Store
 	cloudWindow int // the cloud's window and master ContextConfig.ContextSize; default 200000
 	peerEvery   int
+	// ownInit and ownEvery schedule the cloud's own notes (SummaryPolicy).
+	ownInit, ownEvery int
 	// wrapCloud and wrapEdge wrap a participant before the Coordinator gets it.
 	wrapCloud func(tp *participant.TeamParticipant) thread.Participant
 	wrapEdge  func(p *participant.AgentParticipant) thread.Participant
@@ -452,6 +455,8 @@ type sessionOptions struct {
 	persistEdge bool
 	// eventGate makes the collector wait for it before reading any event.
 	eventGate <-chan struct{}
+	// masterOpts are added to the cloud master's options.
+	masterOpts []agent.AgentOption
 }
 
 // session is one Main Thread over real agents.
@@ -628,6 +633,7 @@ func (s *session) buildCloud() {
 				agent.WithStateSaver(s.saver), agent.WithState(st),
 				agent.WithContextConfig(&agent.ContextConfig{ContextSize: o.cloudWindow}),
 			}, opts...)
+			all = append(all, o.masterOpts...)
 			m := agent.NewUnifiedAgent("master", cloudSys, s.master, all...)
 			s.mastersMu.Lock()
 			s.masters = append(s.masters, m)
@@ -681,7 +687,7 @@ func (s *session) start() {
 		Router:         router,
 		Events:         s.evList,
 		Disclosure:     policy,
-		Summaries:      thread.SummaryPolicy{PeerEvery: o.peerEvery},
+		Summaries:      thread.SummaryPolicy{PeerEvery: o.peerEvery, OwnInit: o.ownInit, OwnEvery: o.ownEvery},
 		Limits:         o.limits,
 		CloudReadsEdge: o.cloudReadsEdge,
 	})
@@ -869,7 +875,7 @@ func TestE2EMainThreadSession(t *testing.T) {
 	if rep1.BasedOn != q1 || rep1.Visibility != thread.Shared || rep1.Tainted {
 		t.Fatalf("cloud reply: %s", describe([]thread.Entry{rep1}))
 	}
-	if d := rep1.Digest.Render(); !strings.Contains(d, pipeline.TeamAssignToolName) || !strings.Contains(d, "researcher/read_file notes/hotels.md") {
+	if d := rep1.Digest.Render(); !strings.Contains(d, pipeline.TeamAssignToolName) || !strings.Contains(d, `researcher/read_file {"path":"notes/hotels.md"}`) {
 		t.Fatalf("digest = %q", d)
 	}
 	for _, ev := range agentEvents(s.events.all()) {
@@ -968,7 +974,7 @@ func TestE2EMainThreadSession(t *testing.T) {
 	if repB.Text() != "EDGE-B: the living room lamp is on." || repB.Visibility != thread.Shared {
 		t.Fatalf("edge reply:%s", describe([]thread.Entry{repB}))
 	}
-	if d := repB.Digest.Render(); !strings.Contains(d, "device_control") || !strings.Contains(d, "event_read ×2") {
+	if d := repB.Digest.Render(); !strings.Contains(d, "device_control") || strings.Count(d, "event_read") != 2 {
 		t.Fatalf("edge digest = %q", d)
 	}
 	// Nothing of the cloud reaches the user after the transfer committed.
@@ -1260,7 +1266,7 @@ func TestE2EMainThreadSession(t *testing.T) {
 }
 
 // forkObserver wraps the cloud participant to record when its forks return
-// and when the Coordinator applies an own summary.
+// and when the Coordinator offers its own notes.
 type forkObserver struct {
 	*participant.TeamParticipant
 	store thread.Store
@@ -1291,28 +1297,33 @@ func (o *forkObserver) Fork(ctx context.Context, snap thread.Snapshot, spec thre
 	return out, err
 }
 
-func (o *forkObserver) ApplyOwnSummary(ctx context.Context, snap thread.Snapshot, text string) error {
+func (o *forkObserver) OfferOwnSummary(ctx context.Context, snap thread.Snapshot, text string) error {
 	sums, err := o.store.Read(ctx, 0, thread.Filter{Kinds: []thread.Kind{thread.KindSummary}}, 0)
 	if err != nil {
 		return err
 	}
-	o.note(fmt.Sprintf("apply own after %d summaries", len(sums)))
-	return o.TeamParticipant.ApplyOwnSummary(ctx, snap, text)
+	o.note(fmt.Sprintf("offer own after %d summaries", len(sums)))
+	return o.TeamParticipant.OfferOwnSummary(ctx, snap, text)
 }
 
-// TestE2EOwnSummary covers Fork A: once the cloud's input crosses 0.6 of its
-// small window, an own summary forked from its last request replaces its
-// earlier context, after the peer fork of the same job settled.
+// TestE2EOwnSummary covers Fork A the way Claude Code's session memory
+// works: once the cloud's input reaches OwnInit, notes forked from its last
+// request are offered to the master after the peer fork of the same job
+// settled. The master is rebuilt from its checkpoint for the next request
+// and installs the notes when its context reaches its compaction line,
+// without a compaction call, so that request starts with them.
 func TestE2EOwnSummary(t *testing.T) {
 	store := thread.NewMemoryStore()
 	var obs *forkObserver
-	s := newSession(t, &sessionOptions{store: store, cloudWindow: 4000, wrapCloud: func(tp *participant.TeamParticipant) thread.Participant {
-		obs = &forkObserver{TeamParticipant: tp, store: store}
-		return obs
-	}})
+	s := newSession(t, &sessionOptions{store: store, cloudWindow: 4000, ownInit: 2000, ownEvery: 1000,
+		wrapCloud: func(tp *participant.TeamParticipant) thread.Participant {
+			obs = &forkObserver{TeamParticipant: tp, store: store}
+			return obs
+		}})
+	const notes = "OWN-NOTES: the user is planning Lisbon in spring and sent a long itinerary."
 	s.master.forkText = func(n int, c *wireCall) string {
-		if strings.Contains(c.lastUser(), "Summarize this conversation so you can continue") {
-			return "OWN-SUMMARY: the user is planning Lisbon in spring and sent a long itinerary."
+		if strings.Contains(c.lastUser(), "Write notes on this conversation") {
+			return notes
 		}
 		return fmt.Sprintf("PEER-SUMMARY %d: Lisbon in spring.", n)
 	}
@@ -1322,46 +1333,59 @@ func TestE2EOwnSummary(t *testing.T) {
 	s.submit(&thread.Query{Text: "What is Lisbon like in spring?", Disclosure: thread.DiscloseShared})
 	s.settle()
 	st := s.cloudP.State()
-	if st.Window != 4000 || float64(st.InputTokens) >= 0.6*4000 {
-		t.Fatalf("after the first query the cloud should be under 0.6 of its window: %+v", st)
+	if st.Window != 4000 || st.CompactAt != 3200 || st.InputTokens >= 2000 {
+		t.Fatalf("after the first query the cloud should be under OwnInit: %+v", st)
 	}
 	if calls, _ := ledgerCount(ledger, "cloud", "", thread.UsageForkOwn); calls != 0 {
-		t.Fatalf("no own summary yet: %d", calls)
+		t.Fatalf("no own notes yet: %d", calls)
 	}
 
 	long := "Here is my draft itinerary: " + strings.Repeat("a day trip to Sintra, lunch in Cascais, dinner in Alfama; ", 80)
 	s.master.script(say("A2: the itinerary is too packed; drop Cascais."))
 	s.submit(&thread.Query{Text: long, Disclosure: thread.DiscloseShared})
 	s.settle()
+	st = s.cloudP.State()
+	if st.InputTokens < 2000 || st.InputTokens >= st.CompactAt {
+		t.Fatalf("after the long query the cloud should be between OwnInit and its compaction line: %+v", st)
+	}
 	if calls, known := ledgerCount(ledger, "cloud", "", thread.UsageForkOwn); calls != 1 || known != 1 {
-		t.Fatalf("fork_own usage: %d calls, %d known (state %+v)", calls, known, s.cloudP.State())
+		t.Fatalf("fork_own usage: %d calls, %d known (state %+v)", calls, known, st)
 	}
 	summaries := find(s.log(), thread.KindSummary, "cloud")
-	notes := obs.seen()
-	want := fmt.Sprintf("apply own after %d summaries", len(summaries))
-	if len(notes) < 3 || notes[len(notes)-1] != want || !slices.Contains(notes[len(notes)-3:], "fork peer") || !slices.Contains(notes[len(notes)-3:], "fork own") {
-		t.Fatalf("the own summary must be applied after the job's peer summary was appended: %v (want last %q)", notes, want)
+	seen := obs.seen()
+	want := fmt.Sprintf("offer own after %d summaries", len(summaries))
+	if len(seen) < 3 || seen[len(seen)-1] != want || !slices.Contains(seen[len(seen)-3:], "fork peer") || !slices.Contains(seen[len(seen)-3:], "fork own") {
+		t.Fatalf("the notes must be offered after the job's peer summary was appended: %v (want last %q)", seen, want)
 	}
-	if after := s.cloudP.State(); float64(after.InputTokens) >= 0.6*4000 {
-		t.Fatalf("the own summary did not shrink the cloud's input: %+v", after)
+	if after := s.cloudP.State(); after.InputTokens != st.InputTokens {
+		t.Fatalf("an offer must not change the context before the compaction line: %+v", after)
 	}
 
+	more := "Here is my packing list: " + strings.Repeat("a rain jacket, walking shoes, a phrasebook, sunscreen; ", 80)
 	s.master.script(inspect(func(c *wireCall) {
-		if len(c.msgs) < 3 || c.msgs[0].role != message.RoleSystem || c.msgs[1].text != "[Previous context summary]: OWN-SUMMARY: the user is planning Lisbon in spring and sent a long itinerary." {
-			t.Errorf("the next request must start with the own summary:\n%s", c.text())
+		if len(c.msgs) < 3 || c.msgs[0].role != message.RoleSystem || c.msgs[1].text != "[Previous context summary]: "+notes {
+			t.Errorf("the request must start with the own notes:\n%s", c.text())
 		}
 		text := c.text()
-		if !strings.Contains(text, "A2: the itinerary is too packed; drop Cascais.") {
-			t.Errorf("the recent tail is missing:\n%s", text)
+		for _, keep := range []string{"A2: the itinerary is too packed; drop Cascais.", "Here is my packing list"} {
+			if !strings.Contains(text, keep) {
+				t.Errorf("the recent tail is missing %q:\n%s", keep, text)
+			}
 		}
 		for _, old := range []string{"A1: Lisbon in spring", "What is Lisbon like in spring?", "Here is my draft itinerary"} {
 			if strings.Contains(text, old) {
 				t.Errorf("the summarized context still holds %q:\n%s", old, text)
 			}
 		}
-	}, say("A3: next, book the hotel.")))
-	s.submit(&thread.Query{Text: "Thanks, what next?", Disclosure: thread.DiscloseShared})
+	}, say("A3: pack light; next, book the hotel.")))
+	s.submit(&thread.Query{Text: more, Disclosure: thread.DiscloseShared})
 	s.settle()
+	if n := s.master.count("compact"); n != 0 {
+		t.Fatalf("the notes were not installed: %d compaction calls", n)
+	}
+	if after := s.cloudP.State(); after.InputTokens >= st.CompactAt {
+		t.Fatalf("the notes did not shrink the cloud's input: %+v", after)
+	}
 }
 
 // checkFork asserts that fork is last plus the reply's own answer and one
@@ -1392,8 +1416,9 @@ func checkFork(t *testing.T, last, fork *wireCall, answerText string) {
 // TestE2EFileStoreRecovery stops a session while an activation is blocked,
 // the way a crashed process stops: the log is closed before the activation
 // can seal anything. A new Coordinator over the reopened log and the same
-// participants marks the unanswered input recovered instead of running it
-// again, and the next query carries on from there.
+// participants resumes the request on its owner: the input quotes it and
+// warns that work done before may or may not have taken effect, the
+// restored master holds its history once, and the next query carries on.
 func TestE2EFileStoreRecovery(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "thread.jsonl")
 	first, err := thread.OpenFileStore(path)
@@ -1434,56 +1459,92 @@ func TestE2EFileStoreRecovery(t *testing.T) {
 	if before := s.head(); before != blocked {
 		t.Fatalf("the crashed session wrote past the blocked input #%d:%s", blocked, describe(s.since(blocked)))
 	}
-	// A restarted process builds its participants anew. The new cloud
-	// participant reads the master's persisted state through Load, so before
-	// its first activation it reports the cursor that state holds.
-	s.rebuild(second)
-	if st := s.cloudP.State(); st.Cursor != blocked || st.InputTokens == 0 {
-		t.Fatalf("the rebuilt cloud reports %+v; want the persisted cursor #%d and an input estimate", st, blocked)
-	}
-
-	rec := one(t, find(s.since(blocked), thread.KindMarker, ""), "recovered marker")
-	if rec.Marker.Kind != thread.MarkerRecovered || rec.BasedOn != blocked || !strings.Contains(rec.Marker.Detail, fmt.Sprintf("#%d", blocked)) {
-		t.Fatalf("recovered marker:%s", describe([]thread.Entry{rec}))
-	}
-	s.events.waitFor(t, "the recovered marker event", func(evs []thread.Event) bool {
-		for _, ev := range evs {
-			if ev.Kind == thread.EventEntry && ev.Entry.Seq == rec.Seq {
-				return true
+	// A restarted process builds its participants anew; the new cloud
+	// participant reads the master's persisted state, which holds the
+	// blocked input. The resumed request is the master's next call.
+	s.master.script(inspect(func(c *wireCall) {
+		text := c.text()
+		note := fmt.Sprintf(`[The session restarted while the user's request #%d "Book the Hotel Aurora for Friday." was being answered`, blocked)
+		if !strings.Contains(text, note) || !strings.Contains(text, "check the actual state before you redo anything") {
+			t.Errorf("the resumed request misses the restart note:\n%s", text)
+		}
+		// The blocked input once as the persisted message, once quoted.
+		for once, n := range map[string]int{"What is Lisbon like in May?": 1, "R1: Lisbon in May is mild.": 1, "Book the Hotel Aurora for Friday.": 2} {
+			if got := strings.Count(text, once); got != n {
+				t.Errorf("the resumed request holds %q %d times, want %d:\n%s", once, got, n, text)
 			}
 		}
-		return false
-	})
+	}, say("R2: I could not confirm the booking; let me check before trying again.")))
+	s.rebuild(second)
+	s.settle()
+
+	rec := one(t, find(s.since(blocked), thread.KindMarker, ""), "restarted marker")
+	if rec.Marker.Kind != thread.MarkerRestarted || rec.BasedOn != blocked || !strings.Contains(rec.Marker.Detail, fmt.Sprintf("#%d", blocked)) {
+		t.Fatalf("restarted marker:%s", describe([]thread.Entry{rec}))
+	}
+	resumed := one(t, find(s.since(blocked), thread.KindReply, "cloud"), "resumed reply")
+	if resumed.BasedOn != rec.Seq {
+		t.Fatalf("resumed reply:%s", describe([]thread.Entry{resumed}))
+	}
 	if owner, _ := s.c.Owner(); owner != "cloud" {
 		t.Fatalf("owner after recovery = %s", owner)
 	}
 
-	// The blocked input is not run again; the next query's request shows it
-	// with its marker, and the history the restored master already holds
-	// only once.
-	s.master.script(inspect(func(c *wireCall) {
-		text := c.text()
-		if !strings.Contains(text, "Book the Hotel Aurora for Friday.") || !strings.Contains(text, "was not answered before the session stopped") {
-			t.Errorf("the next request misses the recovered input or its marker:\n%s", text)
-		}
-		for _, once := range []string{"What is Lisbon like in May?", "R1: Lisbon in May is mild.", "Book the Hotel Aurora for Friday."} {
-			if n := strings.Count(text, once); n != 1 {
-				t.Errorf("the next request holds %q %d times:\n%s", once, n, text)
-			}
-		}
-	}, say("R3: the booking did not go through; shall I try again?")))
+	s.master.script(say("R3: the booking is confirmed."))
 	next := s.submit(&thread.Query{Text: "Did the booking work?", Disclosure: thread.DiscloseShared})
 	s.settle()
 	rep := one(t, find(s.since(next), thread.KindReply, "cloud"), "reply after recovery")
 	if rep.BasedOn != next {
 		t.Fatalf("reply after recovery:%s", describe([]thread.Entry{rep}))
 	}
-	if n := s.master.count("main"); n != 3 {
-		t.Fatalf("master calls = %d; the recovered input must not run again", n)
+	if n := s.master.count("main"); n != 4 {
+		t.Fatalf("master calls = %d; want the first query, the blocked call, the resumed one and the next", n)
 	}
-	for _, e := range s.log() {
-		if e.Kind == thread.KindReply && e.BasedOn == blocked {
-			t.Fatalf("the blocked input got a reply:%s", describe([]thread.Entry{e}))
+}
+
+// TestE2EFailoverHandsOverProgress: the master publishes its plan with
+// update_plan, then its model fails. The log keeps the plan as the run's
+// progress and the failure as a marker; the edge's failover request holds
+// both, and its input is one line pointing at them.
+func TestE2EFailoverHandsOverProgress(t *testing.T) {
+	s := newSession(t, &sessionOptions{masterOpts: []agent.AgentOption{agent.WithPlanTool()}})
+	s.master.script(
+		act("", toolCall("update_plan", map[string]any{"plan": []any{
+			map[string]any{"step": "list hotels near Rua Augusta", "status": "completed"},
+			map[string]any{"step": "compare their prices", "status": "in_progress"},
+		}})),
+		func(context.Context, *wireCall) (*model.ChatResponse, error) {
+			return nil, errors.New("invalid api key")
+		},
+	)
+	var input string
+	s.edge.script(inspect(func(c *wireCall) {
+		text := c.text()
+		input = c.msgs[len(c.msgs)-1].text
+		if !strings.Contains(text, "2. [in_progress] compare their prices") || !strings.Contains(text, "marker failed] cloud failed: participant cloud: invalid api key") {
+			t.Errorf("the edge's request lacks the progress or the failure:\n%s", text)
 		}
+	}, say("E1: Hotel Aurora is the better price.")))
+	q := s.submit(&thread.Query{Text: "Find me a hotel in Lisbon.", Disclosure: thread.DiscloseShared, Explicit: "cloud"})
+	s.settle()
+
+	prog := one(t, find(s.since(q), thread.KindProgress, "cloud"), "cloud progress")
+	var failed thread.Entry
+	for _, e := range find(s.since(q), thread.KindMarker, "") {
+		if e.Marker.Kind == thread.MarkerFailed {
+			failed = e
+		}
+	}
+	if failed.BasedOn != q || prog.BasedOn != q {
+		t.Fatalf("progress and failure:%s", describe([]thread.Entry{prog, failed}))
+	}
+	want := fmt.Sprintf(`[cloud failed: participant cloud: invalid api key (#%d). You now answer the user: continue their request #%d "Find me a hotel in Lisbon." `+
+		`from where cloud left off. What cloud did is in the summary and the entries above; its latest progress is #%d.]`, failed.Seq, q, prog.Seq)
+	if input != want {
+		t.Fatalf("failover input:\n%s\nwant\n%s", input, want)
+	}
+	rep := one(t, find(s.since(q), thread.KindReply, "edge"), "edge reply")
+	if rep.Text() != "E1: Hotel Aurora is the better price." {
+		t.Fatalf("edge reply:%s", describe([]thread.Entry{rep}))
 	}
 }
