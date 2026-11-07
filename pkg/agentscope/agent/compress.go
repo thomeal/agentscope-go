@@ -677,9 +677,10 @@ func (a *UnifiedAgent) splitContextForCompression(reserveTokenBudget int, tools 
 	systemPrompt := a.systemPrompt
 	summary := a.state.Summary
 	plan := a.state.Plan
+	thread := threadPromptMsgs(a.name, a.state.PeerSummary, a.state.ThreadIndex)
 	a.mu.Unlock()
 
-	baseMsgs := compressionBaseMsgs(a.name, systemPrompt, summary, plan)
+	baseMsgs := compressionBaseMsgs(a.name, systemPrompt, summary, thread, plan)
 	if a.contentBlockCompaction {
 		return a.splitContentBlocksForCompression(ctxMsgs, baseMsgs, reserveTokenBudget, tools)
 	}
@@ -687,14 +688,16 @@ func (a *UnifiedAgent) splitContextForCompression(reserveTokenBudget int, tools 
 }
 
 // compressionBaseMsgs builds the invariant head every compression accounting
-// must charge against: the system prompt, the previous summary (when any)
-// and the plan tracker message prepareModelInput injects on every call —
-// counting it is what keeps the reserve fit and the trigger estimate honest.
-func compressionBaseMsgs(agentName, systemPrompt, summary string, plan []tool.PlanItem) []*message.Msg {
+// must charge against: the system prompt, the previous summary (when any),
+// the thread messages (peer summary and index, see threadPromptMsgs) and the
+// plan tracker message prepareModelInput injects on every call — counting
+// them is what keeps the reserve fit and the trigger estimate honest.
+func compressionBaseMsgs(agentName, systemPrompt, summary string, thread []*message.Msg, plan []tool.PlanItem) []*message.Msg {
 	baseMsgs := []*message.Msg{message.SystemMsg(agentName, systemPrompt)}
 	if summary != "" {
 		baseMsgs = append(baseMsgs, message.UserMsg(agentName, "[Previous context summary]: "+summary))
 	}
+	baseMsgs = append(baseMsgs, thread...)
 	if len(plan) > 0 {
 		baseMsgs = append(baseMsgs, planPromptMsg(agentName, plan))
 	}

@@ -71,6 +71,7 @@ func (a *UnifiedAgent) maybeArmPrecompress(ctx context.Context, cfg *ContextConf
 	prevSummary := a.state.Summary
 	systemPrompt := a.systemPrompt
 	plan := append([]tool.PlanItem(nil), a.state.Plan...)
+	thread := threadPromptMsgs(a.name, a.state.PeerSummary, a.state.ThreadIndex)
 	a.precompressRunning = true
 	a.mu.Unlock()
 
@@ -80,13 +81,13 @@ func (a *UnifiedAgent) maybeArmPrecompress(ctx context.Context, cfg *ContextConf
 	// them), so the generation is allowed to finish. Values (tracing, audit)
 	// carry over.
 	go a.runPrecompress(context.WithoutCancel(ctx), &cfgCopy, ctxSize,
-		snapshot, prevSummary, systemPrompt, plan)
+		snapshot, prevSummary, systemPrompt, thread, plan)
 }
 
 // runPrecompress generates the summary for the snapshot. Failures are
 // logged and discarded — the synchronous path owns retries and truncation
 // fallbacks at the hard trigger.
-func (a *UnifiedAgent) runPrecompress(ctx context.Context, cfg *ContextConfig, ctxSize int, snapshot []*message.Msg, prevSummary, systemPrompt string, plan []tool.PlanItem) {
+func (a *UnifiedAgent) runPrecompress(ctx context.Context, cfg *ContextConfig, ctxSize int, snapshot []*message.Msg, prevSummary, systemPrompt string, thread []*message.Msg, plan []tool.PlanItem) {
 	defer func() {
 		a.mu.Lock()
 		a.precompressRunning = false
@@ -103,7 +104,7 @@ func (a *UnifiedAgent) runPrecompress(ctx context.Context, cfg *ContextConfig, c
 		// without reserving anything when nothing is in flight.
 		reserveTokens = 1
 	}
-	baseMsgs := compressionBaseMsgs(a.name, systemPrompt, prevSummary, plan)
+	baseMsgs := compressionBaseMsgs(a.name, systemPrompt, prevSummary, thread, plan)
 	msgsToCompress, msgsToReserve := a.splitMsgsForCompression(snapshot, baseMsgs, reserveTokens, tools)
 	if len(msgsToCompress) == 0 {
 		return

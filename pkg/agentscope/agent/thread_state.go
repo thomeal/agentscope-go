@@ -1,0 +1,521 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"strconv"
+	"strings"
+
+	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/event"
+	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/message"
+	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/model"
+	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/types"
+)
+
+// Thread state seams (EXPERIMENTAL). A host that runs several agents over one
+// shared, append-only log (the thread package) imports log entries into an
+// agent's context, installs summaries other participants wrote and tracks
+// which entries the agent has seen. Everything here is opt-in: an agent whose
+// thread slots are empty behaves exactly as before, on the wire and in its
+// checkpoints (which keep their older schema version).
+
+// ThreadSeqMetadataKey is the Msg.Metadata key that carries the thread seq of
+// an imported thread entry (and of a reply input started WithThreadInput).
+const ThreadSeqMetadataKey = "thread_seq"
+
+// ThreadEventInputInjected names the CustomEvent emitted when boundary input
+// (WithBoundaryInput) was applied inside a reply. Data carries
+// {"cursor": uint64, "count": int}.
+const ThreadEventInputInjected = "thread_input_injected"
+
+// PeerSummary is a summary another participant's model wrote for this agent's
+// window. It covers the shared thread entries with seq <= Through except the
+// Excluded ones.
+type PeerSummary struct {
+	Text     string   `json:"text"`
+	Origin   string   `json:"origin,omitempty"`   // e.g. "cloud/master"
+	Through  uint64   `json:"through,omitempty"`  // coverage: entries with seq <= Through ...
+	Excluded []uint64 `json:"excluded,omitempty"` // ... except these
+	Tainted  bool     `json:"tainted,omitempty"`
+}
+
+// Covers reports whether the summary speaks for the thread entry seq.
+func (p *PeerSummary) Covers(seq uint64) bool {
+	if p == nil || seq > p.Through {
+		return false
+	}
+	for _, x := range p.Excluded {
+		if x == seq {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *PeerSummary) clone() *PeerSummary {
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	cp.Excluded = append([]uint64(nil), p.Excluded...)
+	return &cp
+}
+
+// ThreadSeqOf returns the thread seq stored on m under ThreadSeqMetadataKey.
+// It accepts unsigned and signed integers, float64 (JSON round trips turn a
+// uint64 into float64), json.Number and decimal strings; negative, fractional
+// and out-of-range values are rejected.
+func ThreadSeqOf(m *message.Msg) (uint64, bool) {
+	if m == nil || m.Metadata == nil {
+		return 0, false
+	}
+	v, ok := m.Metadata[ThreadSeqMetadataKey]
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case uint64:
+		return n, true
+	case uint:
+		return uint64(n), true
+	case uint32:
+		return uint64(n), true
+	case int:
+		if n >= 0 {
+			return uint64(n), true
+		}
+	case int64:
+		if n >= 0 {
+			return uint64(n), true
+		}
+	case int32:
+		if n >= 0 {
+			return uint64(n), true
+		}
+	case float64:
+		// 1<<64 is exactly representable; anything at or above it overflows.
+		if n >= 0 && n < math.Ldexp(1, 64) && n == math.Trunc(n) {
+			return uint64(n), true
+		}
+	case json.Number:
+		if s, err := strconv.ParseUint(string(n), 10, 64); err == nil {
+			return s, true
+		}
+	case string:
+		if s, err := strconv.ParseUint(n, 10, 64); err == nil {
+			return s, true
+		}
+	}
+	return 0, false
+}
+
+// threadPromptMsgs builds the thread messages prepareModelInput injects after
+// the agent's own summary: the peer summary and the thread index. It returns
+// nil when both slots are empty, so agents that never use threads send the
+// same requests as before.
+func threadPromptMsgs(agentName string, peer *PeerSummary, index string) []*message.Msg {
+	var msgs []*message.Msg
+	if peer != nil && peer.Text != "" {
+		origin := peer.Origin
+		if origin == "" {
+			origin = "peer"
+		}
+		msgs = append(msgs, message.UserMsg(agentName, "[Summary from "+origin+
+			", covering the shared thread through #"+strconv.FormatUint(peer.Through, 10)+"]:\n"+peer.Text))
+	}
+	if index != "" {
+		msgs = append(msgs, message.UserMsg(agentName,
+			"[Thread index: entries kept out of the summary; read them with thread_read]:\n"+index))
+	}
+	return msgs
+}
+
+// ThreadUpdate is one atomic change to an agent's thread state.
+type ThreadUpdate struct {
+	// Reset clears Context, the agent's own Summary, the read cache, any
+	// pending background precompression and the provider-grounded token
+	// floor (lastModelInputTokens), before anything else applies. Permission
+	// grants, Plan and the toolkit are kept. Only allowed between replies.
+	Reset bool
+	// PeerSummary, when non-nil, replaces the slot. Context messages that
+	// carry a thread seq covered by it (seq <= Through and not Excluded) are
+	// removed: the summary now speaks for them. Messages without a thread seq
+	// (the agent's own turns) are never removed. Removal must not split a
+	// tool_call/tool_result pair; imported messages never hold tool blocks,
+	// so removing whole imported messages is safe. (A seq-tagged message that
+	// does hold tool blocks is kept.) Its Text must not be empty or blank.
+	PeerSummary *PeerSummary
+	// ClearPeerSummary removes the slot (used by tests and resets). It may not
+	// be combined with PeerSummary.
+	ClearPeerSummary bool
+	// Index, when non-nil, replaces ThreadIndex.
+	Index *string
+	// Messages are appended after the removal. They follow Observe's rules
+	// (no system role, no tool_call, tool_result or thinking blocks) and
+	// should carry ThreadSeqMetadataKey. The agent owns them afterwards.
+	Messages []*message.Msg
+	// Cursor is the new ThreadCursor; zero keeps the current value. It may
+	// not move backwards, except in a Reset update: the reset context holds
+	// only what the update brings, so its cursor is set as given (a Reset
+	// with zero keeps the old cursor, so pass the one the new context
+	// matches).
+	Cursor uint64
+	// Taint, when non-nil, sets or clears Tainted.
+	Taint *bool
+}
+
+// BoundaryInput supplies thread updates inside a running reply. It is called
+// at every certified StateReason boundary (where no tool call awaits its
+// result) before the model call; a nil update means nothing to apply.
+type BoundaryInput func(ctx context.Context) (*ThreadUpdate, error)
+
+// WithBoundaryInput installs src as the agent's boundary input (EXPERIMENTAL).
+// Each applied update emits a ThreadEventInputInjected CustomEvent and is
+// persisted before the model call: through the reply-recovery checkpoint when
+// recovery is enabled, otherwise through SaveCheckpoint when a StateSaver is
+// configured. An error from src, an invalid update (Reset is never allowed
+// inside a reply) or a persistence failure ends the reply as an error.
+func WithBoundaryInput(src BoundaryInput) AgentOption {
+	return func(a *UnifiedAgent) { a.boundaryInput = src }
+}
+
+type threadInputKey struct{}
+
+// WithThreadInput marks the input of the reply started with ctx as the thread
+// entry seq (EXPERIMENTAL): the user message the reply appends carries
+// ThreadSeqMetadataKey, and ThreadCursor is raised to seq (never lowered) in
+// the same state update. A resumed reply appends no message, so it ignores
+// the mark. Middleware must wrap, not replace, the reply context for the
+// mark to reach the agent.
+func WithThreadInput(ctx context.Context, seq uint64) context.Context {
+	return context.WithValue(ctx, threadInputKey{}, seq)
+}
+
+func threadInputFrom(ctx context.Context) (uint64, bool) {
+	seq, ok := ctx.Value(threadInputKey{}).(uint64)
+	return seq, ok
+}
+
+// tagThreadInputLocked stamps a reply's user message with its thread seq and
+// raises the cursor. Caller holds a.mu.
+func (a *UnifiedAgent) tagThreadInputLocked(m *message.Msg, seq uint64) {
+	if m.Metadata == nil {
+		m.Metadata = types.JSONObject{}
+	}
+	m.Metadata[ThreadSeqMetadataKey] = seq
+	if seq > a.state.ThreadCursor {
+		a.state.ThreadCursor = seq
+	}
+}
+
+// ThreadView is a copy of an agent's thread state.
+type ThreadView struct {
+	Cursor          uint64
+	PeerSummary     *PeerSummary
+	Index           string
+	Tainted         bool
+	ContextMessages int
+	// InputTokens estimates the model input the next call would send (the
+	// system prompt with state awareness and skill instructions, summaries,
+	// thread messages, plan, context and tool schemas): the model's
+	// CountTokens estimate, floored by the provider-reported input of the
+	// last successful call. It is an estimate only. It uses the raw system
+	// prompt: OnSystemPrompt middleware is not run, so prompt changes a
+	// middleware makes are not counted.
+	InputTokens int
+	// Window is the context size the compression path works against
+	// (ContextConfig.ContextSize, else the model's resolved window, the
+	// smaller of the model and its fallback). It is 0 when neither the
+	// configuration nor the model reports one.
+	Window int
+}
+
+// ThreadView returns a copy of the agent's thread state. It may be called
+// while a reply runs: state is copied under the lock and tokens are counted
+// on the copies afterwards. It runs no middleware (see InputTokens).
+func (a *UnifiedAgent) ThreadView() ThreadView {
+	a.mu.Lock()
+	v := ThreadView{
+		Cursor:          a.state.ThreadCursor,
+		PeerSummary:     a.state.PeerSummary.clone(),
+		Index:           a.state.ThreadIndex,
+		Tainted:         a.state.Tainted,
+		ContextMessages: len(a.state.Context),
+	}
+	input := cloneMsgs(a.modelInputLocked(a.systemPrompt))
+	floor := a.lastModelInputTokens
+	var cfgSize int
+	if a.contextCfg != nil {
+		cfgSize = a.contextCfg.ContextSize
+	}
+	a.mu.Unlock()
+
+	v.InputTokens = max(a.model.CountTokens(input, a.toolkit.GetToolSchemas()), floor)
+	v.Window = a.knownWindow(cfgSize)
+	return v
+}
+
+// knownWindow resolves the window the compression path uses, or 0 when no
+// size is configured and the model reports none (the compression path would
+// then assume defaultContextSize).
+func (a *UnifiedAgent) knownWindow(cfgSize int) int {
+	if cfgSize > 0 {
+		return cfgSize
+	}
+	if model.ResolveContextSize(a.model, 0) <= 0 {
+		return 0
+	}
+	size := model.ResolveContextSize(a.model, defaultContextSize)
+	if a.modelCfg.FallbackModel != nil {
+		size = min(size, model.ResolveContextSize(a.modelCfg.FallbackModel, defaultContextSize))
+	}
+	return size
+}
+
+// cloneMsgs copies each message and its Content slice, so the copies can be
+// read while the reply goroutine keeps appending to or updating the live ones.
+// Blocks are values; nested maps are shared and treated as read-only.
+func cloneMsgs(msgs []*message.Msg) []*message.Msg {
+	if msgs == nil {
+		return nil
+	}
+	out := make([]*message.Msg, len(msgs))
+	for i, m := range msgs {
+		if m == nil {
+			continue
+		}
+		cp := *m
+		cp.Content = append([]message.ContentBlock(nil), m.Content...)
+		out[i] = &cp
+	}
+	return out
+}
+
+// ErrReplyInProgress is wrapped by the error a between-replies operation
+// (ApplyThreadUpdate, ApplySummary, CompactStrict, SetTainted) returns while
+// a reply is still in flight (EXPERIMENTAL): a caller may wait and retry.
+var ErrReplyInProgress = errors.New("a reply is in progress")
+
+// busyLocked rejects a between-replies operation while the agent is running a
+// reply or owned by a Conversation. A reply counts as running until both its
+// event stream has ended (activeReplies) and its reply core has returned
+// (runningCores): the stream can end first when a middleware stops
+// forwarding on cancellation while the core is still inside a tool. Caller
+// holds a.mu.
+func (a *UnifiedAgent) busyLocked(op string) error {
+	if a.activeReplies > 0 || a.runningCores > 0 {
+		return fmt.Errorf("agent %s: %s requires an idle agent; %w", a.name, op, ErrReplyInProgress)
+	}
+	if a.activeConv != nil {
+		return fmt.Errorf("agent %s: %s is not allowed while a conversation owns the agent", a.name, op)
+	}
+	return nil
+}
+
+// validateThreadUpdate checks the parts of u that do not depend on state.
+func validateThreadUpdate(u *ThreadUpdate) error {
+	if u.PeerSummary != nil && u.ClearPeerSummary {
+		return errors.New("agent: thread update: PeerSummary and ClearPeerSummary are mutually exclusive")
+	}
+	// A summary without text would remove the messages it covers while
+	// injecting nothing in their place.
+	if u.PeerSummary != nil && strings.TrimSpace(u.PeerSummary.Text) == "" {
+		return errors.New("agent: thread update: PeerSummary has no text; use ClearPeerSummary to remove the slot")
+	}
+	for i, m := range u.Messages {
+		if m == nil {
+			continue
+		}
+		if err := validateObservedMsg(m); err != nil {
+			return fmt.Errorf("agent: thread update: message %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// validateObservedMsg applies Observe's rules to one message.
+func validateObservedMsg(m *message.Msg) error {
+	if m.Role == message.RoleSystem {
+		return errors.New("system-role messages are not allowed")
+	}
+	if len(m.GetContentBlocks(message.ContentBlockToolCall)) > 0 {
+		return errors.New("messages containing tool_call blocks are not allowed")
+	}
+	if len(m.GetContentBlocks(message.ContentBlockToolResult)) > 0 {
+		return errors.New("messages containing tool_result blocks are not allowed")
+	}
+	if len(m.GetContentBlocks(message.ContentBlockThinking)) > 0 {
+		return errors.New("messages containing thinking blocks are not allowed")
+	}
+	return nil
+}
+
+// checkCursorLocked rejects a cursor that would move backwards.
+func (a *UnifiedAgent) checkCursorLocked(cursor uint64) error {
+	if cursor != 0 && cursor < a.state.ThreadCursor {
+		return fmt.Errorf("agent: thread update: cursor %d is behind the current cursor %d", cursor, a.state.ThreadCursor)
+	}
+	return nil
+}
+
+// applyThreadUpdateLocked applies a validated update. Caller holds a.mu.
+func (a *UnifiedAgent) applyThreadUpdateLocked(u *ThreadUpdate) {
+	if u.Reset {
+		a.state.Context = nil
+		a.state.Summary = ""
+		a.state.ReadCacheData = nil
+		a.pendingPrecompress = nil
+		a.lastModelInputTokens = 0
+		a.lastCapture = nil
+		a.compactionVersion++
+		if a.readCache != nil {
+			a.readCache.CleanFileCache(nil)
+		}
+	}
+	if u.ClearPeerSummary {
+		a.state.PeerSummary = nil
+	}
+	if u.PeerSummary != nil {
+		ps := u.PeerSummary.clone()
+		a.state.PeerSummary = ps
+		if a.removeCoveredLocked(ps) {
+			// The provider-grounded floor measured the larger context; keep it
+			// from triggering a compaction of the shrunken one.
+			a.lastModelInputTokens = 0
+		}
+	}
+	if u.Index != nil {
+		a.state.ThreadIndex = *u.Index
+	}
+	for _, m := range u.Messages {
+		if m != nil {
+			a.state.Context = append(a.state.Context, m)
+		}
+	}
+	if u.Cursor != 0 {
+		a.state.ThreadCursor = u.Cursor
+	}
+	if u.Taint != nil {
+		a.state.Tainted = *u.Taint
+	}
+}
+
+// removeCoveredLocked drops context messages whose thread seq the summary
+// covers and reports whether anything was removed. The context slice is
+// rebuilt rather than filtered in place: earlier snapshots may share it.
+func (a *UnifiedAgent) removeCoveredLocked(ps *PeerSummary) bool {
+	kept := make([]*message.Msg, 0, len(a.state.Context))
+	for _, m := range a.state.Context {
+		if seq, ok := ThreadSeqOf(m); ok && ps.Covers(seq) && !holdsToolBlocks(m) {
+			continue
+		}
+		kept = append(kept, m)
+	}
+	if len(kept) == len(a.state.Context) {
+		return false
+	}
+	a.state.Context = kept
+	return true
+}
+
+func holdsToolBlocks(m *message.Msg) bool {
+	for _, b := range m.Content {
+		switch b.(type) {
+		case message.ToolCallBlock, message.ToolResultBlock:
+			return true
+		}
+	}
+	return false
+}
+
+// ApplyThreadUpdate applies u between replies (EXPERIMENTAL). It returns an
+// error and changes nothing while a reply is in flight (its event stream is
+// open or its reply core has not returned yet; a canceled reply's stream can
+// close while the core still waits for a tool), while a Conversation owns the
+// agent, or when u is invalid (see ThreadUpdate). The update is
+// applied in one critical section and then persisted through SaveCheckpoint
+// when a StateSaver is configured, so cursor and content land in one
+// checkpoint. If persisting fails the error is returned, but the update stays
+// applied in memory; retry persistence with SaveCheckpoint.
+func (a *UnifiedAgent) ApplyThreadUpdate(ctx context.Context, u ThreadUpdate) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := validateThreadUpdate(&u); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	if err := a.busyLocked("thread update"); err != nil {
+		a.mu.Unlock()
+		return err
+	}
+	if !u.Reset {
+		if err := a.checkCursorLocked(u.Cursor); err != nil {
+			a.mu.Unlock()
+			return err
+		}
+	}
+	a.applyThreadUpdateLocked(&u)
+	a.mu.Unlock()
+	return a.persistBetweenReplies(ctx)
+}
+
+// persistBetweenReplies saves a checkpoint when a StateSaver is configured.
+func (a *UnifiedAgent) persistBetweenReplies(ctx context.Context) error {
+	if a.stateSaver == nil {
+		return nil
+	}
+	return a.SaveCheckpoint(ctx)
+}
+
+// drainBoundaryInput applies the boundary input at a certified StateReason
+// boundary. It returns the reply error to end the reply with, or nil.
+func (a *UnifiedAgent) drainBoundaryInput(ctx context.Context, ch chan<- event.Event, replyID string) *types.ReplyErrorInfo {
+	u, err := a.boundaryInput(ctx)
+	if err != nil {
+		return threadInputError(err)
+	}
+	if u == nil {
+		return nil
+	}
+	if u.Reset {
+		return threadInputError(errors.New("reset is not allowed inside a reply"))
+	}
+	if err := validateThreadUpdate(u); err != nil {
+		return threadInputError(err)
+	}
+	a.mu.Lock()
+	if err := a.checkCursorLocked(u.Cursor); err != nil {
+		a.mu.Unlock()
+		return threadInputError(err)
+	}
+	a.applyThreadUpdateLocked(u)
+	cursor := a.state.ThreadCursor
+	a.mu.Unlock()
+	emit(ctx, ch, event.NewCustomEvent(replyID, ThreadEventInputInjected, map[string]any{
+		"cursor": cursor,
+		"count":  len(u.Messages),
+	}))
+	// Persist cursor and content together before the model sees them: with
+	// reply recovery through the fail-stop boundary checkpoint, otherwise
+	// through SaveCheckpoint (whose failure also ends the reply).
+	if a.replyRecovery {
+		if err := a.checkpointBoundary(ctx); err != nil {
+			return checkpointError(err)
+		}
+	} else if a.stateSaver != nil {
+		if err := a.SaveCheckpoint(ctx); err != nil {
+			return checkpointError(err)
+		}
+	}
+	return nil
+}
+
+func threadInputError(err error) *types.ReplyErrorInfo {
+	msg := err.Error()
+	msg = strings.TrimPrefix(msg, "agent: thread update: ")
+	return &types.ReplyErrorInfo{Type: types.ErrorInternal, Message: "thread input failed: " + msg}
+}

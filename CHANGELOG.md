@@ -11,6 +11,53 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
 
 ## [Unreleased]
 
+### Added — Main Thread: one session shared by a cloud and an edge agent (experimental)
+
+- New experimental packages `thread`, `thread/participant` and `thread/route`.
+  A Coordinator runs a cloud participant (one agent, or a master with
+  sub-agents through `pipeline.TeamPipeline`) and an edge participant over one
+  append-only log: routing at query boundaries (local based, cloud based and
+  hybrid modes, rules and an optional classifier with a fixed-size state),
+  `transfer` of the foreground with a structured brief, background tasks and
+  reports, summaries written by forked requests that reuse the prompt cache,
+  a clear rule for edge takeovers, chunked import with strict compaction,
+  edge-only visibility that never reaches the cloud, taint tracking, a shared
+  ledger, the cloud tool-output list and leases. See
+  [Main Thread](docs/main-thread.md) and `examples/main_thread`.
+- Opt-in `agent` seams it builds on, inert unless used: `ApplyThreadUpdate`,
+  `WithBoundaryInput`, `WithThreadInput`, `ThreadView`, `WithForkCapture`,
+  `ForkSnapshot`, `ForkSummary` (with `ForkRequest.KeepToolChoice` for
+  providers whose cache depends on the tool choice), `ApplySummary`,
+  `CompactStrict`, `MarkHandedOff`, `WithExclusiveTools` (matched by the name
+  the toolkit resolves), `WithTaintGate` (a gated call is denied in
+  `ModeDontAsk` instead of asking), `SetTainted`, and the context-aware
+  `SubmitExternalResultContext` and `SubmitUserConfirmContext`.
+- `types.ReplyHandedOff` (`"handed_off"`) ends a reply after a committed
+  handoff. Like an interrupted end it cannot be swallowed by `OnReply`
+  middleware; `TeamRun` treats it as a normal end and the goal pipeline as
+  not completed.
+
+### Changed — checkpoint schema version, answer matching and Responses status
+
+- `agent.StateSchemaVersion` is now 3. Checkpoints are stamped 3 only when an
+  agent holds thread state; others are still stamped 1, or 2 with reply
+  recovery, so older builds keep reading them. Loading accepts up to 3.
+- The OpenAI Responses adapter now sets `ChatResponse.Error` when a response's
+  `status` is present and not `completed` (for example cut at
+  `max_output_tokens`), in `Chat` and in the final `ChatStream` response;
+  `response.incomplete` and `response.failed` stream events end the stream.
+  Content and usage are kept. Before, such a response looked complete.
+- `UnifiedAgent` drops an external result or a user confirmation whose
+  `ReplyID` names a reply other than the waiting one. Tool-call IDs can repeat
+  across replies (Gemini numbers them per response), so a late answer to a
+  canceled reply could answer, or approve, a later call with the same ID. An
+  empty `ReplyID` still matches, so hosts that leave it empty keep tool-call-ID
+  matching only (in this repository the `app` confirm handler and the legacy
+  `service` confirm endpoint, whose requests carry no reply ID). A call that a
+  reply resumed from a plain checkpoint asks again also accepts the reply ID
+  the checkpoint held, so an answer to the request seen before the restart
+  still reaches it.
+
 ### Changed — Anthropic stream accumulation
 
 - Long, fragmented Anthropic-compatible streams (the parser is shared with MiniMax)

@@ -36,6 +36,7 @@ feature is wired into every execution path.
 | OpenAI-compatible serving | [openaiserver/](pkg/agentscope/openaiserver/) | Experimental stateless text Chat Completions, server-owned tools and request admission; [guide](docs/openai-serving.md) |
 | External integrations | [mcp/](pkg/agentscope/mcp/), [a2a/](pkg/agentscope/a2a/), [channel/](pkg/agentscope/channel/) | Tool servers, remote agents and messaging channels |
 | Retrieval and memory | [rag/](pkg/agentscope/rag/), [embedding/](pkg/agentscope/embedding/), [memory/](pkg/agentscope/memory/) | Retrieval, embeddings and memory stores |
+| Cloud-edge shared session | [thread/](pkg/agentscope/thread/), [participant/](pkg/agentscope/thread/participant/), [route/](pkg/agentscope/thread/route/) | Experimental Main Thread log, Coordinator, transfer, background tasks, forked summaries, routing modes and edge-only visibility; [guide](docs/main-thread.md) |
 | Composition and scheduling | [pipeline/](pkg/agentscope/pipeline/), [team/](pkg/agentscope/team/), [schedule/](pkg/agentscope/schedule/) | Agent coordination and scheduled execution |
 | Discovery and skills | [credential/](pkg/agentscope/credential/), [hub/](pkg/agentscope/hub/), [skill/](pkg/agentscope/skill/) | Provider configuration, integration discovery and skill loading |
 | Edge and device support | [device/](pkg/agentscope/device/), [messagebus/](pkg/agentscope/messagebus/), [connectivity.go](pkg/agentscope/model/connectivity.go) | Device tools, pub/sub and cloud/local routing |
@@ -114,7 +115,7 @@ provides defaults. System-prompt transformation is a pipeline; the other hooks
 have their own handler contracts. In particular:
 
 - `OnReply` may consume a non-interrupted `ReplyEndEvent` to request another
-  round. Interrupted ends must propagate. Forward `CustomEvent` values whose
+  round. Interrupted and handed-off ends must propagate. Forward `CustomEvent` values whose
   names start with `agentscope.`; these carry internal round-boundary signals.
 - `OnCheckPermission` and its chain builder exist, but the current unified-agent
   and loop bridge paths do not automatically invoke that middleware hook.
@@ -281,6 +282,22 @@ performs final local admission and owns an independent durable command/effect
 log. The host schedules plan steps; the package does not fetch media, control
 hardware or provide real-time/exactly-once physical guarantees. See
 [embodied contracts](docs/embodied-contracts.md).
+
+Experimental `thread` runs a cloud and an edge participant over one append-only
+log. The `Coordinator` is the only writer: it routes at query boundaries, guards
+reply and owner-change writes with `{owner, epoch}`, shows the user the
+foreground owner's events (others' confirmation requests pass marked
+`Foreground: false`), and never lets `edge_only` entries into a cloud
+import, read, brief or classifier state. `thread/participant` adapts
+`UnifiedAgent` (and a TeamPipeline master) through the opt-in agent seams in
+`agent/thread_state.go`, `fork.go`, `compact_strict.go`, `handoff.go` and
+`taint_gate.go`; its writing tools are external tools answered in event order.
+`types.ReplyHandedOff` ends a reply after a committed transfer and, like an
+interrupted end, cannot be swallowed by `OnReply`. A participant fails
+`Activate` when its Sync was not applied; only a Reset Sync may lower the
+cursor. Agents match external results and confirmations by reply ID too,
+since tool-call IDs can repeat across replies. Checkpoints carry schema 3
+only when thread state is set. See [Main Thread](docs/main-thread.md).
 
 ### Context and model capabilities
 
