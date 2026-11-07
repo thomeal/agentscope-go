@@ -1002,23 +1002,74 @@ func TestPrecompressChargesThreadMessages(t *testing.T) {
 	}
 }
 
-// TestResetSetsTheCursor: a reset context holds only what the update brings,
-// so a Reset may set the cursor below the current one (a clear that replays
-// entries in several rounds starts below it); any other update may not.
-func TestResetSetsTheCursor(t *testing.T) {
+// TestResetKeepsTheCursorRule: a clear is one update, so its cursor is never
+// behind the current one; a Reset may not move the cursor back either.
+func TestResetKeepsTheCursorRule(t *testing.T) {
 	a := NewUnifiedAgent("a", "sys", &seamModel{})
 	a.state.ThreadCursor = 6
+	a.state.Context = []*message.Msg{importedMsg(5, "five")}
 	ctx := context.Background()
-	if err := a.ApplyThreadUpdate(ctx, ThreadUpdate{Reset: true, Messages: []*message.Msg{importedMsg(4, "four")}, Cursor: 4}); err != nil {
-		t.Fatalf("reset to a lower cursor: %v", err)
+	if err := a.ApplyThreadUpdate(ctx, ThreadUpdate{Reset: true, Messages: []*message.Msg{importedMsg(4, "four")}, Cursor: 4}); err == nil {
+		t.Fatal("a reset must not move the cursor back")
 	}
-	if a.state.ThreadCursor != 4 || len(a.state.Context) != 1 {
-		t.Fatalf("cursor=%d len=%d", a.state.ThreadCursor, len(a.state.Context))
+	if a.state.ThreadCursor != 6 || len(a.state.Context) != 1 || msgText(a.state.Context[0]) != "five" {
+		t.Fatalf("a rejected reset changed the state: cursor=%d context=%d", a.state.ThreadCursor, len(a.state.Context))
 	}
-	if err := a.ApplyThreadUpdate(ctx, ThreadUpdate{Cursor: 3}); err == nil {
-		t.Fatal("a plain update must not move the cursor back")
+	if err := a.ApplyThreadUpdate(ctx, ThreadUpdate{Reset: true, Messages: []*message.Msg{importedMsg(7, "seven")}, Cursor: 7}); err != nil {
+		t.Fatalf("reset: %v", err)
 	}
-	if err := a.ApplyThreadUpdate(ctx, ThreadUpdate{Messages: []*message.Msg{importedMsg(5, "five")}, Cursor: 5}); err != nil || a.state.ThreadCursor != 5 {
-		t.Fatalf("the next round moves on from the reset cursor: %v cursor=%d", err, a.state.ThreadCursor)
+	if a.state.ThreadCursor != 7 || len(a.state.Context) != 1 || msgText(a.state.Context[0]) != "seven" {
+		t.Fatalf("cursor=%d context=%d", a.state.ThreadCursor, len(a.state.Context))
+	}
+}
+
+// TestThreadSummaryTokensSharesTheBudget: with ThreadSummaryTokens set, the
+// own summary gets what a held peer summary leaves (at least 256), a peer
+// summary that arrives elides the own one to that share at once, and the
+// thread messages are given back to the reserve.
+func TestThreadSummaryTokensSharesTheBudget(t *testing.T) {
+	cfg := &ContextConfig{ContextSize: 8000, ThreadSummaryTokens: 1500}
+	m := &seamModel{tokens: func(msgs []*message.Msg) int {
+		n := 0
+		for _, x := range msgs {
+			n += len(msgText(x)) / 4
+		}
+		return n
+	}}
+	a := NewUnifiedAgent("a", "sys", m, WithContextConfig(cfg))
+	a.state.Summary = strings.Repeat("o", 8000) // 2,000 estimated tokens
+	ctx := context.Background()
+	peer := &PeerSummary{Text: strings.Repeat("p", 2400), Through: 3} // 600
+	if err := a.ApplyThreadUpdate(ctx, ThreadUpdate{PeerSummary: peer, Cursor: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(a.state.Summary) / 4; n > 920 || n < 850 { // the elision marker adds a few
+		t.Fatalf("own summary is %d tokens after a 600-token peer summary; want its 900-token share", n)
+	}
+	c := cfg.withDefaults()
+	if got := a.ownSummaryBudget(&c, 8000); got != 900 {
+		t.Fatalf("own budget = %d, want 900", got)
+	}
+	big := &PeerSummary{Text: strings.Repeat("p", 6000), Through: 4} // 1,500
+	if err := a.ApplyThreadUpdate(ctx, ThreadUpdate{PeerSummary: big, Cursor: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.ownSummaryBudget(&c, 8000); got != minOwnSummaryTokens {
+		t.Fatalf("own budget next to a full peer summary = %d, want %d", got, minOwnSummaryTokens)
+	}
+	base := int(8000 * c.ReserveRatio)
+	thread := m.CountTokens(threadPromptMsgs(a.name, big, ""), nil)
+	if got := a.reserveTokens(&c, 8000); got != base+thread {
+		t.Fatalf("reserve = %d, want %d + %d", got, base, thread)
+	}
+
+	plain := NewUnifiedAgent("b", "sys", m, WithContextConfig(&ContextConfig{ContextSize: 8000}))
+	plain.state.Summary = strings.Repeat("o", 8000)
+	if err := plain.ApplyThreadUpdate(ctx, ThreadUpdate{PeerSummary: peer, Cursor: 3}); err != nil {
+		t.Fatal(err)
+	}
+	pc := plain.contextCfg.withDefaults()
+	if len(plain.state.Summary) != 8000 || plain.reserveTokens(&pc, 8000) != int(8000*pc.ReserveRatio) {
+		t.Fatal("without ThreadSummaryTokens nothing changes")
 	}
 }

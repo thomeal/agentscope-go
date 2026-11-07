@@ -294,8 +294,8 @@ import, read, brief or classifier state. `thread/participant` adapts
 `taint_gate.go`; its writing tools are external tools answered in event order.
 `types.ReplyHandedOff` ends a reply after a committed transfer and, like an
 interrupted end, cannot be swallowed by `OnReply`. A participant fails
-`Activate` when its Sync was not applied; only a Reset Sync may lower the
-cursor. Agents match external results and confirmations by reply ID too,
+`Activate` when its Sync was not applied; no Sync moves the cursor back (an
+edge clear is one Reset Sync with the activation). Agents match external results and confirmations by reply ID too,
 since tool-call IDs can repeat across replies. Checkpoints carry schema 3
 only when thread state is set. See [Main Thread](docs/main-thread.md).
 

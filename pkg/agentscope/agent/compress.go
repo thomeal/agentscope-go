@@ -125,6 +125,17 @@ type ContextConfig struct {
 	// near the tail, so the middle loses the least.
 	SummaryMaxTokens int
 
+	// ThreadSummaryTokens (EXPERIMENTAL) is the budget the agent's own summary
+	// shares with a peer summary it holds (see ThreadUpdate.PeerSummary).
+	// When positive, the own summary gets what the peer summary leaves, at
+	// least 256 estimated tokens and never more than the SummaryMaxTokens
+	// budget; a peer summary that arrives leaves the own summary
+	// middle-elided to that share at once. The peer summary and thread index
+	// are then also left out of the reserve, so the recent tail keeps its
+	// ReserveRatio share (the reserve stays under 0.75 of the window). Zero
+	// (the default) changes nothing.
+	ThreadSummaryTokens int
+
 	// CompactStrategy selects the window layout after compression:
 	// CompactStrategyReserveTail (default, also "") or
 	// CompactStrategyFreshWindow. See the constants for the trade-off.
@@ -377,7 +388,7 @@ func (a *UnifiedAgent) compressContextImpl(ctx context.Context, cfg *ContextConf
 		return nil
 	}
 
-	reserveTokens := int(float64(ctxSize) * cfg.ReserveRatio)
+	reserveTokens := a.reserveTokens(cfg, ctxSize)
 	if cfg.CompactStrategy == CompactStrategyFreshWindow {
 		// Fresh window: reserve as little as possible. A budget of 1 — NOT 0,
 		// which would take the emergency path — routes the split through the
@@ -461,7 +472,7 @@ func (a *UnifiedAgent) compressContextImpl(ctx context.Context, cfg *ContextConf
 	// Enforce the summary budget: a runaway summary silently re-inflates the
 	// window it just freed. Middle-elision keeps the overview head and the
 	// next-steps tail, the two ends the resumed context needs most.
-	if budget := summaryMaxTokens(cfg, ctxSize); budget > 0 {
+	if budget := a.ownSummaryBudget(cfg, ctxSize); budget > 0 {
 		if truncated, did := TruncateToolResult(newSummary, budget); did {
 			logrus.WithFields(logrus.Fields{
 				"agent":  a.name,

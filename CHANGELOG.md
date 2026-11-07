@@ -19,16 +19,20 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
   append-only log: routing at query boundaries (local based, cloud based and
   hybrid modes, rules and an optional classifier with a fixed-size state),
   `transfer` of the foreground with a structured brief, background tasks and
-  reports, summaries written by forked requests that reuse the prompt cache,
-  a clear rule for edge takeovers, chunked import with strict compaction,
+  reports, summaries written by forked requests that reuse the prompt cache
+  (with an optional guardrail on their text), a one-step clear for edge
+  takeovers, chunked import with strict compaction as the edge's fallback,
   edge-only visibility that never reaches the cloud, taint tracking, a shared
-  ledger, the cloud tool-output list and leases. See
+  ledger, an opt-in tool-output list and leases. The classifier call is
+  bounded by a timeout, after which routing falls through to the mode's
+  default. See
   [Main Thread](docs/main-thread.md) and `examples/main_thread`.
 - Opt-in `agent` seams it builds on, inert unless used: `ApplyThreadUpdate`,
   `WithBoundaryInput`, `WithThreadInput`, `ThreadView`, `WithForkCapture`,
   `ForkSnapshot`, `ForkSummary` (with `ForkRequest.KeepToolChoice` for
   providers whose cache depends on the tool choice), `ApplySummary`,
-  `CompactStrict`, `MarkHandedOff`, `WithExclusiveTools` (matched by the name
+  `CompactStrict`, `ContextConfig.ThreadSummaryTokens` (the own summary's
+  share next to a peer summary), `MarkHandedOff`, `WithExclusiveTools` (matched by the name
   the toolkit resolves), `WithTaintGate` (a gated call is denied in
   `ModeDontAsk` instead of asking), `SetTainted`, and the context-aware
   `SubmitExternalResultContext` and `SubmitUserConfirmContext`.

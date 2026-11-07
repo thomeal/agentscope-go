@@ -49,6 +49,7 @@ type fakePart struct {
 	compactPlan []fakeCompact
 	onCompact   func()
 	syncErr     error
+	saveErr     error // Activate applies its Sync, then fails (an unsaved checkpoint)
 	activateErr error
 	scripts     []fakeScript
 	script      fakeScript // used when scripts is empty
@@ -89,9 +90,9 @@ func (f *fakePart) Sync(_ context.Context, s Sync) error {
 }
 
 // applyLocked applies s with the agent's cursor rule (ApplyThreadUpdate): the
-// cursor never moves back, except in a Reset, which sets it.
+// cursor never moves back.
 func (f *fakePart) applyLocked(s *Sync) error {
-	if !s.Reset && s.Cursor != 0 && s.Cursor < f.state.Cursor {
+	if s.Cursor != 0 && s.Cursor < f.state.Cursor {
 		return fmt.Errorf("fake: cursor %d is behind the current cursor %d", s.Cursor, f.state.Cursor)
 	}
 	cp := *s
@@ -157,7 +158,14 @@ func (f *fakePart) Activate(ctx context.Context, act Activation) (<-chan Activat
 	if act.Sync != nil {
 		// Like the in-repo participants: a Sync that cannot be applied fails
 		// Activate, and nothing runs.
-		if err := f.applyLocked(act.Sync); err != nil {
+		err := f.syncErr
+		if err == nil {
+			err = f.applyLocked(act.Sync)
+		}
+		if err == nil {
+			err = f.saveErr
+		}
+		if err != nil {
 			f.mu.Unlock()
 			return nil, err
 		}

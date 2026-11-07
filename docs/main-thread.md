@@ -92,7 +92,8 @@ The decision order is fixed: availability and disclosure (an edge-only query
 never reaches the cloud; neither does an unclassified one while the edge is
 tainted), a participant the user named, tool groups only one side holds, host
 rules, the classifier, then the mode's default. A classifier error, an invalid
-answer or confidence below the threshold falls through to the default; routing
+answer, confidence below the threshold or a call that runs out of
+`route.Config.Timeout` (default 10 s) falls through to the default; routing
 never blocks the user on the classifier.
 
 The classifier reads a fixed-size state, so it fits a small model's prompt
@@ -119,10 +120,13 @@ model call; `OnReply` middleware cannot swallow it) and starts the target with
 the brief. It never waits for a summary fork. Unlike a sub-agent call, nothing
 returns to the caller: the other side continues with the user.
 
-A transfer is refused when the user's request is edge-only and the target is in
-the cloud, and when the brief comes from an edge context holding edge-only
-material and the host's `DisclosurePolicy` does not clear it. The model gets
-the reason and may rewrite the brief or continue itself.
+An edge-only request may still be handed to the cloud, but only through its
+brief: the brief of a transfer from an edge context holding edge-only material
+(an edge-only request included) goes to the cloud only when the host's
+`DisclosurePolicy` clears it, and the request itself stays a gap in the cloud's
+projection. Without a policy, or when it does not clear the brief, the
+transfer is refused; the model gets the reason and may rewrite the brief or
+continue itself.
 
 ## Background work
 
@@ -164,45 +168,62 @@ tool. The main thread is never touched by a fork
 (`agent.WithForkCapture`, `ForkSnapshot`, `ForkSummary`).
 
 * **Peer summary (for the edge).** After every `SummaryPolicy.PeerEvery`
-  tokens of growth (default 20,000), or when the cloud hands the foreground to
-  the edge with an outdated summary, a fork writes a summary for the edge's
-  window (its `SummaryBudget`, about 1K tokens) and appends it as a `summary`
-  entry with its coverage: through the cloud's last sealed entry, excluding
-  edge-only entries and entries the cloud never imported.
+  tokens of growth (default 20,000), when the cloud hands the foreground to the
+  edge, or when the cloud's own summary falls due, a fork writes a summary for
+  the edge's window (its `SummaryBudget`, about 1K tokens) whenever the newest
+  one is outdated, and appends it as a `summary` entry with its coverage:
+  through the cloud's last sealed entry, excluding edge-only entries and
+  entries written by others after the cloud's cursor. The cloud imports what it
+  lacks in full, so everything else up to its cursor is in the fork's snapshot.
+  `ForkGuard` (participant option) runs the host's guardrail rules on every
+  summary a fork writes, since a fork does not pass through the reply loop.
 * **Own summary (for the cloud).** When the cloud's input reaches 0.6 of its
-  window, a fork on the same snapshot writes the cloud's own summary. It is
+  window, a fork on the same snapshot writes the cloud's own summary, together
+  with a peer summary when the newest one is outdated: once the own summary
+  replaces the history, its tool work could no longer reach the edge. It is
   applied between replies, only after the peer fork settled, keeping a recent
   tail with intact tool pairs (`ApplySummary`). Compression of the cloud is
-  never synchronous on its main thread.
+  not synchronous on its main thread; the agent's own compression remains the
+  fallback when its window fills before a fork result is applied.
 * **Clear rule (edge takeover).** When the edge is about to run after another
   participant held the foreground since the edge last acted, and the newest
   peer summary is newer than the edge's last activity, the edge's context is
-  replaced: the peer summary, a short index of the edge-only entries the
-  summary cannot hold (readable in full with `thread_read`), and the entries
-  after the summary. The edge does not need its older context: the summary
-  speaks for it. An edge that kept the foreground (for example while the cloud
-  ran a background task for it) is not cleared; it imports incrementally. A
-  summary's coverage excludes edge-only entries and every entry the cloud
-  consumed without seeing in full (skipped or cut imports), so a clear never
-  drops what the summary does not hold. A clear that does not fit in one round
-  is applied in chunks; its first round resets the context and sets the
-  cursor, which may then be below the old one (`ThreadUpdate.Cursor`). The
-  clear counts as done only when its last round goes with the activation; if
-  a later round fails, the participant's next import clears again (also after
-  a failed background task), because only a clear brings back its own
-  earlier replies.
+  replaced in one update that goes with the activation: the peer summary, a
+  short index of the edge-only entries the summary cannot hold (readable in
+  full with `thread_read`), and the entries the summary does not cover,
+  including the edge's own when the summary excludes them. The edge does not
+  need its older context: the summary speaks for it. The update is not
+  chunked or compacted on the way in: what outgrows the window is the edge
+  agent's own compression's job, as in any reply; nor is what reaches the edge
+  during that reply (steering input, reports). A clear whose activation fails
+  is not recorded, and the next takeover clears again: an agent may have
+  applied it in memory without saving it, and applying it again is harmless,
+  since it carries everything up to the new trigger. An edge that
+  kept the foreground (for example while the cloud ran a background task for
+  it) is not cleared; it imports incrementally.
 * **Incremental import.** Otherwise the participant imports the entries past
-  its cursor, within a share of its window (`ImportPolicy`).
-* **Chunked import.** When even that does not fit (for example the cloud is
-  unavailable, so no fresh peer summary exists, or the cloud returns after a
-  long edge stretch), the Coordinator imports in chunks and compacts between
-  them with `agent.CompactStrict`, which leaves the state unchanged on any
-  failure. After `ImportPolicy.MaxRounds` it moves on and tells the participant
+  its cursor. A cloud participant imports them in full; an edge import stays
+  within a share of its window (`ImportPolicy.EdgeShare`).
+* **Chunked import (edge fallback).** When an edge import does not fit (no
+  newer peer summary exists, for example because the cloud is unavailable),
+  the Coordinator imports in chunks and compacts between them with
+  `agent.CompactStrict`, which leaves the state unchanged on any failure.
+  After `ImportPolicy.MaxRounds` it moves on and tells the participant
   which entries to read with `thread_read`.
 
-The cloud's tool outputs are kept outside the log and every context in the
-event list. The edge reads them on demand with `event_read` (outline, search,
-page). Nothing is pushed. The cloud reads edge tool outputs only when the host
+* **Local summary budget.** The edge's own summary comes from its agent's
+  synchronous compression in the reply loop; nothing forks on the edge. Set
+  `agent.ContextConfig.ThreadSummaryTokens` on the edge agent (the plan's
+  proposal is 1,500 with a 1,000-token `SummaryBudget`): the own summary then
+  gets what the peer summary leaves, a newly arrived peer summary elides an
+  older own summary to that share at once, and the peer summary and index no
+  longer eat the recent tail's `ReserveRatio` share.
+
+The event list is opt-in (stage 0 measured no gain from it): with
+`CaptureOutputs` set on the cloud participant and `event_read` installed on the
+edge, the cloud's tool outputs are kept outside the log and every context, and
+the edge reads them on demand with `event_read` (outline, search, page; every
+read is capped). Nothing is pushed. The cloud reads edge tool outputs only when the host
 sets `Config.CloudReadsEdge`, and never an edge-only record (outputs of
 private tools, or recorded while the edge context was private).
 
@@ -314,12 +335,13 @@ leaving it for recovery.
 * Offline tests with scripted models only; no live measurement of this runtime.
 * One Coordinator process per log; `FileStore` takes no file lock and keeps the
   whole log in memory.
-* The Coordinator does not persist which peer summary a participant holds,
-  which entries the cloud consumed without seeing in full, nor a clear left
-  unfinished by a failed round; after a restart it assumes none of them, so a
-  summary written after a restart can claim entries skipped before it, and an
-  edge whose clear failed just before a restart may miss its own earlier
-  replies until the next clear.
+* The Coordinator does not persist which peer summary a participant holds;
+  after a restart the next clear decides from the log.
+* **Evaluation to do: local compression.** The edge compacts synchronously in
+  its reply loop. Whether an asynchronous, continuously updated summary (the
+  Claude Code session-memory style the cloud's forks follow) is stable enough
+  on a weak local model has not been evaluated; compare the two on task
+  correctness and cloud cost before changing the edge's default.
 * Steering inputs delivered mid-reply leave no trace on the reply entry; after
   a restart one can receive a harmless `recovered` marker.
 * Providers that report no usage show up as unknown usage; the agent's

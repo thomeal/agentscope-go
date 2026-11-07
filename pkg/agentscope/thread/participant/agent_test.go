@@ -33,14 +33,21 @@ func TestPrepareSelectsToolsAndBindsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := toolNames(cloud.Tools()); !slices.Equal(got, allToolNames) {
-		t.Fatalf("cloud tools = %v", got)
+	if got := toolNames(cloud.Tools()); !slices.Equal(got, []string{ToolTransfer, ToolAssignTask, ToolReport, ToolPublishArtifact, ToolThreadRead}) {
+		t.Fatalf("cloud tools = %v; event_read is opt-in", got)
+	}
+	for _, d := range []thread.Descriptor{cloudDesc, edgeDesc} {
+		c := &core{desc: d}
+		c.configure(nil, nil, nil, 0)
+		if c.capture {
+			t.Fatalf("%s: tool output capture is opt-in", d.Name)
+		}
 	}
 	edge, err := Prepare(edgeDesc, PrepareOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := toolNames(edge.Tools()); slices.Contains(got, ToolPublishArtifact) || len(got) != len(allToolNames)-1 {
+	if got := toolNames(edge.Tools()); slices.Contains(got, ToolPublishArtifact) || slices.Contains(got, ToolEventRead) || len(got) != len(allToolNames)-2 {
 		t.Fatalf("edge tools = %v", got)
 	}
 	if only, err := Prepare(edgeDesc, PrepareOptions{Tools: []string{ToolThreadRead}}); err != nil || !slices.Equal(toolNames(only.Tools()), []string{ToolThreadRead}) {

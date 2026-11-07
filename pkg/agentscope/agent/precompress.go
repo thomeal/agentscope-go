@@ -98,7 +98,7 @@ func (a *UnifiedAgent) runPrecompress(ctx context.Context, cfg *ContextConfig, c
 		systemPrompt = middleware.ApplySystemPromptPipeline(ctx, a.middlewares, a.name, systemPrompt)
 	}
 	tools := a.toolkit.GetToolSchemas()
-	reserveTokens := int(float64(ctxSize) * cfg.ReserveRatio)
+	reserveTokens := a.reserveTokens(cfg, ctxSize)
 	if cfg.CompactStrategy == CompactStrategyFreshWindow {
 		// See compressContextImpl: budget 1 routes through tool-pair repair
 		// without reserving anything when nothing is in flight.
@@ -122,7 +122,7 @@ func (a *UnifiedAgent) runPrecompress(ctx context.Context, cfg *ContextConfig, c
 		logrus.WithError(err).WithField("agent", a.name).Warn("background pre-compression formatting failed")
 		return
 	}
-	if budget := summaryMaxTokens(cfg, ctxSize); budget > 0 {
+	if budget := a.ownSummaryBudget(cfg, ctxSize); budget > 0 {
 		if truncated, did := TruncateToolResult(newSummary, budget); did {
 			newSummary = truncated
 		}

@@ -32,7 +32,9 @@ type AgentConfig struct {
 	// sensors, local files the user marked private). Edge participants only.
 	PrivateTools []string
 	// CaptureOutputs records each tool result into the host's event list.
-	// The default is true for the cloud zone and false for the edge.
+	// The default is false: stage 0 measured no gain from the event list, so
+	// it is opt-in (set this on the cloud participant and add event_read to
+	// the edge's PrepareOptions.Tools).
 	CaptureOutputs *bool
 	// MaxEventOutput caps one recorded tool output, in bytes (default 64 KiB).
 	MaxEventOutput int
@@ -41,12 +43,18 @@ type AgentConfig struct {
 	// provider that drops cached message blocks when the tool choice changes,
 	// so a fork reuses the main thread's prompt cache.
 	KeepForkToolChoice bool
+	// ForkGuard runs the host's guardrail rules on every summary a fork
+	// writes, before the Coordinator appends or applies it: a fork does not
+	// go through the reply loop, so its middleware does not see the text. An
+	// error fails the fork (agent.ForkRequest.Guard).
+	ForkGuard func(ctx context.Context, text string) error
 }
 
 // PrepareOptions selects what Prepare installs.
 type PrepareOptions struct {
-	// Tools selects the thread tools to install. Default: all of them for
-	// the cloud zone, all but publish_artifact for the edge.
+	// Tools selects the thread tools to install. Default: all of them but
+	// event_read (opt-in, see AgentConfig.CaptureOutputs) for the cloud zone,
+	// and also but publish_artifact for the edge.
 	Tools []string
 	// TaintGate lists tool names or toolkit groups gated while the agent is
 	// tainted; it replaces the default, which gates transfer, assign_task,
@@ -130,7 +138,7 @@ func newAgentParticipant(c *core, cfg *AgentConfig) (*AgentParticipant, error) {
 		return nil, errors.New("participant: AgentConfig.Agent is required")
 	}
 	c.configure(cfg.TaintingTools, cfg.PrivateTools, cfg.CaptureOutputs, cfg.MaxEventOutput)
-	return &AgentParticipant{c: c, agent: cfg.Agent, keepToolChoice: cfg.KeepForkToolChoice}, nil
+	return &AgentParticipant{c: c, agent: cfg.Agent, keepToolChoice: cfg.KeepForkToolChoice, forkGuard: cfg.ForkGuard}, nil
 }
 
 // AgentParticipant wraps one UnifiedAgent as a thread participant. It
@@ -141,6 +149,7 @@ type AgentParticipant struct {
 	c              *core
 	agent          *agent.UnifiedAgent
 	keepToolChoice bool
+	forkGuard      func(ctx context.Context, text string) error
 }
 
 var (
@@ -343,7 +352,7 @@ func (p *AgentParticipant) Snapshot() (thread.Snapshot, error) {
 // Fork asks the agent's model for a summary of snap. Its usage is returned,
 // not recorded: the Coordinator records fork usage.
 func (p *AgentParticipant) Fork(ctx context.Context, snap thread.Snapshot, spec thread.ForkSpec) (thread.ForkOutput, error) {
-	return forkOn(ctx, p.agent, snap, &spec, p.keepToolChoice)
+	return forkOn(ctx, p.agent, snap, &spec, p.keepToolChoice, p.forkGuard)
 }
 
 // ApplyOwnSummary replaces the agent's context with text plus a recent tail,
@@ -389,7 +398,8 @@ func ownSnapshot(a *agent.UnifiedAgent, snap thread.Snapshot) (*forkSnapshot, er
 	return s, nil
 }
 
-func forkOn(ctx context.Context, a *agent.UnifiedAgent, snap thread.Snapshot, spec *thread.ForkSpec, keepToolChoice bool) (thread.ForkOutput, error) {
+func forkOn(ctx context.Context, a *agent.UnifiedAgent, snap thread.Snapshot, spec *thread.ForkSpec, keepToolChoice bool,
+	guard func(context.Context, string) error) (thread.ForkOutput, error) {
 	s, err := ownSnapshot(a, snap)
 	if err != nil {
 		return thread.ForkOutput{}, err
@@ -401,6 +411,7 @@ func forkOn(ctx context.Context, a *agent.UnifiedAgent, snap thread.Snapshot, sp
 		Validate:       spec.Validate,
 		MaxRewrites:    spec.MaxRewrites,
 		KeepToolChoice: keepToolChoice,
+		Guard:          guard,
 	})
 	var out thread.ForkOutput
 	if res != nil {

@@ -21,8 +21,10 @@ func cloudRecord(tool, target, output string) EventRecord {
 	return EventRecord{Origin: Origin{Participant: "cloud", Path: "master"}, Zone: ZoneCloud, Tool: tool, Target: target, Output: output}
 }
 
+// edgeRecord is an edge record marked shareable; an unmarked edge record is
+// edge-only.
 func edgeRecord(tool, target, output string) EventRecord {
-	return EventRecord{Origin: Origin{Participant: "edge"}, Zone: ZoneEdge, Tool: tool, Target: target, Output: output}
+	return EventRecord{Origin: Origin{Participant: "edge"}, Zone: ZoneEdge, Tool: tool, Target: target, Output: output, Visibility: Shared}
 }
 
 func TestReadable(t *testing.T) {

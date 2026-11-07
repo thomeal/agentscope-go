@@ -13,6 +13,7 @@ import (
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/message"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/model"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/types"
+	"github.com/sirupsen/logrus"
 )
 
 // Thread state seams (EXPERIMENTAL). A host that runs several agents over one
@@ -158,10 +159,7 @@ type ThreadUpdate struct {
 	// should carry ThreadSeqMetadataKey. The agent owns them afterwards.
 	Messages []*message.Msg
 	// Cursor is the new ThreadCursor; zero keeps the current value. It may
-	// not move backwards, except in a Reset update: the reset context holds
-	// only what the update brings, so its cursor is set as given (a Reset
-	// with zero keeps the old cursor, so pass the one the new context
-	// matches).
+	// not move backwards.
 	Cursor uint64
 	// Taint, when non-nil, sets or clears Tainted.
 	Taint *bool
@@ -381,6 +379,7 @@ func (a *UnifiedAgent) applyThreadUpdateLocked(u *ThreadUpdate) {
 	if u.PeerSummary != nil {
 		ps := u.PeerSummary.clone()
 		a.state.PeerSummary = ps
+		a.boundOwnSummaryLocked()
 		if a.removeCoveredLocked(ps) {
 			// The provider-grounded floor measured the larger context; keep it
 			// from triggering a compaction of the shrunken one.
@@ -452,11 +451,9 @@ func (a *UnifiedAgent) ApplyThreadUpdate(ctx context.Context, u ThreadUpdate) er
 		a.mu.Unlock()
 		return err
 	}
-	if !u.Reset {
-		if err := a.checkCursorLocked(u.Cursor); err != nil {
-			a.mu.Unlock()
-			return err
-		}
+	if err := a.checkCursorLocked(u.Cursor); err != nil {
+		a.mu.Unlock()
+		return err
 	}
 	a.applyThreadUpdateLocked(&u)
 	a.mu.Unlock()
@@ -518,4 +515,74 @@ func threadInputError(err error) *types.ReplyErrorInfo {
 	msg := err.Error()
 	msg = strings.TrimPrefix(msg, "agent: thread update: ")
 	return &types.ReplyErrorInfo{Type: types.ErrorInternal, Message: "thread input failed: " + msg}
+}
+
+// minOwnSummaryTokens is the smallest own-summary share ThreadSummaryTokens
+// leaves: the smallest size the agent's overflow recovery elides a text to.
+const minOwnSummaryTokens = 256
+
+// ownSummaryShare is the own summary's share of ThreadSummaryTokens next to
+// peer, or 0 when the option is off. It counts in TruncateToolResult's unit.
+func ownSummaryShare(cfg *ContextConfig, peer *PeerSummary) int {
+	if cfg == nil || cfg.ThreadSummaryTokens <= 0 {
+		return 0
+	}
+	left := cfg.ThreadSummaryTokens
+	if peer != nil {
+		left -= len(peer.Text) / 4
+	}
+	return max(left, minOwnSummaryTokens)
+}
+
+// ownSummaryBudget is the budget a newly written own summary is elided to:
+// the SummaryMaxTokens budget, lowered to the ThreadSummaryTokens share when
+// that option is set.
+func (a *UnifiedAgent) ownSummaryBudget(cfg *ContextConfig, ctxSize int) int {
+	budget := summaryMaxTokens(cfg, ctxSize)
+	a.mu.Lock()
+	share := ownSummaryShare(cfg, a.state.PeerSummary)
+	a.mu.Unlock()
+	if share > 0 && (budget <= 0 || share < budget) {
+		budget = share
+	}
+	return budget
+}
+
+// reserveTokens is the reserve a compression keeps for the recent tail. The
+// split charges the thread messages (peer summary and index) with the rest
+// of the head; with ThreadSummaryTokens set they are given back, so a held
+// peer summary does not leave the agent without recent turns. The reserve
+// then stays under 0.75 of the window and under the trigger.
+func (a *UnifiedAgent) reserveTokens(cfg *ContextConfig, ctxSize int) int {
+	reserve := int(float64(ctxSize) * cfg.ReserveRatio)
+	if cfg.ThreadSummaryTokens <= 0 {
+		return reserve
+	}
+	a.mu.Lock()
+	thread := threadPromptMsgs(a.name, a.state.PeerSummary, a.state.ThreadIndex)
+	a.mu.Unlock()
+	if len(thread) == 0 {
+		return reserve
+	}
+	limit := int(float64(ctxSize) * min(0.75, cfg.TriggerRatio-0.05))
+	return max(reserve, min(reserve+a.model.CountTokens(thread, nil), limit))
+}
+
+// boundOwnSummaryLocked elides the own summary to its ThreadSummaryTokens
+// share next to the peer summary just set: the share is otherwise applied
+// only when the next summary is written, and the two would exceed the total
+// until then. Caller holds a.mu.
+func (a *UnifiedAgent) boundOwnSummaryLocked() {
+	if a.contextCfg == nil || a.state.Summary == "" {
+		return
+	}
+	share := ownSummaryShare(a.contextCfg, a.state.PeerSummary)
+	if share <= 0 {
+		return
+	}
+	if text, did := TruncateToolResult(a.state.Summary, share); did {
+		a.state.Summary = text
+		logrus.WithFields(logrus.Fields{"agent": a.name, "budget": share}).
+			Warn("own summary exceeded its share next to the peer summary; middle-elided")
+	}
 }

@@ -3,7 +3,6 @@ package thread
 import (
 	"errors"
 	"fmt"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,6 +100,14 @@ func (c *Coordinator) planForks(a *activation) *forkJob {
 		needPeer = stale && (growth >= pol.PeerEvery || handedTo == target.name)
 	}
 	needOwn := st.Window > 0 && float64(st.InputTokens) >= pol.OwnRatio*float64(st.Window)
+	// An own summary replaces the history it covers, so the tool work in it
+	// could no longer reach a peer summary: a stale peer summary is written
+	// from the same snapshot, and runForkJob applies the own one only after
+	// the peer fork settled.
+	if needOwn && !needPeer && target != nil && target != ps && through > 0 {
+		prev := c.newestSummary(c.ctx, target.name)
+		needPeer = prev == nil || prev.Coverage.Through < through
+	}
 	if !needPeer && !needOwn {
 		return nil
 	}
@@ -128,25 +135,21 @@ func (c *Coordinator) planForks(a *activation) *forkJob {
 }
 
 // planPeer fills the peer fork of job: its coverage, recorded before the
-// fork, and its spec. The coverage excludes edge-only entries, entries of
-// others past the snapshot's cursor, and entries the writer consumed without
-// seeing them in full (skipped by an import, or cut by a projection): a
-// clear drops what a summary covers, so the summary must not claim them.
+// fork, and its spec. The coverage excludes edge-only entries and the
+// entries of others past the snapshot's cursor: the writer imports what it
+// lacks in full (its imports are not budgeted), so everything else up to
+// its cursor is in the snapshot.
 func (c *Coordinator) planPeer(job *forkJob, target *partState, through uint64) error {
 	pol := &c.cfg.Summaries
 	entries, err := c.store.Read(c.ctx, 0, Filter{}, int(through))
 	if err != nil {
 		return err
 	}
-	c.mu.Lock()
-	unseen := slices.Clone(job.ps.unseen)
-	c.mu.Unlock()
 	cursor := job.snap.Cursor()
 	cov := Coverage{Through: through}
 	for i := range entries {
 		e := &entries[i]
-		if e.EffectiveVisibility() == EdgeOnly || (e.Seq > cursor && e.Origin.Participant != job.ps.name) ||
-			inRanges(unseen, e.Seq) {
+		if e.EffectiveVisibility() == EdgeOnly || (e.Seq > cursor && e.Origin.Participant != job.ps.name) {
 			cov.Excluded = append(cov.Excluded, e.Seq)
 		}
 	}

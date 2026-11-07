@@ -7,6 +7,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/classifier"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/thread"
@@ -787,5 +788,46 @@ func TestStateTrimmingIsInReason(t *testing.T) {
 	}
 	if d.Source != thread.RouteClassifier || !strings.Contains(d.Reason, "cut the summary in the middle") || !strings.Contains(d.Reason, "dropped 1 recent entries") {
 		t.Fatalf("decision = %+v", d)
+	}
+}
+
+// hang is a classifier that answers only when its context ends.
+type hang struct{}
+
+func (hang) Classify(ctx context.Context, req classifier.Request) (*classifier.Response, error) {
+	return hang{}.ClassifyWithDispatch(ctx, req, classifier.DispatchLimits{}, nil)
+}
+
+func (hang) Target() (endpoint, model string) { return "fake://hang", "hang" }
+
+func (hang) ClassifyWithDispatch(ctx context.Context, _ classifier.Request, _ classifier.DispatchLimits, _ func(classifier.AttemptKind) error) (*classifier.Response, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// TestClassifierTimeoutStays: a classifier that never answers runs out of
+// Config.Timeout, and the query stays with the current owner instead of
+// waiting for it.
+func TestClassifierTimeoutStays(t *testing.T) {
+	r := newRouter(t, Config{Mode: Hybrid, Classifier: hang{}, Timeout: 20 * time.Millisecond})
+	req := request()
+	req.Owner = "cloud"
+	done := make(chan struct{})
+	var d thread.RouteDecision
+	var err error
+	go func() {
+		defer close(done)
+		d, _, err = r.Decide(context.Background(), req)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a hung classifier blocked the query")
+	}
+	if err != nil || d.Target != req.Owner || d.Source != thread.RouteDefault || !strings.Contains(d.Reason, "classifier failed") {
+		t.Fatalf("decision = %+v, err %v; want the current owner %q", d, err, req.Owner)
+	}
+	if def := newRouter(t, Config{Classifier: hang{}}); def.cfg.Timeout != DefaultTimeout {
+		t.Fatalf("default timeout = %v", def.cfg.Timeout)
 	}
 }

@@ -130,7 +130,7 @@ func (a *UnifiedAgent) compactStrictImpl(ctx context.Context, cfg *ContextConfig
 	}
 
 	toolSchemas := a.toolkit.GetToolSchemas()
-	reserveTokens := int(float64(ctxSize) * cfg.ReserveRatio)
+	reserveTokens := a.reserveTokens(cfg, ctxSize)
 	if cfg.CompactStrategy == CompactStrategyFreshWindow {
 		reserveTokens = 1 // see compressContextImpl
 	}
@@ -171,7 +171,7 @@ func (a *UnifiedAgent) compactStrictImpl(ctx context.Context, cfg *ContextConfig
 	if err != nil {
 		return fmt.Errorf("agent: strict compaction: %w", err)
 	}
-	if budget := summaryMaxTokens(cfg, ctxSize); budget > 0 {
+	if budget := a.ownSummaryBudget(cfg, ctxSize); budget > 0 {
 		if truncated, did := TruncateToolResult(newSummary, budget); did {
 			newSummary = truncated
 		}

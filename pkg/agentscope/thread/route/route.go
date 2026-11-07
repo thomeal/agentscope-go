@@ -23,6 +23,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/classifier"
@@ -51,6 +52,12 @@ const (
 // calibrate it for each classifier.
 const DefaultThreshold = 0.8
 
+// DefaultTimeout bounds one classifier call when Config.Timeout is zero. A
+// call that runs out of time counts as a classifier failure: routing falls
+// through to the mode's default (in hybrid, the current owner) instead of
+// waiting.
+const DefaultTimeout = 10 * time.Second
+
 // QuestionID is the ID of the one Choice question the router asks.
 const QuestionID = "owner"
 
@@ -78,6 +85,10 @@ type Config struct {
 	// Threshold is the minimum confidence for a classifier answer to be
 	// used, in (0, 1]. Zero means DefaultThreshold.
 	Threshold float64
+	// Timeout bounds one classifier call; zero means DefaultTimeout and a
+	// negative value means no bound. A call that runs out of time is a
+	// classifier failure, so routing falls through to the mode's default.
+	Timeout time.Duration
 	// MaxLag stops the classifier from choosing a participant that has more
 	// than MaxLag entries it has not imported yet. Zero means no limit.
 	MaxLag uint64
@@ -147,6 +158,9 @@ func normalize(cfg Config) (Config, error) { //nolint:gocritic // a copy is what
 	case LocalBased, CloudBased, Hybrid:
 	default:
 		return Config{}, configError("mode %q, want %q, %q or %q", cfg.Mode, LocalBased, CloudBased, Hybrid)
+	}
+	if cfg.Timeout == 0 {
+		cfg.Timeout = DefaultTimeout
 	}
 	if cfg.Threshold == 0 {
 		cfg.Threshold = DefaultThreshold
@@ -554,7 +568,13 @@ func (r *Router) classify(ctx context.Context, in *thread.RouteRequest, disclosu
 		}
 		return r.cfg.Authorize(ctx, kind)
 	}
-	resp, err := r.cfg.Classifier.ClassifyWithDispatch(ctx, req, r.cfg.Limits, begin)
+	cctx := ctx
+	if r.cfg.Timeout > 0 {
+		var cancel context.CancelFunc
+		cctx, cancel = context.WithTimeout(ctx, r.cfg.Timeout)
+		defer cancel()
+	}
+	resp, err := r.cfg.Classifier.ClassifyWithDispatch(cctx, req, r.cfg.Limits, begin)
 	out.resp = resp
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		out.err = fmt.Errorf("route: classifier call canceled: %w", ctxErr)

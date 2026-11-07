@@ -372,3 +372,28 @@ func TestMiddleCut(t *testing.T) {
 		t.Fatalf("tiny budget cut = %q", got)
 	}
 }
+
+// TestCoordinatorOwnForkBringsThePeerFork: an own summary replaces the
+// history it covers, so when it falls due a stale peer summary is written
+// from the same snapshot even though the growth since the last one is below
+// PeerEvery; the own summary is applied after it.
+func TestCoordinatorOwnForkBringsThePeerFork(t *testing.T) {
+	env, _, cloud := forkEnv(t, nil, func(cfg *Config) { cfg.Summaries.PeerEvery = 1 << 30 })
+	cloud.setState(func(s *ParticipantState) { s.Window = 1000 })
+	var summaryFirst bool
+	cloud.beforeApply = func() { summaryFirst = len(findEntries(env.log(), KindSummary, "")) == 1 }
+	cloud.push(grow(700, "big answer"))
+	env.say("go")
+	env.idle()
+	sums := findEntries(env.log(), KindSummary, "")
+	if len(sums) != 1 || len(cloud.appliedOwn()) != 1 {
+		t.Fatalf("want one peer summary and one own summary: %d and %v", len(sums), cloud.appliedOwn())
+	}
+	if !summaryFirst {
+		t.Fatal("the own summary was applied before the peer summary was written")
+	}
+	specs := cloud.forkSpecs()
+	if len(specs) != 2 {
+		t.Fatalf("forks = %d, want the peer and own forks", len(specs))
+	}
+}

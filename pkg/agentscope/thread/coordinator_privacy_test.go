@@ -255,7 +255,7 @@ func TestCoordinatorHostCalls(t *testing.T) {
 	check := func(name string, err error) { results = append(results, result{name, err}) }
 	edge.push(func(r *fakeRun) *ActivationEnd {
 		h := r.host()
-		id := h.RecordEvent(EventRecord{Origin: Origin{Participant: "cloud"}, Zone: ZoneCloud, Tool: "camera", Output: "jpeg bytes"})
+		id := h.RecordEvent(EventRecord{Origin: Origin{Participant: "cloud"}, Zone: ZoneCloud, Tool: "camera", Output: "jpeg bytes", Visibility: Shared})
 		h.RecordUsage(LedgerEntry{Participant: "cloud", Kind: UsageMain, Usage: &model.ChatUsage{InputTokens: 3}})
 		if d := h.Descriptors(); len(d) != 2 || d[0].Name != "edge" || d[1].Name != "cloud" {
 			t.Errorf("descriptors = %+v", d)

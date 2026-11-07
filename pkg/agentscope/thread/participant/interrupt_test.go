@@ -556,3 +556,43 @@ func TestAwaitIdleReturnsOtherErrorsAtOnce(t *testing.T) {
 		t.Fatalf("a failing save was retried for %v", d)
 	}
 }
+
+// TestForkGuardRunsOnSummaries: the host's guardrail sees every summary a
+// fork writes, on both participant kinds, and an error fails the fork.
+func TestForkGuardRunsOnSummaries(t *testing.T) {
+	var seen []string
+	guard := func(_ context.Context, text string) error {
+		seen = append(seen, text)
+		if strings.Contains(text, "BLOCKED") {
+			return errors.New("guardrail: blocked")
+		}
+		return nil
+	}
+	f := newFixture(t, fixtureOptions{cfg: AgentConfig{ForkGuard: guard}, respond: func(_ context.Context, n int, _ *model.CallOptions) (*model.ChatResponse, error) {
+		if n == 0 {
+			return textResp("answer"), nil
+		}
+		return textResp("BLOCKED summary"), nil
+	}})
+	activate(t, f.p, foreground(1, "question"), nil)
+	snap, err := f.p.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.p.Fork(context.Background(), snap, thread.ForkSpec{Prompt: "Summarize."}); err == nil {
+		t.Fatal("a summary the guardrail rejects must fail the fork")
+	}
+
+	tf := newTeamFixture(t, teamOptions{cfg: TeamConfig{ForkGuard: guard}, master: queued(textResp("answer"), textResp("the summary"))})
+	activate(t, tf.tp, foreground(1, "question"), nil)
+	if snap, err = tf.tp.Snapshot(); err != nil {
+		t.Fatal(err)
+	}
+	out, err := tf.tp.Fork(context.Background(), snap, thread.ForkSpec{Prompt: "Summarize."})
+	if err != nil || out.Text == "" {
+		t.Fatalf("team fork = %+v, %v", out, err)
+	}
+	if len(seen) != 2 || seen[0] != "BLOCKED summary" || seen[1] != out.Text {
+		t.Fatalf("guard saw %q", seen)
+	}
+}

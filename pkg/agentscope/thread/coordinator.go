@@ -40,7 +40,6 @@ const (
 	defaultOwnMaxTokens     = 8192
 	defaultMaxRewrites      = 1
 	defaultEdgeShare        = 0.5
-	defaultCloudShare       = 0.6
 	defaultMaxRounds        = 8
 	defaultIndexRunes       = 1200
 	defaultStaleAfter       = 40
@@ -104,12 +103,13 @@ type SummaryPolicy struct {
 // ImportPolicy bounds what the Coordinator imports into a participant
 // before it runs.
 type ImportPolicy struct {
-	// EdgeShare is the share of an edge window an import may fill; default 0.5.
+	// EdgeShare is the share of an edge window an import may fill; default
+	// 0.5. Only edge imports are budgeted: a cloud participant imports what
+	// it lacks in full, and what outgrows its window is compacted there.
 	EdgeShare float64
-	// CloudShare is the share of a cloud window an import may fill; default 0.6.
-	CloudShare float64
-	// MaxRounds bounds the chunk and compact rounds of an import that does
-	// not fit; default 8.
+	// MaxRounds bounds the chunk and compact rounds of an edge import that
+	// does not fit (the local fallback when no new summary covers the
+	// entries); default 8.
 	MaxRounds int
 	// IndexRunes bounds the EdgeIndex an edge receives after a clear; default
 	// 1200.
@@ -290,18 +290,6 @@ type partState struct {
 	privGen      uint64
 	heldCoverage *Coverage // coverage of the peer summary it holds
 	resetFrom    uint64    // seq of the summary its last clear applied
-	// clearPending is a clear whose reset round was applied but whose last
-	// round never reached the participant: the reset dropped its own
-	// entries, which only a clear sends again, so its next import clears
-	// again whatever its activity says.
-	clearPending *clearCommit
-	// unseen are the seqs it consumed without seeing them in full: ranges an
-	// import skipped with a notice and entries a projection cut. A peer
-	// summary it writes excludes them. The ranges only grow; they are kept
-	// merged, so they stay small unless many separate entries are cut. They
-	// are not persisted: after a restart the Coordinator assumes the
-	// participant saw everything up to its cursor.
-	unseen []seqRange
 	// notify holds, by seq, the Notify reports addressed to it that no
 	// foreground activation of it has received yet. They wake it while it is
 	// the idle owner.
@@ -317,42 +305,6 @@ type partState struct {
 func (ps *partState) raisePrivateLocked() {
 	ps.private = true
 	ps.privGen++
-}
-
-// seqRange is an inclusive range of seqs.
-type seqRange struct{ from, to uint64 }
-
-// addUnseenLocked records [from, to] as consumed without being seen in
-// full. The ranges stay sorted, disjoint and merged.
-func (ps *partState) addUnseenLocked(from, to uint64) {
-	if from == 0 || to < from {
-		return
-	}
-	out := make([]seqRange, 0, len(ps.unseen)+1)
-	placed := false
-	for _, r := range ps.unseen {
-		switch {
-		case r.to+1 < from: // entirely before the new range
-			out = append(out, r)
-		case to+1 < r.from: // entirely after it
-			if !placed {
-				out = append(out, seqRange{from, to})
-				placed = true
-			}
-			out = append(out, r)
-		default: // overlapping or adjacent: merge
-			from, to = min(from, r.from), max(to, r.to)
-		}
-	}
-	if !placed {
-		out = append(out, seqRange{from, to})
-	}
-	ps.unseen = out
-}
-
-// inRanges reports whether seq is in one of the ranges.
-func inRanges(rs []seqRange, seq uint64) bool {
-	return slices.ContainsFunc(rs, func(r seqRange) bool { return r.from <= seq && seq <= r.to })
 }
 
 // inputRec is an undelivered user input.
@@ -511,8 +463,7 @@ func (cfg *Config) normalize() error {
 	}
 	im := &cfg.Import
 	im.EdgeShare = shareOrDefault(im.EdgeShare, defaultEdgeShare)
-	im.CloudShare = shareOrDefault(im.CloudShare, defaultCloudShare)
-	if im.EdgeShare > 1 || im.CloudShare > 1 || s.OwnRatio > 1 {
+	if im.EdgeShare > 1 || s.OwnRatio > 1 {
 		return errors.New("thread: import shares and the own summary ratio must be at most 1")
 	}
 	im.MaxRounds = intOrDefault(im.MaxRounds, defaultMaxRounds)

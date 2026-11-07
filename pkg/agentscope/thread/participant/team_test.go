@@ -106,6 +106,7 @@ func newTeamFixture(t *testing.T, o teamOptions) *teamFixture { //nolint:gocriti
 	f := &teamFixture{host: newFakeHost(cloudDesc, edgeDesc), master: &scriptModel{respond: o.master}, member: &scriptModel{respond: o.member}, saver: newMemSaver()}
 	cfg := o.cfg
 	cfg.Descriptor = cloudDesc
+	optIntoEvents(cloudDesc, &cfg.Prepare, &cfg.CaptureOutputs)
 	cfg.Master = func(ctx context.Context, assign tool.Tool, threadTools []tool.Tool, opts []agent.AgentOption) (*agent.UnifiedAgent, error) {
 		if o.factory != nil {
 			return o.factory(f, ctx, assign, threadTools, opts)
@@ -425,21 +426,22 @@ func TestTeamToolsAndDescriptor(t *testing.T) {
 	}
 }
 
-// TestTeamQueuedResetSetsTheCursor: before the first master, queued updates
-// follow the agent's cursor rule: only a Reset may lower the cursor.
-func TestTeamQueuedResetSetsTheCursor(t *testing.T) {
+// TestTeamQueuedResetKeepsTheCursorRule: before the first master, queued
+// updates follow the agent's cursor rule: no update, Reset included, moves
+// the cursor back.
+func TestTeamQueuedResetKeepsTheCursorRule(t *testing.T) {
 	f := newTeamFixture(t, teamOptions{master: queued(), member: queued()})
 	ctx := t.Context()
 	if err := f.tp.Sync(ctx, thread.Sync{Messages: []*message.Msg{projected(5, "five")}, Cursor: 5}); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.tp.Sync(ctx, thread.Sync{Reset: true, Messages: []*message.Msg{projected(3, "three")}, Cursor: 3}); err != nil {
-		t.Fatalf("a reset to a lower cursor: %v", err)
+	if err := f.tp.Sync(ctx, thread.Sync{Reset: true, Messages: []*message.Msg{projected(3, "three")}, Cursor: 3}); err == nil {
+		t.Fatal("a reset must not move the queued cursor back")
 	}
-	if st := f.tp.State(); st.Cursor != 3 {
+	if err := f.tp.Sync(ctx, thread.Sync{Reset: true, Messages: []*message.Msg{projected(6, "six")}, Cursor: 6}); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	if st := f.tp.State(); st.Cursor != 6 {
 		t.Fatalf("cursor after the reset = %d", st.Cursor)
-	}
-	if err := f.tp.Sync(ctx, thread.Sync{Cursor: 2}); err == nil {
-		t.Fatal("a plain update must not move the queued cursor back")
 	}
 }

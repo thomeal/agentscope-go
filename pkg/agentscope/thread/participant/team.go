@@ -55,8 +55,10 @@ type TeamConfig struct {
 	// only: State reports cursor 0 until the first activation, and a factory
 	// that restores an older master would get those entries again.
 	Load func(ctx context.Context) (*agent.AgentState, error)
-	// KeepForkToolChoice works as in AgentConfig, for the master's forks.
+	// KeepForkToolChoice and ForkGuard work as in AgentConfig, for the
+	// master's forks.
 	KeepForkToolChoice bool
+	ForkGuard          func(ctx context.Context, text string) error
 }
 
 // TeamParticipant is a master agent with sub-agents run through
@@ -239,10 +241,9 @@ func (tp *TeamParticipant) Sync(ctx context.Context, s thread.Sync) error { //no
 	}
 	tp.mu.Lock()
 	defer tp.mu.Unlock()
-	// The agent's cursor rule: it never moves back, except in a Reset,
-	// which sets it (zero keeps it). A reset keeps the taint unless the
-	// update sets it.
-	if !u.Reset && u.Cursor != 0 && u.Cursor < tp.queuedCursor {
+	// The agent's cursor rule: it never moves back. A reset keeps the taint
+	// unless the update sets it.
+	if u.Cursor != 0 && u.Cursor < tp.queuedCursor {
 		return fmt.Errorf("participant %s: thread update cursor %d is behind the queued cursor %d", tp.c.desc.Name, u.Cursor, tp.queuedCursor)
 	}
 	tp.queued = append(tp.queued, u)
@@ -473,7 +474,7 @@ func (tp *TeamParticipant) Fork(ctx context.Context, snap thread.Snapshot, spec 
 	if m == nil {
 		return thread.ForkOutput{}, fmt.Errorf("%w: no master has run yet", thread.ErrNoSnapshot)
 	}
-	return forkOn(ctx, m, snap, &spec, tp.cfg.KeepForkToolChoice)
+	return forkOn(ctx, m, snap, &spec, tp.cfg.KeepForkToolChoice, tp.cfg.ForkGuard)
 }
 
 // stateTokens estimates the input a master restored from st would send.

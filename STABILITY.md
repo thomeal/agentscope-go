@@ -180,7 +180,7 @@ ports and deferred work, including realtime/TUI, SOP and model-context wiring.
   with one foreground owner, guarded owner/epoch writes, transfer, background
   tasks, forked summaries and edge-only visibility. The agent seams it uses
   (`WithForkCapture`, `ForkSnapshot`, `ForkSummary`, `ApplySummary`,
-  `CompactStrict`, `ApplyThreadUpdate`, `WithBoundaryInput`, `WithThreadInput`,
+  `CompactStrict`, `ContextConfig.ThreadSummaryTokens`, `ApplyThreadUpdate`, `WithBoundaryInput`, `WithThreadInput`,
   `ThreadView`, `ThreadSeqOf`, `ErrReplyInProgress`, `MarkHandedOff`,
   `WithExclusiveTools`, `WithTaintGate`, `SetTainted`,
   `SubmitExternalResultContext`, `SubmitUserConfirmContext`) are

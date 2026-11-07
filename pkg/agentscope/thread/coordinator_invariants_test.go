@@ -219,11 +219,10 @@ func TestCoordinatorOlderInputRoutedAfterNoOwner(t *testing.T) {
 	}
 }
 
-// A peer summary never claims entries its writer consumed without seeing
-// them in full: an import that skipped entries, or cut one, leaves them out
-// of the coverage, and the edge's clear then gives the edge its own entries
-// back.
-func TestCoordinatorPeerCoverageExcludesUnseen(t *testing.T) {
+// A cloud participant imports what it lacks in full, whatever its window:
+// nothing is cut, skipped or compacted on the way in, so its peer summary
+// excludes only edge-only entries and entries past its snapshot's cursor.
+func TestCoordinatorCloudImportsInFull(t *testing.T) {
 	store := NewMemoryStore(WithClock(fixedClock()))
 	for i := 1; i <= 5; i++ {
 		mustAppend(t, store, nil, Entry{Kind: KindArtifact, Origin: Origin{Participant: "edge"}, Visibility: Shared,
@@ -233,7 +232,6 @@ func TestCoordinatorPeerCoverageExcludesUnseen(t *testing.T) {
 	cloud := newFakeForker("cloud")
 	cloud.desc.Window = 400
 	cloud.state.InputTokens = 150
-	cloud.compactPlan = []fakeCompact{{ok: false}, {ok: false}}
 	cloud.push(grow(500, "plan ready"))
 	env := newCoEnv(t, store, func(cfg *Config) {
 		cfg.Router = zoneRouter()
@@ -242,47 +240,24 @@ func TestCoordinatorPeerCoverageExcludesUnseen(t *testing.T) {
 	env.say("plan") // #6, owner_change #7, reply #8
 	env.idle()
 
-	if !containsText(allImported(cloud.fakePart), "cut; read #3") ||
-		!containsText(allImported(cloud.fakePart), "#4–#5 not imported") {
-		t.Fatalf("the cloud's import did not cut #3 and skip #4–#5: %q", allImported(cloud.fakePart))
+	syncs := cloud.appliedSyncs()
+	if len(syncs) != 1 {
+		t.Fatalf("want the cloud's import in one Sync: %+v", syncs)
+	}
+	for i := 1; i <= 5; i++ {
+		if want := fmt.Sprintf("EDGE-%d %s", i, strings.Repeat("e", 110)); !containsText(syncTexts(&syncs[0]), want) {
+			t.Fatalf("the cloud did not import EDGE-%d in full: %q", i, syncTexts(&syncs[0]))
+		}
+	}
+	if n := cloud.compactCount(); n != 0 {
+		t.Fatalf("the cloud's import compacted %d times", n)
 	}
 	sums := findEntries(env.log(), KindSummary, "")
 	if len(sums) != 1 {
 		t.Fatalf("summaries = %+v", sums)
 	}
-	if got := sums[0].Coverage.Excluded; !reflect.DeepEqual(got, []uint64{3, 4, 5, 7}) {
-		t.Fatalf("coverage excludes %v, want [3 4 5 7]", got)
-	}
-
-	edge.push(replyWith("back"))
-	env.submit(Query{Text: "continue", Disclosure: DiscloseEdgeOnly})
-	env.idle()
-	s := edge.activations()[0].Sync
-	if s == nil || !s.Reset {
-		t.Fatalf("the edge was not cleared: %+v", s)
-	}
-	for _, want := range []string{"EDGE-3", "EDGE-4", "EDGE-5"} {
-		if !containsText(syncTexts(s), want) {
-			t.Fatalf("the clear dropped %s, which the cloud never saw in full: %q", want, syncTexts(s))
-		}
-	}
-}
-
-func TestPartStateUnseenRanges(t *testing.T) {
-	ps := &partState{}
-	for _, r := range [][2]uint64{{10, 12}, {1, 2}, {5, 5}, {3, 4}, {20, 20}, {13, 13}, {0, 9}, {7, 6}} {
-		ps.addUnseenLocked(r[0], r[1])
-	}
-	want := []seqRange{{1, 5}, {10, 13}, {20, 20}}
-	if !reflect.DeepEqual(ps.unseen, want) {
-		t.Fatalf("ranges = %v, want %v", ps.unseen, want)
-	}
-	ps.addUnseenLocked(6, 19)
-	if !reflect.DeepEqual(ps.unseen, []seqRange{{1, 20}}) {
-		t.Fatalf("merged ranges = %v", ps.unseen)
-	}
-	if !inRanges(ps.unseen, 7) || inRanges(ps.unseen, 21) {
-		t.Fatal("inRanges is wrong")
+	if got := sums[0].Coverage.Excluded; !reflect.DeepEqual(got, []uint64{7}) {
+		t.Fatalf("coverage excludes %v, want [7]", got)
 	}
 }
 
@@ -329,8 +304,8 @@ func TestCoordinatorUnclassifiedWhileTaintedIsEdgeOnly(t *testing.T) {
 	if len(ea) != 1 || ea[0].Trigger.Seq != q {
 		t.Fatalf("edge activations = %+v", ea)
 	}
-	if transferErr == nil || !strings.Contains(transferErr.Error(), "edge-only") {
-		t.Fatalf("transfer of the cycle to the cloud: %v", transferErr)
+	if !errors.Is(transferErr, errPrivateBrief) {
+		t.Fatalf("transfer of the cycle to the cloud with no disclosure policy: %v", transferErr)
 	}
 }
 
@@ -719,8 +694,11 @@ func TestEventListEdgeOnlyRecords(t *testing.T) {
 	private.Visibility = EdgeOnly
 	odd := edgeRecord("Read", "odd.txt", "SECRET odd")
 	odd.Visibility = "secret" // unknown values count as edge-only
+	unmarked := edgeRecord("Read", "notes.txt", "SECRET unmarked")
+	unmarked.Visibility = "" // an unmarked edge record is edge-only
 	pid := l.Add(private)
 	oid := l.Add(odd)
+	l.Add(unmarked)
 	sid := l.Add(edgeRecord("Camera", "front", "jpeg"))
 	if got := ids(l.Outline(ZoneCloud, true, 0)); !reflect.DeepEqual(got, []string{sid}) {
 		t.Fatalf("cloud outline = %v, want only %s", got, sid)
@@ -752,7 +730,7 @@ func TestCoordinatorRecordEventVisibility(t *testing.T) {
 	edge.push(func(r *fakeRun) *ActivationEnd {
 		h := r.host()
 		ids = append(ids,
-			h.RecordEvent(EventRecord{Tool: "camera", Output: "open output"}),
+			h.RecordEvent(EventRecord{Tool: "camera", Output: "open output", Visibility: Shared}),
 			h.RecordEvent(EventRecord{Tool: "sensor", Output: "PRIVATE-TOOL", Visibility: EdgeOnly}))
 		return r.reply("ok")
 	}, func(r *fakeRun) *ActivationEnd {
@@ -945,11 +923,10 @@ func TestCoordinatorPrivateWriteMakesEdgePrivate(t *testing.T) {
 	}
 }
 
-// A clear whose reset chunk was applied but whose later chunk failed: the
-// reset is in force (the edge holds the summary, and the privacy the reset
-// cleared stays lowered), but the clear is not done, so the next takeover
-// clears again and the edge receives everything the reset dropped.
-func TestCoordinatorClearInForceAfterLaterChunkFails(t *testing.T) {
+// A clear the edge cannot apply leaves the Coordinator's view as it was: the
+// edge stays private, holds no new coverage and is cleared again at the next
+// takeover, with the whole import in that one Sync.
+func TestCoordinatorFailedClearKeepsTheView(t *testing.T) {
 	store := NewMemoryStore(WithClock(fixedClock()))
 	mustAppend(t, store, nil, userInput("plan"))
 	mustAppend(t, store, &Guard{}, ownerChange("", "cloud"))
@@ -965,16 +942,9 @@ func TestCoordinatorClearInForceAfterLaterChunkFails(t *testing.T) {
 			Content: textBlocks(fmt.Sprintf("CHUNK-%d ", i) + strings.Repeat("b", 300))})
 	}
 	edge := smallEdge()
+	edge.syncErr = errors.New("checkpoint save failed")
 	_, cloud := edgeCloud()
 	cloud.push(replyWith("taken over"))
-	var once sync.Once
-	edge.onCompact = func() {
-		once.Do(func() {
-			edge.mu.Lock()
-			edge.syncErr = errors.New("checkpoint save failed")
-			edge.mu.Unlock()
-		})
-	}
 	env := newCoEnv(t, store, nil, edge, cloud)
 	env.c.mu.Lock()
 	env.c.parts["edge"].raisePrivateLocked()
@@ -982,16 +952,15 @@ func TestCoordinatorClearInForceAfterLaterChunkFails(t *testing.T) {
 
 	env.submit(Query{Text: "continue", Explicit: "edge"})
 	env.idle()
-	syncs := edge.appliedSyncs()
-	if n := len(edge.activations()); n != 0 || len(syncs) != 1 || !syncs[0].Reset {
-		t.Fatalf("want only the reset chunk applied and no reply: %d activations, syncs %+v", n, syncs)
+	if n := len(edge.activations()); n != 0 || len(edge.appliedSyncs()) != 0 {
+		t.Fatalf("want nothing applied and no reply: %d activations, syncs %+v", n, edge.appliedSyncs())
 	}
 	env.c.mu.Lock()
 	ps := env.c.parts["edge"]
 	private, held, from := ps.private, ps.heldCoverage, ps.resetFrom
 	env.c.mu.Unlock()
-	if private || held == nil || held.Through != 3 || from != 0 {
-		t.Fatalf("after the reset chunk: private %v held %+v resetFrom %d", private, held, from)
+	if !private || held != nil || from != 0 {
+		t.Fatalf("after the failed clear: private %v held %+v resetFrom %d", private, held, from)
 	}
 
 	edge.mu.Lock()
@@ -1000,21 +969,18 @@ func TestCoordinatorClearInForceAfterLaterChunkFails(t *testing.T) {
 	edge.push(replyWith("back"))
 	env.submit(Query{Text: "continue again", Explicit: "edge"})
 	env.idle()
-	again := edge.appliedSyncs()[1:]
-	if len(again) == 0 || !again[0].Reset {
-		t.Fatalf("the next takeover must clear again: %+v", again)
+	again := edge.appliedSyncs()
+	if len(again) != 1 || !again[0].Reset {
+		t.Fatalf("the next takeover must clear again in one Sync: %+v", again)
 	}
-	var texts []string
-	for i := range again {
-		texts = append(texts, syncTexts(&again[i])...)
-	}
+	texts := syncTexts(&again[0])
 	if !containsText(texts, "CHUNK-1") || !containsText(texts, "CHUNK-8") {
-		t.Fatalf("the second clear must bring the whole import: %q", texts)
+		t.Fatalf("the clear must bring the whole import: %q", texts)
 	}
 	env.c.mu.Lock()
-	from = env.c.parts["edge"].resetFrom
+	private, from = ps.private, ps.resetFrom
 	env.c.mu.Unlock()
-	if from != 4 {
-		t.Fatalf("resetFrom after the finished clear = %d", from)
+	if private || from != 4 {
+		t.Fatalf("after the clear: private %v resetFrom %d", private, from)
 	}
 }

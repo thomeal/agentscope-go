@@ -303,6 +303,9 @@ func (t *tracker) capture(r *callRecord) {
 		Output:  r.output.String(),
 		Tainted: r.tainted,
 	}
+	// An unmarked edge record is edge-only; the participant marks what it
+	// knows to be shareable.
+	rec.Visibility = thread.Shared
 	if _, private := t.act.flags(); private || t.c.private[r.name] {
 		rec.Visibility = thread.EdgeOnly
 	}

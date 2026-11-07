@@ -36,8 +36,9 @@ type EventRecord struct {
 	// Zone is the zone of the participant whose tool produced the output.
 	Zone Zone
 	// Visibility says whether a cloud reader may ever read the output. An
-	// empty value is Shared; any value other than Shared or empty is treated
-	// as EdgeOnly. A cloud reader never sees an EdgeOnly record, whatever
+	// empty value is Shared for a cloud record and EdgeOnly for an edge one
+	// (unmarked edge output never reaches the cloud); any value other than
+	// Shared or empty is treated as EdgeOnly. A cloud reader never sees an EdgeOnly record, whatever
 	// the CloudReadsEdge switch says. Edge participants set EdgeOnly for
 	// outputs of private tools and of activations whose context holds
 	// edge-only material.
@@ -49,10 +50,10 @@ type EventRecord struct {
 	Time       time.Time
 }
 
-// effectiveVisibility treats an empty visibility as Shared and any unknown
-// one as EdgeOnly.
+// effectiveVisibility treats an empty visibility as Shared for a cloud
+// record and EdgeOnly for any other, and any unknown one as EdgeOnly.
 func (r *EventRecord) effectiveVisibility() Visibility {
-	if r.Visibility == "" || r.Visibility == Shared {
+	if r.Visibility == Shared || (r.Visibility == "" && r.Zone == ZoneCloud) {
 		return Shared
 	}
 	return EdgeOnly

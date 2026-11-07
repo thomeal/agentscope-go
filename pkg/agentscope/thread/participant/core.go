@@ -73,7 +73,7 @@ func newCore(d thread.Descriptor, opts PrepareOptions, prepared bool) (*core, er
 	names := opts.Tools
 	if names == nil {
 		for _, n := range allToolNames {
-			if n == ToolPublishArtifact && d.Zone == thread.ZoneEdge {
+			if (n == ToolPublishArtifact && d.Zone == thread.ZoneEdge) || n == ToolEventRead {
 				continue
 			}
 			names = append(names, n)
@@ -103,7 +103,7 @@ func newCore(d thread.Descriptor, opts PrepareOptions, prepared bool) (*core, er
 func (c *core) configure(tainting, private []string, capture *bool, maxOutput int) {
 	c.tainting = toSet(tainting)
 	c.private = toSet(private)
-	c.capture = c.desc.Zone == thread.ZoneCloud
+	c.capture = false
 	if capture != nil {
 		c.capture = *capture
 	}

@@ -130,7 +130,9 @@ func newSession(ctx context.Context) (*session, error) {
 			agent.WithToolkit(tk),
 			agent.WithModelStreaming(false),
 			agent.WithPermissionContext(permission.NewContext(permission.ModeBypass)),
-			agent.WithContextConfig(&agent.ContextConfig{ContextSize: edgeDesc.Window}),
+			// The own summary shares the local summary budget with the peer
+			// summary the cloud writes for this window.
+			agent.WithContextConfig(&agent.ContextConfig{ContextSize: edgeDesc.Window, ThreadSummaryTokens: 1500}),
 		}, prep.Options()...)...)
 	edgeP, err := prep.Participant(participant.AgentConfig{Descriptor: edgeDesc, Agent: edgeAgent, PrivateTools: []string{"door_lock"}})
 	if err != nil {

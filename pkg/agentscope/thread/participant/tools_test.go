@@ -27,7 +27,10 @@ type toolEnv struct {
 
 func newToolEnv(t *testing.T, d thread.Descriptor) *toolEnv { //nolint:gocritic // test helper
 	t.Helper()
-	prep, err := Prepare(d, PrepareOptions{})
+	var opts PrepareOptions
+	var capture *bool
+	optIntoEvents(d, &opts, &capture)
+	prep, err := Prepare(d, opts)
 	if err != nil {
 		t.Fatal(err)
 	}

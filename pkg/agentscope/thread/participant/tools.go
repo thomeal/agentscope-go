@@ -38,8 +38,12 @@ var defaultTaintGate = []string{ToolTransfer, ToolAssignTask, ToolReport, ToolPu
 // threadReadMaxRunes caps one thread_read output.
 const threadReadMaxRunes = 6000
 
-// defaultEventOutline is the number of records event_read lists by default.
-const defaultEventOutline = 20
+// defaultEventOutline is the number of records event_read lists by default;
+// maxEventOutline caps what one outline or search may ask for.
+const (
+	defaultEventOutline = 20
+	maxEventOutline     = 40
+)
 
 func isThreadTool(name string) bool {
 	return slices.Contains(allToolNames, name)
@@ -557,6 +561,7 @@ func (c *core) eventRead(host thread.Host, act *activation, in map[string]any) *
 		if limit == 0 {
 			limit = defaultEventOutline
 		}
+		limit = min(limit, maxEventOutline)
 		return renderOutline(act, host.EventOutline(name, limit), "No tool outputs are available to read.")
 	case "search":
 		query := strArg(in, "query")
@@ -566,6 +571,7 @@ func (c *core) eventRead(host thread.Host, act *activation, in map[string]any) *
 		if limit == 0 {
 			limit = defaultEventOutline
 		}
+		limit = min(limit, maxEventOutline)
 		return renderOutline(act, host.EventSearch(name, query, limit), "No tool outputs match "+query+".")
 	case "page":
 		id := strArg(in, "id")

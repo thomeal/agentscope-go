@@ -6,7 +6,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -15,8 +14,9 @@ import (
 )
 
 // edgeEraStore holds a session where the edge answered with eight long
-// replies (#3–#10), the cloud took over without importing them, and a summary
-// written for the edge (#14) excludes them. The edge's cursor is 10.
+// replies (#3–#10), the cloud took over, and a summary written for the edge
+// (#14) excludes them (as a summary excludes entries its writer had not
+// imported when it forked). The edge's cursor is 10.
 func edgeEraStore(t *testing.T) Store {
 	t.Helper()
 	s := NewMemoryStore(WithClock(fixedClock()))
@@ -43,11 +43,12 @@ func edgeEraStore(t *testing.T) Store {
 	return s
 }
 
-// TestCoordinatorClearInRoundsBelowTheCursor: a clear that replays the edge's
-// own excluded replies does not fit in one round, so its first round ends
-// below the edge's cursor. The reset sets the cursor (it never moves back
-// otherwise), so the edge takes the foreground back instead of failing over.
-func TestCoordinatorClearInRoundsBelowTheCursor(t *testing.T) {
+// TestCoordinatorClearIsOneSync: a clear is one Sync with the activation,
+// however large: the reset, the summary, the index and every entry the
+// summary does not cover (the edge's own excluded replies included, since
+// the reset drops them). It is not chunked or compacted on the way in, and
+// its cursor never moves back.
+func TestCoordinatorClearIsOneSync(t *testing.T) {
 	edge := smallEdge()
 	edge.state.Cursor = 10
 	_, cloud := edgeCloud()
@@ -56,22 +57,20 @@ func TestCoordinatorClearInRoundsBelowTheCursor(t *testing.T) {
 	env.idle()
 
 	syncs := edge.appliedSyncs()
-	if len(syncs) < 2 || !syncs[0].Reset || syncs[0].Cursor == 0 || syncs[0].Cursor >= 10 {
-		t.Fatalf("the clear's first round must end below the edge's cursor: %+v", syncs)
+	if len(syncs) != 1 || !syncs[0].Reset || syncs[0].PeerSummary == nil || syncs[0].PeerSummary.Seq != 14 {
+		t.Fatalf("want one reset Sync carrying summary #14: %+v", syncs)
+	}
+	if syncs[0].Cursor < 10 {
+		t.Fatalf("the clear moved the cursor back to %d", syncs[0].Cursor)
+	}
+	if n := edge.compactCount(); n != 0 {
+		t.Fatalf("the clear compacted %d times", n)
 	}
 	acts := edge.activations()
-	if len(acts) != 1 || acts[0].Trigger.Seq != seq {
-		t.Fatalf("the edge must answer #%d itself: %+v", seq, acts)
+	if len(acts) != 1 || acts[0].Trigger.Seq != seq || acts[0].Sync == nil || !acts[0].Sync.Reset {
+		t.Fatalf("the clear must go with the edge's activation for #%d: %+v", seq, acts)
 	}
-	for _, e := range env.log() {
-		if e.Kind == KindOwnerChange && e.Owner.Reason == ReasonFailover {
-			t.Fatalf("the clear failed over: %+v", e.Owner)
-		}
-	}
-	if st := edge.State(); st.Cursor < seq {
-		t.Fatalf("cursor after the clear = %d", st.Cursor)
-	}
-	got := strings.Join(allImported(edge), "\n")
+	got := strings.Join(syncTexts(&syncs[0]), "\n")
 	for seq := 3; seq <= 10; seq++ {
 		if !strings.Contains(got, "[#"+strconv.Itoa(seq)+" reply from edge]") {
 			t.Fatalf("the clear lost the edge's reply #%d:\n%s", seq, got)
@@ -283,48 +282,40 @@ func TestCoordinatorRecoveryKeepsTheDisclosure(t *testing.T) {
 	}
 }
 
-// TestCoordinatorFailedClearRoundKeepsOwnReplies: a clear whose reset round
-// was applied but whose later round failed is not done. The reset dropped
-// the edge's own replies above the round's cursor, and only a clear sends
-// own entries, so the next takeover clears again instead of importing
-// incrementally from the lowered cursor.
-func TestCoordinatorFailedClearRoundKeepsOwnReplies(t *testing.T) {
+// TestCoordinatorFailedClearIsRepeated: a clear whose activation fails is
+// not recorded, and the next takeover clears again with everything the
+// first one carried.
+func TestCoordinatorFailedClearIsRepeated(t *testing.T) {
 	edge := smallEdge()
 	edge.state.Cursor = 10
-	var once sync.Once
-	edge.onCompact = func() {
-		once.Do(func() {
-			edge.mu.Lock()
-			edge.syncErr = errors.New("checkpoint save failed")
-			edge.mu.Unlock()
-		})
-	}
+	edge.syncErr = errors.New("checkpoint save failed")
 	_, cloud := edgeCloud()
 	env := newCoEnv(t, edgeEraStore(t), nil, edge, cloud)
 	env.submit(Query{Text: "back to the edge", Explicit: "edge"})
 	env.idle()
-	if n := len(edge.activations()); n != 0 {
-		t.Fatalf("the failed clear must not start a reply: %d", n)
+	if n := len(edge.activations()); n != 0 || len(edge.appliedSyncs()) != 0 {
+		t.Fatalf("the failed clear must change nothing: %d activations, syncs %+v", n, edge.appliedSyncs())
 	}
-	first := len(edge.appliedSyncs())
+	env.c.mu.Lock()
+	from := env.c.parts["edge"].resetFrom
+	env.c.mu.Unlock()
+	if from != 0 {
+		t.Fatalf("a failed clear was recorded: resetFrom = %d", from)
+	}
 
 	edge.mu.Lock()
 	edge.syncErr = nil
 	edge.mu.Unlock()
 	env.submit(Query{Text: "edge again", Explicit: "edge"})
 	env.idle()
-	again := edge.appliedSyncs()[first:]
-	if len(again) == 0 || !again[0].Reset {
-		t.Fatalf("the next takeover must clear again: %+v", again)
+	again := edge.appliedSyncs()
+	if len(again) != 1 || !again[0].Reset {
+		t.Fatalf("the next takeover must clear again in one Sync: %+v", again)
 	}
-	var got []string
-	for i := range again {
-		got = append(got, syncTexts(&again[i])...)
-	}
-	joined := strings.Join(got, "\n")
+	joined := strings.Join(syncTexts(&again[0]), "\n")
 	for n := 3; n <= 10; n++ {
 		if !strings.Contains(joined, "[#"+strconv.Itoa(n)+" reply from edge]") {
-			t.Fatalf("the edge's own reply #%d was lost after the failed clear:\n%s", n, joined)
+			t.Fatalf("the edge's own reply #%d is missing from the repeated clear:\n%s", n, joined)
 		}
 	}
 	if n := len(edge.activations()); n != 1 {
@@ -332,21 +323,15 @@ func TestCoordinatorFailedClearRoundKeepsOwnReplies(t *testing.T) {
 	}
 }
 
-// TestCoordinatorFailedBackgroundClearKeepsOwnReplies is the same for a clear
-// inside a background task: the failed task's report is written in the
-// edge's name and moves its activity past the summary, yet the unfinished
-// clear is still repeated at the next takeover.
-func TestCoordinatorFailedBackgroundClearKeepsOwnReplies(t *testing.T) {
+// TestCoordinatorFailedBackgroundClearKeepsTheContext: a clear inside a
+// background task that the edge cannot apply leaves its context whole. The
+// failed task's report, written in the edge's name, moves its activity past
+// the summary, so the next takeover imports incrementally: nothing the edge
+// held was dropped.
+func TestCoordinatorFailedBackgroundClearKeepsTheContext(t *testing.T) {
 	edge := smallEdge()
 	edge.state.Cursor = 10
-	var once sync.Once
-	edge.onCompact = func() {
-		once.Do(func() {
-			edge.mu.Lock()
-			edge.syncErr = errors.New("checkpoint save failed")
-			edge.mu.Unlock()
-		})
-	}
+	edge.syncErr = errors.New("checkpoint save failed")
 	_, cloud := edgeCloud()
 	cloud.push(func(r *fakeRun) *ActivationEnd {
 		if _, _, err := r.assign("edge", "check the photos", false); err != nil {
@@ -357,9 +342,8 @@ func TestCoordinatorFailedBackgroundClearKeepsOwnReplies(t *testing.T) {
 	env := newCoEnv(t, edgeEraStore(t), nil, edge, cloud)
 	env.submit(Query{Text: "next question", Explicit: "cloud"})
 	env.idle()
-	syncs := edge.appliedSyncs()
-	if n := len(edge.activations()); n != 0 || len(syncs) != 1 || !syncs[0].Reset {
-		t.Fatalf("want the task's clear to fail after its reset round: %d activations, syncs %+v", n, syncs)
+	if n := len(edge.activations()); n != 0 || len(edge.appliedSyncs()) != 0 {
+		t.Fatalf("want the task's clear to fail unapplied: %d activations, syncs %+v", n, edge.appliedSyncs())
 	}
 	var failed bool
 	for _, e := range env.log() {
@@ -376,24 +360,86 @@ func TestCoordinatorFailedBackgroundClearKeepsOwnReplies(t *testing.T) {
 	edge.mu.Unlock()
 	env.submit(Query{Text: "edge again", Explicit: "edge"})
 	env.idle()
-	again := edge.appliedSyncs()[1:]
-	if len(again) == 0 || !again[0].Reset {
-		t.Fatalf("the next takeover must clear again: %+v", again)
-	}
-	var got []string
-	for i := range again {
-		got = append(got, syncTexts(&again[i])...)
-	}
-	joined := strings.Join(got, "\n")
-	for n := 3; n <= 10; n++ {
-		if !strings.Contains(joined, "[#"+strconv.Itoa(n)+" reply from edge]") {
-			t.Fatalf("the edge's own reply #%d was lost after the failed background clear:\n%s", n, joined)
+	for _, s := range edge.appliedSyncs() {
+		if s.Reset {
+			t.Fatalf("the edge was reset after its activity passed the summary: %+v", s)
 		}
 	}
+	if n := len(edge.activations()); n != 1 {
+		t.Fatalf("the edge must answer: %d activations", n)
+	}
+}
+
+// TestCoordinatorClearLeavesSteeringWhole: a clear has no budget, so a user
+// message that steers the edge's reply after a large clear arrives in full
+// instead of as a cut notice.
+func TestCoordinatorClearLeavesSteeringWhole(t *testing.T) {
+	edge := smallEdge()
+	edge.state.Cursor = 10
+	edge.started = make(chan Activation, 8)
+	release := make(chan struct{})
+	var got []string
+	edge.push(gate(release, func(r *fakeRun) *ActivationEnd {
+		for range 3 {
+			if s := r.pending(); s != nil {
+				got = append(got, syncTexts(s)...)
+			}
+		}
+		return r.reply("ok")
+	}))
+	_, cloud := edgeCloud()
+	env := newCoEnv(t, edgeEraStore(t), nil, edge, cloud)
+	env.submit(Query{Text: "back to the edge", Explicit: "edge"})
+	if a := waitStarted(t, edge); a.Sync == nil || !a.Sync.Reset || countTokens(a.Sync.Messages) <= int(0.5*float64(edge.desc.Window)) {
+		t.Fatalf("want a clear larger than the edge's import share: %+v", a.Sync)
+	}
+	steer := "STEERING: also check whether the garage door is closed"
+	env.submit(Query{Text: steer, Explicit: "edge"})
+	close(release)
+	env.idle()
+	if !containsText(got, steer) {
+		t.Fatalf("the steering message did not arrive in full: %q", got)
+	}
+}
+
+// TestCoordinatorUnsavedClearIsRepeated: an agent can apply a clear in memory
+// and then fail to save it, which fails the activation. The Coordinator does
+// not record the clear, and the repeated clear applies over the first one
+// (its cursor is not behind) and still carries the edge's own replies.
+func TestCoordinatorUnsavedClearIsRepeated(t *testing.T) {
+	edge := smallEdge()
+	edge.state.Cursor = 10
+	edge.saveErr = errors.New("checkpoint save failed")
+	_, cloud := edgeCloud()
+	env := newCoEnv(t, edgeEraStore(t), nil, edge, cloud)
+	env.submit(Query{Text: "back to the edge", Explicit: "edge"})
+	env.idle()
+	if n := len(edge.activations()); n != 0 || len(edge.appliedSyncs()) != 1 {
+		t.Fatalf("want the clear applied without a reply: %d activations, %d syncs", n, len(edge.appliedSyncs()))
+	}
 	env.c.mu.Lock()
-	pending := env.c.parts["edge"].clearPending
+	from := env.c.parts["edge"].resetFrom
 	env.c.mu.Unlock()
-	if pending != nil {
-		t.Fatal("the finished clear must not stay pending")
+	if from != 0 {
+		t.Fatalf("an unsaved clear was recorded: resetFrom = %d", from)
+	}
+
+	edge.mu.Lock()
+	edge.saveErr = nil
+	edge.mu.Unlock()
+	env.submit(Query{Text: "edge again", Explicit: "edge"})
+	env.idle()
+	syncs := edge.appliedSyncs()
+	if len(syncs) != 2 || !syncs[1].Reset || syncs[1].Cursor < syncs[0].Cursor {
+		t.Fatalf("want a second clear applied over the first: %+v", syncs)
+	}
+	joined := strings.Join(syncTexts(&syncs[1]), "\n")
+	for n := 3; n <= 10; n++ {
+		if !strings.Contains(joined, "[#"+strconv.Itoa(n)+" reply from edge]") {
+			t.Fatalf("the repeated clear lost the edge's reply #%d:\n%s", n, joined)
+		}
+	}
+	if n := len(edge.activations()); n != 1 {
+		t.Fatalf("the edge must answer after the repeated clear: %d activations", n)
 	}
 }

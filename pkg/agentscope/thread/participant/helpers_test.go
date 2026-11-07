@@ -376,6 +376,7 @@ func newFixture(t *testing.T, o fixtureOptions) *fixture { //nolint:gocritic // 
 	f := &fixture{m: &scriptModel{respond: o.respond}, host: newFakeHost(cloudDesc, edgeDesc), perms: permission.NewContext(o.mode)}
 	cfg := o.cfg
 	cfg.Descriptor = o.desc
+	optIntoEvents(o.desc, &o.prepare, &cfg.CaptureOutputs)
 	if o.noPrep {
 		tk := tool.NewToolkit(o.tools...)
 		opts := append([]agent.AgentOption{agent.WithToolkit(tk), agent.WithModelStreaming(false), agent.WithPermissionContext(f.perms)}, o.agent...)
@@ -511,4 +512,22 @@ func projected(seq uint64, text string) *message.Msg {
 	m.Metadata[thread.SeqMetadataKey] = seq
 	m.Metadata[thread.KindMetadataKey] = string(thread.KindReport)
 	return m
+}
+
+// optIntoEvents opts a test participant into the event list the way the
+// defaults did before it became opt-in: every thread tool (publish_artifact
+// only for the cloud) and capture on the cloud. Explicit settings win.
+func optIntoEvents(d thread.Descriptor, p *PrepareOptions, capture **bool) { //nolint:gocritic // test helper
+	if p.Tools == nil {
+		for _, n := range allToolNames {
+			if n == ToolPublishArtifact && d.Zone == thread.ZoneEdge {
+				continue
+			}
+			p.Tools = append(p.Tools, n)
+		}
+	}
+	if *capture == nil {
+		on := d.Zone == thread.ZoneCloud
+		*capture = &on
+	}
 }

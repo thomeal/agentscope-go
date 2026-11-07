@@ -29,8 +29,9 @@ const (
 	// While the edge is tainted the query is DiscloseEdgeOnly in every
 	// respect: its user_input entry is edge_only, so no cloud participant
 	// imports it, reads it or receives it through Pending, and its query
-	// cycle never goes to the cloud by routing, Transfer or failover, also
-	// after a restart. Otherwise the entry is shared, and routing still keeps
+	// cycle never goes to the cloud by routing or failover, also after a
+	// restart; an edge Transfer hands it over only through a brief the
+	// DisclosurePolicy clears. Otherwise the entry is shared, and routing still keeps
 	// the query off the cloud if the edge is tainted when the query is
 	// routed.
 	DiscloseUnclassified Disclosure = "unclassified"
@@ -127,10 +128,7 @@ type Sync struct {
 	Index *string
 	// Messages are projected entries, each carrying SeqMetadataKey.
 	Messages []*message.Msg
-	// Cursor is the new cursor; zero keeps it. It never moves back, except
-	// in a Reset: the reset context holds only what the Sync brings, so its
-	// cursor is set as given (a clear replayed in several rounds starts
-	// below the old cursor).
+	// Cursor is the new cursor; zero keeps it. It never moves back.
 	Cursor uint64
 	// Taint, when non-nil, sets or clears the participant's taint state.
 	Taint *bool

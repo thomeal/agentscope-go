@@ -689,15 +689,72 @@ func TestCoordinatorTransferRefusals(t *testing.T) {
 		t.Errorf("background caller: %v", errs["background caller"])
 	}
 
-	// An edge-only query never goes to the cloud through a Transfer.
+	// An edge-only query reaches the cloud through a Transfer only as a brief
+	// the policy clears (plan §12); the query itself stays a gap.
 	edge.push(func(r *fakeRun) *ActivationEnd {
-		_, errs["edge-only input"] = r.transfer("cloud")
-		return r.reply("kept")
+		_, errs["edge-only, private brief"] = r.host().Transfer(r.ctx, TransferRequest{From: Origin{Participant: "edge"},
+			Epoch: r.act.Epoch, To: "cloud", Brief: Brief{Goal: "fix it using the private notes", Remaining: []string{"x"}}})
+		_, errs["edge-only, cleared brief"] = r.transfer("cloud")
+		return &ActivationEnd{Reason: types.ReplyHandedOff}
 	})
+	cloud.push(replyWith("on it"))
 	env.submit(Query{Text: "my secret", Disclosure: DiscloseEdgeOnly})
 	env.idle()
-	if err := errs["edge-only input"]; err == nil || !strings.Contains(err.Error(), "edge-only") {
-		t.Errorf("edge-only input: %v", err)
+	if err := errs["edge-only, private brief"]; !errors.Is(err, errPrivateBrief) {
+		t.Errorf("edge-only input with a private brief: %v", err)
+	}
+	if err := errs["edge-only, cleared brief"]; err != nil {
+		t.Errorf("edge-only input with a cleared brief: %v", err)
+	}
+	if containsText(cloud.seenTexts(), "my secret") {
+		t.Error("the edge-only query reached the cloud")
+	}
+}
+
+// TestCoordinatorCloudTransferInAnEdgeOnlyCycle: once the edge has handed an
+// edge-only request to the cloud through a cleared brief, the cloud never saw
+// the request, so its own transfer to another cloud participant is not held
+// to the disclosure policy.
+func TestCoordinatorCloudTransferInAnEdgeOnlyCycle(t *testing.T) {
+	edge, cloud := edgeCloud()
+	cloud2 := newFakePart("cloud2", ZoneCloud)
+	policy := &fakePolicy{fn: func(text string) (Visibility, error) {
+		if strings.Contains(text, testBrief().Goal) {
+			return Shared, nil
+		}
+		return EdgeOnly, nil
+	}}
+	var edgeErr, cloudErr error
+	edge.push(func(r *fakeRun) *ActivationEnd {
+		_, edgeErr = r.transfer("cloud")
+		return &ActivationEnd{Reason: types.ReplyHandedOff}
+	})
+	cloud.push(func(r *fakeRun) *ActivationEnd {
+		_, cloudErr = r.host().Transfer(r.ctx, TransferRequest{From: Origin{Participant: "cloud"}, Epoch: r.act.Epoch,
+			To: "cloud2", Brief: Brief{Goal: "compare the hotel prices", Remaining: []string{"pick one"}}})
+		return &ActivationEnd{Reason: types.ReplyHandedOff}
+	})
+	cloud2.push(replyWith("booked"))
+	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Disclosure = policy }, edge, cloud, cloud2)
+	env.submit(Query{Text: "my secret", Disclosure: DiscloseEdgeOnly})
+	env.idle()
+	if edgeErr != nil {
+		t.Fatalf("edge transfer with a cleared brief: %v", edgeErr)
+	}
+	if cloudErr != nil {
+		t.Fatalf("cloud transfer in an edge-only cycle: %v", cloudErr)
+	}
+	policy.mu.Lock()
+	calls := append([]string(nil), policy.calls...)
+	policy.mu.Unlock()
+	if containsText(calls, "compare the hotel prices") {
+		t.Fatalf("the cloud's brief went through the disclosure policy: %q", calls)
+	}
+	if n := len(cloud2.activations()); n != 1 {
+		t.Fatalf("cloud2 activations = %d", n)
+	}
+	if containsText(cloud.seenTexts(), "my secret") || containsText(cloud2.seenTexts(), "my secret") {
+		t.Fatal("the edge-only query reached the cloud")
 	}
 }
 

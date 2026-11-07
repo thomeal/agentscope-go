@@ -220,7 +220,7 @@ func (c *Coordinator) execute(a *activation) (*ActivationEnd, bool) {
 	// in force, and a foreground activation holds everything up to its
 	// cursor.
 	if im.clear != nil {
-		c.commitClearLocked(ps, im.clear, true)
+		c.commitClearLocked(ps, im.clear)
 	}
 	if c.holdsForegroundLocked(a) {
 		through := max(st.Cursor, a.trigger.Seq)
@@ -309,21 +309,15 @@ func (c *Coordinator) flushBacklogLocked(a *activation, force bool) {
 }
 
 // commitClearLocked records a clear whose reset the participant applied:
-// the summary it now holds, and its privacy, lowered only when nothing set
-// it since the import marked it. done marks the clear finished (resetFrom),
-// so the same summary is not applied again; it is set once every round of
-// the clear reached the participant.
-func (c *Coordinator) commitClearLocked(ps *partState, cc *clearCommit, done bool) {
+// the summary it now holds, the summary's seq (so the same summary does not
+// clear it again), and its privacy, lowered only when nothing set it since
+// the import marked it.
+func (c *Coordinator) commitClearLocked(ps *partState, cc *clearCommit) {
 	if ps.privGen == cc.gen {
 		ps.private = cc.private
 	}
 	ps.heldCoverage = cloneCoverage(cc.coverage)
-	if done {
-		ps.resetFrom = cc.seq
-		ps.clearPending = nil
-	} else {
-		ps.clearPending = cc
-	}
+	ps.resetFrom = cc.seq
 }
 
 // deliveredNotifyLocked drops the Notify reports up to through from the

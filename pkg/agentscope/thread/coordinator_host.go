@@ -135,11 +135,12 @@ func (h *coordHost) Transfer(ctx context.Context, req TransferRequest) (uint64, 
 			c.mu.Unlock()
 			return 0, err
 		}
-		if to.desc.Zone == ZoneCloud && c.cycle.disclosure == DiscloseEdgeOnly {
-			c.mu.Unlock()
-			return 0, fmt.Errorf("thread: the user's request is edge-only, so it may not go to %s in the cloud", to.name)
-		}
-		private := c.privateLocked(h.ps, a, req.Private)
+		// An edge may still hand an edge-only request to the cloud, but only
+		// through a brief the disclosure policy clears (plan §12): the
+		// request itself stays a gap in the cloud's projection. A cloud
+		// caller never saw the request.
+		private := c.privateLocked(h.ps, a, req.Private) ||
+			(h.ps.desc.Zone == ZoneEdge && c.cycle.disclosure == DiscloseEdgeOnly)
 		c.mu.Unlock()
 
 		brief := req.Brief.Render()
