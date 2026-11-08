@@ -40,8 +40,14 @@ const (
 	// cloud is offline, when it needs tools or data only on the device, or
 	// when the classifier says it is simple.
 	CloudBased Mode = "cloud_based"
-	// Hybrid has no home. Every open query is classified; a low-confidence
-	// answer leaves the query with the current owner.
+	// Hybrid has no home. Every open query is classified. When step 5 leaves
+	// the query open, it goes to the cloud whoever owns the session, and to
+	// the edge only when the cloud is not a candidate. Step 5 leaves it open
+	// when there is no classifier, when the router does not ask it (the state
+	// cannot be built or Authorize denies the dispatch), and when it cannot
+	// use the answer (the call fails or runs out of time, the answer is
+	// invalid, its confidence is below the threshold, or it chose a
+	// participant over MaxLag).
 	Hybrid Mode = "hybrid"
 )
 
@@ -52,8 +58,7 @@ const DefaultThreshold = 0.8
 
 // DefaultTimeout bounds one classifier call when Config.Timeout is zero. A
 // call that runs out of time counts as a classifier failure: routing falls
-// through to the mode's default (in hybrid, the current owner) instead of
-// waiting.
+// through to the mode's default (in hybrid, the cloud) instead of waiting.
 const DefaultTimeout = 10 * time.Second
 
 // QuestionID is the ID of the one Choice question the router asks.
@@ -82,7 +87,10 @@ type Config struct {
 	// classifier failure, so routing falls through to the mode's default.
 	Timeout time.Duration
 	// MaxLag stops the classifier from choosing a participant that has more
-	// than MaxLag entries it has not imported yet. Zero means no limit.
+	// than MaxLag entries it has not imported yet. Zero means no limit. It
+	// limits the classifier's choice only: a participant rejected for lag
+	// still gets the query when it is the mode's default (the home, or the
+	// cloud in hybrid), and then imports what it lacks.
 	MaxLag uint64
 	// Budget bounds the classifier state. Zero fields take the values of
 	// DefaultBudget.
@@ -405,7 +413,10 @@ func (r *Router) fallback(in *thread.RouteRequest, set *candidateSet) (target, w
 	var prefs []pref
 	switch r.cfg.Mode {
 	case Hybrid:
-		prefs = []pref{{in.Owner, "stay with the current owner"}, {r.cfg.Edge, "the edge"}, {r.cfg.Cloud, "the cloud"}}
+		// A query the classifier left open goes to the cloud. While the
+		// cloud is a candidate, the edge takes a query that steps 1 to 4
+		// leave open only when the classifier picks it.
+		prefs = []pref{{r.cfg.Cloud, "the cloud"}, {r.cfg.Edge, "the cloud is not a candidate"}}
 	case LocalBased:
 		prefs = []pref{{r.cfg.Edge, "home is the edge"}, {r.cfg.Cloud, "the edge is not a candidate"}}
 	case CloudBased:

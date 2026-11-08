@@ -111,14 +111,34 @@ steered it are queued again.
 |---|---|---|
 | `local_based` | edge | go to the cloud only for stronger reasoning or cloud-only tools |
 | `cloud_based` | cloud | go to the edge only for simple requests or device-only tools and data |
-| `hybrid` | none | best participant per query; low confidence stays with the current owner |
+| `hybrid` | none | best participant per query; a query it leaves open goes to the cloud |
 
 The decision order is fixed: availability, a participant the user named,
 tool groups only one side holds, host rules, the classifier, then the mode's
-default. A classifier error, an invalid
-answer, confidence below the threshold or a call that runs out of
-`route.Config.Timeout` (default 10 s) falls through to the default; routing
-never blocks the user on the classifier.
+default. The query falls through to the default in these cases, and
+routing never blocks the user on the classifier:
+
+- there is no classifier;
+- the state cannot be built;
+- `route.Config.Authorize` denies the dispatch;
+- the call fails or runs out of `route.Config.Timeout` (default 10 s);
+- the answer is invalid;
+- its confidence is below the threshold;
+- it chose a participant more than `route.Config.MaxLag` entries behind.
+
+In `hybrid` the default is the cloud, whoever owns the session, and the edge
+only when the cloud is not a candidate. With the configured edge and cloud
+as the only participants, a query the earlier steps leave open goes to the
+edge only when the classifier picks the edge at or above the threshold and
+within `MaxLag`. `MaxLag` limits the classifier's
+choice only. The default participant gets the query even when it is behind,
+and imports what it lacks.
+
+The cloud counts as offline when `thread.Config.Available` reports it. With two
+participants, the edge is then the only candidate. If the cloud is unreachable
+but reported available, an open query still goes to it, and the edge gets
+the query only after that cloud run fails and failover moves it. A hosted
+classifier on the same failing network can add its timeout first.
 
 The classifier reads a fixed-size state, so it fits a small model's prompt
 (Piccolo's 8,192-token row): the query (cut to 1,500 tokens), the summary the

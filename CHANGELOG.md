@@ -27,8 +27,12 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
   edge-only data and taint is left as future work in
   `docs/design/main-thread-privacy.md`). The classifier call is
   bounded by a timeout, after which routing falls through to the mode's
-  default; the hybrid question is stage 0's, and the participant
-  descriptions follow stage 0 with tool calls in place of its records.
+  default. Hybrid's default is the cloud. Whoever owns the session, a query
+  the classifier leaves open goes there. Open means no classifier, a call
+  that is not made, fails or times out, an invalid answer, low confidence,
+  or a choice over `MaxLag`. The hybrid question is stage 0's, and the
+  participant descriptions follow stage 0 with tool calls in place of its
+  records.
   Peer summaries are refreshed when what a handover would bring the edge
   reaches a share of its window. The cloud's own notes follow Claude Code's
   session memory (first notes at 10,000 tokens, edit-based updates every

@@ -346,19 +346,19 @@ func TestClassifierOperationIDWithoutRequestID(t *testing.T) {
 }
 
 func TestClassifierLowConfidence(t *testing.T) {
-	r := newRouter(t, Config{Mode: Hybrid, Classifier: choiceFake("cloud", 0.6)})
-	// Hybrid stays with the owner on low confidence, even when the
-	// classifier leaned towards the other participant.
+	r := newRouter(t, Config{Mode: Hybrid, Classifier: choiceFake("edge", 0.6)})
+	// Hybrid sends a low-confidence query to the cloud, even when the edge
+	// owns the session and the classifier leaned towards it.
 	in := request()
 	in.Owner = "edge"
 	d, resp, err := r.Decide(context.Background(), in)
 	if err != nil {
 		t.Fatalf("Decide: %v", err)
 	}
-	if d.Target != "edge" || d.Source != thread.RouteDefault || d.Confidence != 0 {
+	if d.Target != "cloud" || d.Source != thread.RouteDefault || d.Confidence != 0 {
 		t.Fatalf("decision = %+v", d)
 	}
-	if !strings.Contains(d.Reason, "below the threshold 0.80") || !strings.Contains(d.Reason, "stay with the current owner") {
+	if !strings.Contains(d.Reason, "below the threshold 0.80") || !strings.Contains(d.Reason, "default for mode hybrid: the cloud") {
 		t.Fatalf("reason = %q", d.Reason)
 	}
 	if resp == nil || d.ClassifierCalls != 1 || !d.UsageKnown {
@@ -504,6 +504,38 @@ func TestLagLimit(t *testing.T) {
 	}
 }
 
+// TestLagLimitHybrid: in hybrid, MaxLag limits the classifier's choice only.
+// A lagging edge the classifier picks is refused, and the query goes to the
+// default, the cloud. A lagging cloud the classifier picks is refused too,
+// but it is the default, so it gets the query anyway.
+func TestLagLimitHybrid(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		choice string
+		lagged int
+	}{
+		{"lagging edge", "edge", 0},
+		{"lagging cloud", "cloud", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRouter(t, Config{Mode: Hybrid, Classifier: choiceFake(tc.choice, 0.95), MaxLag: 10})
+			in := request()
+			in.Owner = "edge"
+			in.Participants[tc.lagged].Lag = 50
+			d, err := r.Route(context.Background(), in)
+			if err != nil {
+				t.Fatalf("Route: %v", err)
+			}
+			if d.Target != "cloud" || d.Source != thread.RouteDefault {
+				t.Fatalf("decision = %+v", d)
+			}
+			if !strings.Contains(d.Reason, "50 entries behind (limit 10)") || !strings.Contains(d.Reason, "default for mode hybrid: the cloud") {
+				t.Fatalf("reason = %q", d.Reason)
+			}
+		})
+	}
+}
+
 func TestModeDefaults(t *testing.T) {
 	both := []thread.RouteCandidate{edgeCand(true), cloudCand(true)}
 	cases := []struct {
@@ -514,11 +546,11 @@ func TestModeDefaults(t *testing.T) {
 		want  string
 		why   string
 	}{
-		{"hybrid stays with the cloud owner", Hybrid, "cloud", both, "cloud", "stay with the current owner"},
-		{"hybrid stays with the edge owner", Hybrid, "edge", both, "edge", "stay with the current owner"},
-		{"hybrid without owner takes the edge", Hybrid, "", both, "edge", "the edge"},
-		{"hybrid owner not a candidate", Hybrid, "lab", append([]thread.RouteCandidate{namedCand("lab", thread.ZoneCloud, false)}, both...), "edge", "the edge"},
-		{"hybrid without edge takes the cloud", Hybrid, "", []thread.RouteCandidate{edgeCand(false), cloudCand(true), namedCand("lab", thread.ZoneCloud, true)}, "cloud", "the cloud"},
+		{"hybrid keeps a cloud owner on the cloud", Hybrid, "cloud", both, "cloud", "default for mode hybrid: the cloud"},
+		{"hybrid moves an edge owner to the cloud", Hybrid, "edge", both, "cloud", "default for mode hybrid: the cloud"},
+		{"hybrid without owner takes the cloud", Hybrid, "", both, "cloud", "default for mode hybrid: the cloud"},
+		{"hybrid owner not a candidate", Hybrid, "lab", append([]thread.RouteCandidate{namedCand("lab", thread.ZoneCloud, false)}, both...), "cloud", "default for mode hybrid: the cloud"},
+		{"hybrid without cloud takes the edge", Hybrid, "cloud", []thread.RouteCandidate{edgeCand(true), cloudCand(false), namedCand("lab", thread.ZoneCloud, true)}, "edge", "the cloud is not a candidate"},
 		{"hybrid first by name", Hybrid, "", []thread.RouteCandidate{edgeCand(false), cloudCand(false), namedCand("lab", thread.ZoneCloud, true), namedCand("beta", thread.ZoneEdge, true)}, "beta", "first candidate by name"},
 		{"local based goes home", LocalBased, "cloud", both, "edge", "home is the edge"},
 		{"local based without edge", LocalBased, "", []thread.RouteCandidate{edgeCand(false), cloudCand(true), namedCand("lab", thread.ZoneCloud, true)}, "cloud", "the edge is not a candidate"},
@@ -626,13 +658,13 @@ func (hang) ClassifyWithDispatch(ctx context.Context, _ classifier.Request, _ cl
 	return nil, ctx.Err()
 }
 
-// TestClassifierTimeoutStays: a classifier that never answers runs out of
-// Config.Timeout, and the query stays with the current owner instead of
-// waiting for it.
-func TestClassifierTimeoutStays(t *testing.T) {
+// TestClassifierTimeoutFallsThrough: a classifier that never answers runs
+// out of Config.Timeout, and the query goes to the hybrid default, the cloud,
+// instead of waiting for it or staying with the edge owner.
+func TestClassifierTimeoutFallsThrough(t *testing.T) {
 	r := newRouter(t, Config{Mode: Hybrid, Classifier: hang{}, Timeout: 20 * time.Millisecond})
 	req := request()
-	req.Owner = "cloud"
+	req.Owner = "edge"
 	done := make(chan struct{})
 	var d thread.RouteDecision
 	var err error
@@ -645,8 +677,8 @@ func TestClassifierTimeoutStays(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("a hung classifier blocked the query")
 	}
-	if err != nil || d.Target != req.Owner || d.Source != thread.RouteDefault || !strings.Contains(d.Reason, "classifier failed") {
-		t.Fatalf("decision = %+v, err %v; want the current owner %q", d, err, req.Owner)
+	if err != nil || d.Target != "cloud" || d.Source != thread.RouteDefault || !strings.Contains(d.Reason, "classifier failed") {
+		t.Fatalf("decision = %+v, err %v; want the cloud", d, err)
 	}
 	if def := newRouter(t, Config{Classifier: hang{}}); def.cfg.Timeout != DefaultTimeout {
 		t.Fatalf("default timeout = %v", def.cfg.Timeout)
