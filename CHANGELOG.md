@@ -138,9 +138,9 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
 
 - With `ContextConfig.PrecompressRatio` set, a context that is still at the
   trigger after a ready summary is applied now also compresses synchronously,
-  instead of sending an over-long request.
+  instead of continuing above the trigger.
 - A blank background summary is discarded like a failed generation instead
-  of being applied, a background result no longer replaces a summary offered
+  of being applied, a background result does not replace a summary offered
   (`OfferSummary`) while it ran, and an offer loaded from a checkpoint is
   dropped when its bounds do not fit the context.
 
