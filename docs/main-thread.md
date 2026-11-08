@@ -336,7 +336,7 @@ tool. A fork never touches the agent's main context
   descriptor leaves `SummaryBudget` at zero, is 5/6 of that total (stage 0:
   2,500 of 3,000).
 
-The event list is opt-in (stage 0 measured no gain from it): with
+The event list is opt-in (stage 0 found no clear difference with it): with
 `CaptureOutputs` set on a participant and `event_read` installed on its peer,
 that participant's tool outputs are kept outside the log and every context,
 and the peer in the other zone reads them on demand with `event_read`
@@ -442,7 +442,8 @@ may or may not have taken effect, so the owner checks the actual state
 before redoing anything. A request a Transfer handed to the owner is resumed
 there like any other, and the input quotes it. If the owner is gone, the
 turn's routing never finished: its request is routed again behind a
-`requeue:` marker that counts the restart, the turn's other inputs that
+`restarted` marker whose dedup key starts with `requeue:` and counts the
+restart, the turn's other inputs that
 nothing is based on are queued again as Submit would queue them, and one
 that something is based on gets a `recovered` marker. An open request whose
 entries all precede the newest finished one gets a `recovered` marker and is

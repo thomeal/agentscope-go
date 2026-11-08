@@ -49,7 +49,7 @@ its window.
 | `ConnectivityAwareModel` | One model call, by connectivity and a circuit breaker | Yes | Yes | Cloud first; the local model works only after failures. The window is the smaller of the two ([model.go:196-199](https://github.com/agentscope-ai/agentscope-go/blob/ce51d23/pkg/agentscope/model/model.go#L196-L199)) |
 | `tierrouter.ChatRouter` | One operation | Refuses tools ([chatmodel.go:174-176](https://github.com/agentscope-ai/agentscope-go/blob/ce51d23/pkg/agentscope/tierrouter/chatmodel.go#L174-L176)) | Buffered `Reply` only | No tool session can use it |
 | `managedtask.Router` | One task: rules, then a classifier, then qualified pools | Text only, no Agent | No | Routes fixed text tasks, not a session |
-| `agent.Spawn`, `runtime.AgentManager` | A host call | Yes | No: one-shot sub-agents | The result returns to the caller; the sub-agent does not continue with the user |
+| `UnifiedAgent.Spawn`, `runtime.AgentManager` | A host call | Yes | No: one-shot sub-agents | The result returns to the caller; the sub-agent does not continue with the user |
 | `pipeline.TeamPipeline` | Leader assignment | Yes | Within one run; each `Start` builds a fresh leader | Serial, results return to the leader |
 
 A host can compose a two-tier session from these parts: a `ChatModel` that
@@ -71,8 +71,8 @@ handoff. Each composition runs into one of the following.
 - **The cloud's summary does not fit the device.** The default summary
   budget is 1/32 of the window, clamped to [1,024, 8,192]
   ([compress.go:41-49](https://github.com/agentscope-ai/agentscope-go/blob/ce51d23/pkg/agentscope/agent/compress.go#L41-L49)).
-  For a 200K cloud window that is 6,250 tokens, nearly the 6,400-token
-  compression line of an 8K device window.
+  For a 200K cloud window that is 6,250 tokens, nearly the 6,553-token
+  compression line of an 8,192-token device window (trigger ratio 0.8).
 - **Compression replaces state in place.** `state.Summary` and
   `state.Context` are overwritten
   ([compress.go:492-493](https://github.com/agentscope-ai/agentscope-go/blob/ce51d23/pkg/agentscope/agent/compress.go#L492-L493)),
@@ -100,45 +100,16 @@ handoff. Each composition runs into one of the following.
 | A handover that does not return to the caller, and background work on the other side while the owner talks to the user | Replacing `managedtask` for fixed text tasks |
 | The cloud side may be a master with sub-agents, without changing the device's view | Real-time hardware control or physical safety guarantees |
 | The device can take over when the cloud is down | A privacy boundary. Every participant reads every entry ([design note](main-thread-privacy.md)) |
-| Everything is opt-in and EXPERIMENTAL; ordinary agents keep their defaults | Verifying more than two top-level participants. The structure allows it; nothing tests it |
+| The thread packages are opt-in and EXPERIMENTAL; four default-behavior changes outside them are listed in section 18 | Verifying more than two top-level participants. The structure allows it; nothing tests it |
 
 ## 3. Architecture
 
-```mermaid
-flowchart TB
-    user([User])
-    subgraph coordinator ["Coordinator (deterministic code, not a model)"]
-        coord["routing at query boundaries<br/>owner and epoch<br/>wakes and forks<br/>shared ledger"]
-    end
-    router["Router<br/>availability → named → tool groups → rules → classifier → mode default"]
-    clf["classifier.DispatchClassifier<br/>Jev · Bailian · OpenAI Decisions · fake"]
-    log[("Main Thread log<br/>append-only, total order<br/>MemoryStore · FileStore")]
-    subgraph edgep ["Edge participant (AgentParticipant)"]
-        edge["UnifiedAgent<br/>small window, device tools<br/>own summary + peer summary"]
-    end
-    subgraph cloudp ["Cloud participant (TeamParticipant or AgentParticipant)"]
-        master["master UnifiedAgent<br/>large window, own notes"]
-        subA["member A"]
-        subB["member B"]
-        master -- "TeamAssign / result" --> subA
-        master -- "TeamAssign / result" --> subB
-    end
+![Main Thread architecture: user, Coordinator, router and classifier, the log, the edge participant and the cloud participant with a master and two members](../images/main-thread-architecture.svg)
 
-    user -- "query, steering, confirmations" --> coord
-    coord -- "foreground events of the owner only" --> user
-    coord -- "RouteRequest" --> router
-    router -- "fixed-size state" --> clf
-    coord -- "guarded append" --> log
-    log -- "entries past the cursor" --> edge
-    log -- "entries past the cursor" --> master
-    edge -- "reply, transfer, assign, report, artifact" --> coord
-    master -- "reply, transfer, assign, report, artifact" --> coord
-    coord -. "fork from the last request:<br/>peer summary, own notes" .-> master
-```
-
-*Figure 1. Every interaction between participants goes through the log. The
-Coordinator is its only writer. Members stay inside the cloud participant
-and never touch the log.*
+*Figure 1. The participants coordinate through the log, which only the
+Coordinator writes; the opt-in event list and a shared workspace are the
+exceptions. Members stay inside the cloud participant and never touch the
+log. Cursors and entries are an example.*
 
 | Layer | Responsibility | Code |
 |---|---|---|
@@ -179,7 +150,7 @@ The receiver therefore cannot see the other side's tool outputs. Four
 mechanisms make up for that: the peer summary, written by a cloud fork that
 saw the full trajectory (section 6); the tool digest; artifact references;
 and the read-only `thread_read` tool. A fifth, the event list, is opt-in
-because stage 0 measured no gain from it.
+because stage 0 found no clear difference with it.
 
 ### Entry kinds
 
@@ -201,7 +172,7 @@ type Entry struct {
     Seq      uint64                 // assigned by the single sequencer
     Epoch    uint64                 // the owner epoch at write time
     Kind     Kind
-    Origin   Origin                 // participant and agent path, e.g. cloud/master
+    Origin   Origin                 // the writer; empty means the Coordinator
     To       []string               // participants to wake; empty only syncs
     BasedOn  uint64                 // the newest entry the writer had read
     Content  []message.ContentBlock // never tool calls, results or thinking
@@ -270,7 +241,7 @@ documented defaults.
 | **What fills it** | Its own full context, with its own notes in place of older history | Peer summary, own summary, imports and the current turn | A fixed-size state |
 | **Summary written for it** | Own notes, capped at `OwnMaxTokens` (8,192) | Peer summary within `Descriptor.SummaryBudget`, or 5/6 of the summary total (2,560) | None; with `IncludeHistory` it reads the peer summary |
 | **Who writes it** | The cloud's own-notes fork | Peer summary: the cloud's peer fork. Own summary: the edge's synchronous compression | — |
-| **When** | First at 10,000 input tokens (`OwnInit`), then every 5,000 (`OwnEvery`); installed at the compaction line | When a handover's load reaches 80% of the edge window (`PeerRatio`), and on a transfer to the edge | Every query |
+| **When** | First at 10,000 input tokens (`OwnInit`), then every 5,000 (`OwnEvery`); installed at the compaction line | When a handover's load reaches 80% of the edge window (`PeerRatio`), and on a transfer to the edge | Each query the earlier routing steps leave open |
 | **Summary total** | — | `ThreadSummaryTokens`: 3/8 of the window (3,072), shared by the own and the peer summary | Query 1,500; recent 1,500; participants 300; total 6,000 |
 | **Imports** | In full | Up to half the window (`EdgeShare` 0.5); chunked, up to 8 rounds (`MaxRounds`), when that does not fit | — |
 | **Reads** | Every entry | Every entry | The query and descriptors; with `IncludeHistory`, also the peer summary, recent entries and lag |
@@ -282,19 +253,7 @@ tail's `ReserveRatio` share, so the recent turns survive a handover.
 
 ## 6. Context and summaries
 
-```mermaid
-flowchart LR
-    req["Cloud's last request<br/>(captured with WithForkCapture)"]
-    pf["Peer fork<br/>last request + one instruction<br/>budget: edge SummaryBudget"]
-    of["Own-notes fork<br/>first at 10K, then every 5K<br/>FIND/REPLACE edits"]
-    se["summary entry<br/>Target = edge, Coverage"]
-    clear["Edge takeover<br/>context := summary + uncovered entries"]
-    offer["OfferSummary<br/>saved with the agent state"]
-    install["Installed at the cloud's<br/>compaction line, no model call"]
-    req --> pf --> se --> clear
-    req --> of --> offer --> install
-    se -. "notes are offered only after a<br/>peer summary covers their snapshot" .-> offer
-```
+![Peer summary and own notes, both forked from the cloud's last request](../images/main-thread-summaries.svg)
 
 *Figure 2. Both summaries come from forks of the cloud's last request. The
 main context is never touched by a fork. The edge never forks.*
@@ -323,9 +282,8 @@ edge can therefore always take over within its window, failover included,
 when the cloud can no longer fork. `PeerEvery` adds a fixed refresh interval
 and defaults to 20,000 tokens only when the edge's window is unknown.
 
-The plan before implementation refreshed the peer summary every 20K tokens.
-The load rule replaced it: it writes when a takeover would no longer fit,
-not on a timer.
+Alternative considered: a fixed refresh every 20K tokens. The load rule
+writes when a takeover would no longer fit, not on a timer.
 
 ### Own notes, for the cloud
 
@@ -350,9 +308,9 @@ snapshot. Two rules keep this safe:
   context, or the context is still at the line after the notes are in, the
   agent compresses synchronously, as it would without notes.
 
-The plan before implementation had the cloud rewrite its whole summary near
-the compaction line (its "Fork A"). Notes edited incrementally replaced it,
-so the cloud's compaction never waits on a model call when an offer is ready.
+Alternative considered: rewriting the cloud's whole summary near the
+compaction line. With incrementally edited notes, the cloud's compaction
+never waits on a model call when an offer is ready.
 
 ### The edge's context
 
@@ -363,7 +321,7 @@ so the cloud's compaction never waits on a model call when an offer is ready.
   entries it does not cover. The summary speaks for the older context. An
   edge that kept the foreground, for example while the cloud ran a background
   task for it, is not cleared. Stage 0 measured keeping the local context at
-  a takeover against clearing it, and found no gain:
+  a takeover against clearing it, and found no clear difference:
   −0.7 [−19.8, +18.5] points as scored.
 - **Incremental import.** Otherwise the edge imports the entries past its
   cursor, within `EdgeShare` of its window.
@@ -402,21 +360,7 @@ stayed there. The default is now the cloud.
 
 ### Decision order
 
-```mermaid
-flowchart TD
-    q["New query at a boundary"] --> run{"An activation<br/>is running?"}
-    run -- yes --> steer["Steer the running owner<br/>(next safe boundary)"]
-    run -- no --> avail["Candidates: available participants"]
-    avail --> named{"User named<br/>a participant?"}
-    named -- yes --> pick["Owner"]
-    named -- no --> groups{"Query needs a tool group<br/>only one side holds?"}
-    groups -- yes --> pick
-    groups -- no --> rules{"A host rule<br/>matches?"}
-    rules -- yes --> pick
-    rules -- no --> clf{"Classifier answers within the timeout,<br/>authorized, valid, confident,<br/>target within MaxLag?"}
-    clf -- yes --> pick
-    clf -- no --> def["Mode default"] --> pick
-```
+![Routing order from a new query to its owner](../images/main-thread-routing.svg)
 
 *Figure 3. The router never blocks on the classifier: every classifier
 failure falls through to the default.*
@@ -465,8 +409,8 @@ warning about it; `route.BuildState` returns the exact state for logs.
 |---|---|---|---|
 | `transfer(to, brief)` | The receiver | Its reply ends (`ReplyHandedOff`) | Starts with the brief and takes the next user message |
 | `assign_task(to, task, notify)` | Unchanged | Keeps working | Runs in the background; its final answer becomes a `report` |
-| `report(text, refs, to, notify)` | Unchanged | Keeps working | Sees it at its next boundary; an idle owner is woken only with `notify` |
-| `publish_artifact(uri, summary)` | Unchanged | Keeps working | Sees the reference |
+| `report(text, to, task_id, notify)` | Unchanged | Keeps working | Sees it at its next boundary; an idle owner is woken only with `notify` |
+| `publish_artifact(uri, summary, size, text)` | Unchanged | Keeps working | Sees the reference |
 | Routing switch (no model involved) | The router's target | Already idle | Handles the current query |
 | `thread_read`, `event_read` | Read-only | — | — |
 
@@ -474,25 +418,11 @@ A transfer and a routing switch write the same `owner_change` entry and
 differ only in `reason`. A routing switch has no brief; the receiver relies
 on the summary and the entries it imports.
 
-```mermaid
-sequenceDiagram
-    participant C as Cloud master
-    participant K as Coordinator
-    participant L as Log
-    participant E as Edge agent
-    participant U as User
-    C->>U: streamed text (epoch 7)
-    C->>K: transfer(edge, brief)
-    K->>L: one guarded write: reply (text the user saw) + owner_change, epoch 7 → 8
-    K-->>C: tool result; the reply ends with ReplyHandedOff
-    K->>E: activate: brief, plus clear or import
-    E->>U: streamed reply (epoch 8)
-    C--)K: late output
-    K->>L: report with a rejected_output marker, never shown as a reply
-```
+![Transfer sequence between the cloud master, the Coordinator, the edge agent and the user, with failure cases](../images/main-thread-transfer.svg)
 
 *Figure 4. Ownership changes when the log write commits. A late write from
-the old owner fails its guard.*
+the old owner fails its guard. The receiver's reply reaches the user through
+the Coordinator.*
 
 - **The brief is structured:** goal, done, remaining, constraints and
   references. The receiver's `BriefMaxRunes` bounds it.
@@ -529,37 +459,14 @@ to tell the user.
 | Two agents on one workspace | Each agent gets its own `tool.ReadCache` with `SetRejectStaleWrites(true)`: a whole-file write over a version the agent never read is refused, and it reads again. This includes a team's members |
 | Deciding on a stale view | Entries record `BasedOn`; new information arrives at the next boundary, and the model decides. Nothing merges automatically |
 | Waking each other | Only `To` wakes; reports wake only with `notify`; at most 4 wakes of an idle owner per query (`MaxWakesPerQuery`) and nested tasks 2 deep (`MaxAssignDepth`) |
-| Queued user input | At most 16 inputs wait for a cycle (`MaxPendingInputs`); inputs parked after `no_owner` do not count, and the oldest beyond the bound is retired and stays as context |
+| Queued user input | At most 16 inputs wait for a cycle (`MaxPendingInputs`); inputs parked after a `no_owner` or `recovered` marker do not count, and the oldest beyond the bound is retired and stays as context |
 | Confirmations from the background | Events carry their origin and `Foreground: false`; the host shows them without changing the owner and answers with `SubmitUserConfirm`. A background request has no timeout yet |
 | Progress | `update_plan` calls become `progress` entries of their run, so a failover or restart sees where the run stood |
 | Safe injection | Steering and boundary input arrive only where no tool call awaits its result, so a tool-call/result pair is never split |
 
 ## 10. A cloud master with sub-agents
 
-```mermaid
-flowchart LR
-    subgraph chosen ["Chosen: members inside the participant"]
-        L1[("Log")]
-        E1["Edge agent"]
-        subgraph CP ["Cloud participant"]
-            M1["master"] --> A1["member A"]
-            M1 --> B1["member B"]
-        end
-        L1 <--> E1
-        L1 <--> M1
-    end
-    subgraph rejected ["Not chosen: members on the log"]
-        L2[("Log")]
-        E2["Edge agent"]
-        M2["master"]
-        A2["member A"]
-        B2["member B"]
-        L2 <--> E2
-        L2 <--> M2
-        L2 <--> A2
-        L2 <--> B2
-    end
-```
+![Members inside the cloud participant, compared with members on the log](../images/main-thread-team.svg)
 
 *Figure 5. With members inside the participant, the log's membership does
 not grow with the team, and neither does what the edge must import.*
@@ -578,7 +485,7 @@ reports the right cursor before its first activation.
 | Crossing the boundary | Members cannot transfer or assign across the boundary. A need for device work goes back to the master, which assigns it |
 | Publishing | A member's result is a tool result in the master's context; the master decides what to publish. Member tool calls appear in the digest as `member/tool` |
 | Ledger | Member usage is recorded under the cloud participant, by path |
-| Summaries | Forks start only from the master; members' work reaches a summary through the master's context. Notes offered after the next activation built its master are matched by message ID |
+| Summaries | Forks start only from the master; members' work reaches a summary through the master's context. Notes that finish after the next activation has built its master are offered to that master, which matches them by message ID |
 | Handed-off ends | `TeamRun` treats the leader's `ReplyHandedOff` as a normal end |
 | Recovery | The master is rebuilt from its checkpoint; after a crash it gets the `restarted` input and checks the actual state (section 12) |
 
@@ -589,40 +496,43 @@ cloud and the edge comes from `assign_task`.
 ## 11. An end-to-end example
 
 A user debugs a service crash on their device. The mode is `hybrid`; the edge
-holds the `device` tool group. Indented rows are actions inside a participant
-that do not enter the log.
+holds the `device` tool group. Rows in italics are actions inside a participant
+that do not enter the log. The origin column shows what the entry records:
+a participant's name, `user`, or `coordinator` for entries the Coordinator
+writes on its own.
 
 | Seq | Epoch | Kind | Origin | Content |
 |---|---|---|---|---|
 | 101 | 7 | `user_input` | user | "The service crashed last night. Find out why and propose a fix." |
 | 102 | 8 | `owner_change` | coordinator | cloud → edge, `reason=router`: the host marked the query as needing the `device` tool group (`Query.NeedsGroups`), which only the edge holds |
 | 103 | 8 | `reply` | edge | "Out of memory on host-a17; the heap grows steadily." Digest: `read_log` ×4, `grep` ×2 |
-| 104 | 9 | `owner_change` | edge → cloud | `reason=transfer`. Brief: goal, find the defect and a patch; done, OOM and growth confirmed; references, the log excerpt |
+| 104 | 9 | `owner_change` | edge | edge → cloud, `reason=transfer`. Brief: goal, find the defect and a patch; done, OOM and growth confirmed; references, the log excerpt |
 | | | | | *Cloud master imports 101–104, then `TeamAssign` member-a (code search) and member-b (reproduction)* |
-| 105 | 9 | `progress` | cloud/master | Plan: search the cache code (done), reproduce (in progress), write the patch |
-| 106 | 9 | `artifact` | cloud/master | `patch-17.diff` with a summary and size |
-| 107 | 9 | `reply` | cloud/master | "The cache has no bound; patch-17 adds one." Digest: `TeamAssign` ×2, `member-a/grep` ×3, `member-b/run_test` |
-| 108 | 9 | `summary` | cloud/master (fork) | Peer summary for the edge, `Coverage{Through: 107}`: the handover load reached 80% of the edge window |
+| 105 | 9 | `progress` | cloud | Plan: search the cache code (done), reproduce (in progress), write the patch |
+| 106 | 9 | `artifact` | cloud | `patch-17.diff` with a summary and size |
+| 107 | 9 | `reply` | cloud | "The cache has no bound; patch-17 adds one." Digest: `TeamAssign` ×2, `member-a/grep` ×3, `member-b/run_test` |
+| 108 | 9 | `summary` | cloud (fork) | Peer summary for the edge, `Coverage{Through: 107}`: the handover load reached 80% of the edge window |
 | 109 | 9 | `user_input` | user | "Apply it on the device and run the tests." |
 | 110 | 10 | `owner_change` | coordinator | cloud → edge, `reason=router`: the host marked the query as needing `device` |
 | | | | | *The cloud held the foreground since the edge last acted (103), and #108 is newer, so the edge is cleared: its context becomes #108 plus #109–110* |
 | 111 | 10 | `assign` | edge | To cloud, `notify`: "Look for other unbounded caches in the service." |
 | 112 | 10 | `reply` | edge | "Applied; 3 of 3 tests pass." Digest: `apply_patch`, `go_test` |
 | | | | | *The cloud runs the task in the background; its events are not shown to the user* |
-| 113 | 10 | `report` | cloud/master | To edge, `notify`: "The session store has the same pattern." Wakes the idle owner (1 of 4 wakes) |
+| 113 | 10 | `report` | cloud | To edge, `notify`: "The session store has the same pattern." Wakes the idle owner (1 of 4 wakes) |
 | 114 | 10 | `reply` | edge | "The cloud found a second unbounded cache in the session store." |
 | 115 | 10 | `user_input` | user | "Patch the session store too and explain the change." |
 | 116 | 11 | `owner_change` | coordinator | edge → cloud, `reason=router`: no rule matched and the classifier was not confident, so the `hybrid` default, the cloud |
-| 117 | 11 | `progress` | cloud/master | Plan: patch written (done), explanation (in progress) |
-| 118 | 11 | `marker` | coordinator | `failed`: the cloud's model call failed |
-| 119 | 11 | `marker` | coordinator | `unknown_effects`: the failed run had called tools |
-| 120 | 12 | `owner_change` | coordinator | cloud → edge, `reason=failover`. The edge's input is one line pointing at #118 and the progress #117; the edge imports incrementally (#108 is older than its last activity) |
-| 121 | 12 | `reply` | edge | "The cloud stopped mid-way; the session-store patch is written but not applied. Applying it now." |
+| 117 | 11 | `progress` | cloud | Plan: patch written (done), explanation (in progress) |
+| 118 | 11 | `reply` | cloud | The text the failed run had streamed, sealed with its digest: `write_file` |
+| 119 | 11 | `marker` | coordinator | `failed`: the cloud's model call failed |
+| 120 | 11 | `marker` | coordinator | `unknown_effects`: the failed run had called tools |
+| 121 | 12 | `owner_change` | coordinator | cloud → edge, `reason=failover`. The edge's input is one line pointing at #119 and the progress #117; the edge imports incrementally (#108 is older than its last activity) |
+| 122 | 12 | `reply` | edge | "The cloud stopped mid-way; the session-store patch is written but not applied. Applying it now." |
 
 The failover note follows a fixed format:
 
 ```
-[cloud failed: <reason> (#118). You now answer the user: continue their request #115 "<the request, at most 120 characters>" from where cloud left off. What cloud did is in the summary and the entries above; its latest progress is #117.]
+[cloud failed: <reason> (#119). You now answer the user: continue their request #115 "<the request, at most 120 characters>" from where cloud left off. What cloud did is in the summary and the entries above; its latest progress is #117.]
 ```
 
 ## 12. Failure, recovery and durability
@@ -644,7 +554,7 @@ that steered the failed run. Without a new owner, the request ends with
 |---|---|
 | `owner_change` written, owner not yet woken | The owner and epoch come from the log; the turn resumes on the owner |
 | A run in flight | The owner gets a `restarted` marker and an input quoting the request, the host's `RecoveryNote`, the failure before the restart if any, and the latest progress. It is told that earlier tool calls may or may not have taken effect and must check the actual state first |
-| The owner is gone | The turn's routing never finished: the request is routed again behind a `requeue:` marker that counts the restart |
+| The owner is gone | The turn's routing never finished: the request is routed again behind a `restarted` marker whose dedup key starts with `requeue:` and counts the restart |
 | The same request restarted twice | It gets a `recovered` marker and waits for the user's next message (`maxRestarts` is 2) |
 | Entries imported, checkpoint not written | Cursor and content are in one checkpoint, so the same batch is imported again, without duplicates |
 | A clear whose activation failed | Not recorded; the next handover clears again, which is harmless |
@@ -670,8 +580,8 @@ recovery.
 `Coordinator.Ledger()` records every model call by participant, agent path
 and kind: `main`, `fork_peer`, `fork_own`, `classifier` and `compaction`. A
 call whose usage the provider did not report counts as unknown, and totals
-give no cost when any call is unknown or unpriceable, the same rule as
-`managedtask`'s cost per qualified completion.
+give no cost when any call is unknown or unpriceable, the same rule as the
+cost per qualified completion in `replay/evalkit`.
 
 ## 14. Deployment
 
@@ -683,9 +593,10 @@ cloud is down, that process belongs on the device or next to it.
 **Across the network (not built).** The suggested shape keeps the log and the
 Coordinator on the edge, with the cloud participant as a client:
 
-- **Leases.** The cloud holds a time-limited foreground lease. During a
-  partition the edge takes over when the lease expires, and the cloud's late
-  output fails its guard when it comes back.
+- **Leases.** The cloud would hold a time-limited foreground lease. During a
+  partition the edge would take over when the lease expires, and the cloud's
+  late output would fail its guard when it comes back. (`participant.Leased`
+  exists today for shared resources, not for the foreground.)
 - **Entry point.** This assumes the user's entry point is on the device. If it
   is a cloud service, the sequencer belongs in the cloud, and offline work on
   the device needs forks and merges of the log. That is a different design.
@@ -706,27 +617,29 @@ runtime; it is unrelated to the `managedtask` package.
 
 **Expected benefits:**
 
-- **Isolation.** The cloud agent's tools run in a server-side sandbox, not on
-  the device.
-- **Device load.** The device no longer hosts the cloud agent's loop, its
-  context or its members.
+- **Isolation.** The cloud agent's tools would run in a server-side sandbox,
+  not on the device.
+- **Device load.** The device would no longer host the cloud agent's loop,
+  its context or its members.
 - **Execution.** The cloud agent's internal rounds (model calls, tool steps,
-  member delegation) no longer cross the device's network, so they are faster
-  and more stable. Only published entries cross it.
+  member delegation) would no longer cross the device's network; only
+  published entries would. We expect that to make them faster and more
+  stable; nothing here measures latency.
 
 **What would change:**
 
 - **No shared workspace.** Stage 0's tasks had both agents on one workspace,
   so files written by one side reached the other. A decoupled cloud agent
-  has its own. Handovers and reports must then carry artifacts
+  would have its own. Handovers and reports would then have to carry artifacts
   (`publish_artifact` references that resolve on the other side), and the
   current results do not establish how well that works.
-- **The log crosses the network.** Section 14's leases, fencing and
-  transport apply. The log's location follows the user's entry point.
-- **Failover gets slower to detect.** A remote agent that stops answering is
-  found by lease expiry, not by a failed local call.
-- **Recovery splits.** The managed agent's checkpoint lives server-side; the
-  `restarted` input and the unknown-effects rule stay the same.
+- **The log would cross the network.** Section 14's leases, fencing and
+  transport would apply. The log's location follows the user's entry point.
+- **Failover would be slower to detect.** A remote agent that stops
+  answering would be found by lease expiry, not by a failed local call.
+- **Recovery would split.** The managed agent's checkpoint would live
+  server-side; the `restarted` input and the unknown-effects rule would stay
+  the same.
 
 **What would stay:** the log model, one owner, the epoch guard, the clear rule
 and peer summaries, the router, and the device's ownership of device tools.
@@ -787,27 +700,64 @@ means the pages read did not say.
 Stage 0 benchmarked a prototype of this design before the branch was written:
 Qwen3.5-4B on vLLM with an 8K window imposed, `gpt-6-luna` on the OpenAI
 Responses API, multi-turn Go coding tasks in one shared workspace, scored by
-hidden tests, with each turn's owner set by the task script. The plan and its
-amendments are in the harness's `prereg.md`. The results below measure the
-prototype, not this branch, and come from one configuration.
+hidden tests (a session that does not compile scores 0), with each turn's
+owner set by the task script. Results are paired by task, with 95% bootstrap
+CIs over tasks; a cost ratio is the prototype's cloud cost over the other
+scheme's.
 
-On 12 long tasks (27 to 32 turns), as scored, with 95% bootstrap CIs over
-tasks:
+The plan and each amendment were written down before the runs they govern, in
+the harness's [`prereg.md`](https://github.com/thomeal/agentscope-go/blob/eval/final/experiments/stage0/prereg.md). The plan changed after early results: the
+primary measure moved from fact retention to hidden tests, some gates were
+dropped after their previews fell short, and a scheme that beat the prototype
+on short tasks was removed from the comparisons (below). The results measure
+the prototype, not this branch, and come from one configuration: one local
+model, one window, one cloud model and one kind of task.
+
+On 12 long tasks (27 to 32 turns), as scored:
 
 | Against | Score difference | Cloud cost ratio |
 |---|---|---|
-| One shared history, compressed at the 8K window (its compression ran on the cloud, a harness choice; no cost comparison is claimed) | +40.8 [+13.5, +66.4] | — |
+| One shared history, compressed at the 8K window | +40.8 [+13.5, +66.4] | — |
 | Separate contexts, with a summary handoff at each switch | +22.7 [−2.7, +46.1] | 1.21 [1.07, 1.40] |
 
-On 30 short tasks, the prototype beat the handoff scheme by +11.6
-[+4.5, +20.4] at the same cost and tied the shared history. Two schemes
-scored higher and did more of the work in the cloud: an all-cloud session
-(+43.9 on long tasks), and, on short tasks only, a single history that sent
-calls over the edge window to the cloud (+9.1 [+5.5, +12.8] over the
-prototype at the same cost). With owners from a query-only stand-in classifier
-instead of the authors', the prototype's long-task score fell by 30.7 points
-[−57.9, −0.4] at about a third of the cost. The RFC gives the full reading
-and its limits.
+- **Sessions that did not compile.** These were 10 of 24 for the prototype,
+  20 of 24 for the shared history and 15 of 24 for the handoff scheme, and
+  explain most of these gaps.
+- **With repairs.** Re-running the sessions that did not compile, with up to
+  three rounds of compiler errors sent to the last turn's owner, puts the lead
+  over the handoff scheme at +23.6 [+13.4, +34.5] (cost ratio 1.18
+  [1.00, 1.43]). A re-run is also a second try: 30 of the 101 re-runs,
+  across all schemes, compiled with no round, and a scheme with more failures
+  gets more second tries.
+- **The shared-history baseline's compression ran on the cloud,** a harness
+  choice. We expect this favors it on score, which was not measured; it
+  inflated its cloud cost, so no cost comparison against it is claimed.
+- **The prototype's summary budgets were tuned** on five pilot sessions, a
+  choice in its favor.
+- **Short tasks.** On 30 short tasks (6 to 9 turns), the prototype beat the
+  handoff scheme by +11.6 [+4.5, +20.4] at the same cost (.99) and tied the
+  shared history (+0.4).
+- **Routing.** With owners from a classifier that saw only the query (OpenAI
+  Decisions standing in for Jev) instead of the authors', the prototype's
+  long-task score changed by −30.7 [−57.9, −0.4] at about a third of the cost.
+- **Two schemes, for reference only.** Both scored higher and did more of the
+  work in the cloud:
+  - an all-cloud session at the cloud's full window: 43.9 points
+    [22.0, 66.6] above the prototype on long tasks, as scored, at about the
+    same cost (.95);
+  - a single history that sent each call over the edge window to the cloud,
+    scored on short tasks only: 9.1 points [5.5, 12.8] above the prototype at
+    the same cloud cost (1.02 [.87, 1.27]). It was dropped before the long
+    tasks on the expectation, never measured, that past the edge window
+    nearly every call goes to the cloud.
+- **A withdrawn comparison.** A comparison of this branch against a routed
+  single-history baseline was withdrawn: that baseline was presented as what
+  `main` does, but its compression ran on the cloud, which `main` does not
+  do. Its results are void and not used here, except the routing observation
+  in section 7.
+- **Privacy.** The prototype had privacy classes and sent none of a set of
+  planted private codes to the cloud. The branch has no privacy classes, so
+  that result does not apply to it ([design note](main-thread-privacy.md)).
 
 ## 18. Changes outside the new packages
 
