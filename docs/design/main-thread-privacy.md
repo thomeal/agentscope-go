@@ -5,9 +5,10 @@ Status: design note. Nothing here is implemented. The Main Thread runtime
 every participant reads every entry, and the cloud imports what the edge
 wrote like anything else.
 
-This note records what the runtime should eventually protect, what stage 0
-showed, why a first implementation was taken out before merge, and the
-direction a systematic design should take.
+The runtime is a first stage. Isolation is meant to come in a separate,
+later change. This note records what it should protect, what stage 0 showed,
+why a first implementation was taken out before merge, and the direction a
+systematic design should take.
 
 ## The requirement
 
@@ -27,8 +28,8 @@ the concern travels: an edge that imports a report written from a web page
 holds that content too.
 
 Both needs reach every path that moves content between participants. That is
-what makes them hard to bolt on later, and also why a partial design is
-worse than none: a host would rely on it.
+why they need one design rather than a check in each feature, and why a
+partial design is worse than none: a host would rely on it.
 
 ## What stage 0 showed
 
@@ -42,46 +43,54 @@ Main Thread.
 body sent to the cloud was scanned for the codes of device-only turns: their
 user text, their expected reply and any record they read.
 
-| Scheme | Private codes found in cloud requests |
+| Scheme | Private codes found in cloud requests, per session |
 |---|---|
 | Main Thread | 0 (in both runs) |
-| One shared history, 8K window | 81 per session |
-| One shared history, 32K window | 225 per session |
-| Everything in the cloud | 690 per session |
-| Direct summary handoff | 6,985 over 30 sessions |
-| Direct handoff, brief kept in the system prompt | 6,045 over 30 sessions |
+| One shared history, 8K window | 81 |
+| One shared history, 32K window | 225 |
+| Everything in the cloud | 690 |
+| Direct summary handoff | about 233 (6,985 over 30 sessions) |
+| Direct handoff, brief kept in the system prompt | about 202 (6,045 over 30 sessions) |
 
-Every other scheme sends the cloud what the edge saw. Main Thread kept device
+The shared-history and everything-in-the-cloud rows come from an earlier run
+that was stopped and whose other rows were not used, on code that changed
+afterwards; the handoff rows come from a later run of 30 sessions on the
+harness's later code. Every other scheme sends the cloud what the edge saw. Main Thread kept device
 data out because its log carries what was published, not each side's
 context. The labels in stage 0 were the benchmark's: every turn came marked
 shared or device-only. So the result shows the log can hold the line when the
 labels are right. It does not show that a host can produce those labels.
 
-**Long tasks.** On the long coding tasks, scored by hidden tests with up to
-three rounds of compile repair, Main Thread scored .848 against .423 for one
-shared 8K history (+42.5 points, 95% CI [+21.8, +60.8]) at the same cloud
-cost (ratio .97), and .612 for direct summary handoff (+23.6 [+13.4, +34.5])
-at about a fifth more cloud cost. The lead over the shared history is clear
-in every reading. The lead over handoff is clear only with the repair
-rounds: as scored, without them, it is +22.7 [−2.7, +46.1]. On the short
-tasks Main Thread tied the shared history and beat handoff by +11.6 points at
-the same cost. Those task sets hold no private data, so this comparison does
-not depend on any privacy mechanism.
+**Long tasks.** On the long coding tasks, scored by hidden tests, many
+sessions of every edge scheme ended with code that did not compile. As
+scored, the primary reading, Main Thread scored .527 against .119 for one
+shared 8K history (+40.8 points, 95% CI [+13.5, +66.4]) at about the same
+cloud cost (ratio 1.06), and .300 for direct summary handoff (+22.7
+[−2.7, +46.1]) at about a fifth more (ratio 1.21). With up to three rounds of
+compile repair for those sessions, Main Thread scored .848 against .423
+(+42.5 [+21.8, +60.8]) and .612 (+23.6 [+13.4, +34.5]). That second reading
+includes second tries, and a scheme with more failures got more of them. The
+lead over the shared history is clear in both readings; the lead over
+handoff only with repair. On the short tasks Main Thread tied the shared
+history and beat handoff by +11.6 points at the same cost. Those task sets
+hold no private data, so this comparison does not depend on any privacy
+mechanism.
 
-**Everything in the cloud.** Sending everything to the cloud scored higher
-on both task sets: .966 against .848 on the long tasks with repair (−11.8
-[−20.0, −5.2]) at about the same cloud cost, and .989 against .880 on the
-short tasks (−11.0 [−14.6, −7.5]), where Main Thread cost 28% less. Stage 0
-set this scheme aside because it sends the cloud all private data. Without a
-privacy design, a host that needs no data kept on the device can run it, and
-against it stage 0 shows Main Thread a lower cloud cost on short tasks, not a
-higher score. Serving a turn while the cloud is down is the other argument
-for an edge agent; it follows from the design and was not measured on task
-results.
+**Everything in the cloud** is outside Main Thread's scope. This project
+leaves deployments that can always reach the cloud to a managed cloud agent
+(one that runs server-side), which stage 0 did not measure. Main Thread is for edge deployments, where the
+cloud can be unavailable and the edge must keep serving. For reference,
+sending everything to the cloud scored higher on both task sets. On the long
+tasks it scored .966 against .527 as scored (−43.9 [−66.6, −22.0]) and
+against .848 with repair (−11.8 [−20.0, −5.2]), at about the same cloud cost;
+it had no compile failures, so no second tries. On the short tasks it scored
+.989 against .880 (−11.0 [−14.6, −7.5]), where Main Thread cost 28% less.
+Serving a turn while the cloud is down follows from the design and was not
+measured on task results.
 
 Removing the implementation keeps the comparison with the shared history and
-handoff, and gives up the privacy result until a design like the one below
-exists.
+handoff, and gives up the privacy result until an isolation layer like the
+one below is added.
 
 ## The first implementation, and why it was removed
 
@@ -197,6 +206,8 @@ or a compaction drops a label only when it drops the labeled content.
 
 ## Until then
 
-Do not give the edge data that must stay on the device while a cloud
-participant shares its session. Rely on the host's permission rules for
-writing and device tools; the runtime does not track untrusted content.
+Do not give the edge data that must stay on the device. The cloud reads the
+edge's entries, briefs, reports and recorded tool outputs, and a hosted
+routing classifier reads the query and recent entries. Rely on the host's
+permission rules for writing and device tools; the runtime does not track
+untrusted content.
