@@ -200,6 +200,10 @@ ports and deferred work, including realtime/TUI, SOP and model-context wiring.
   of the history sent to a more preferred model. Measured in stage 0 on one
   cloud and one local model, for `write_file` only.
 
+- `agent.WithPlanAfterLatestInput` is an Experimental addition to the
+  `agent` package and changes only where the plan message sits in the model
+  input. Its effect on answer quality has not been measured.
+
 - `tool.ReadCache.SetRejectStaleWrites` and `ReadCacheEntry.Hash` are
   Experimental. The check is off by default; `Read` records the hash either
   way. The check is not a lock and covers the built-in Write tool; files

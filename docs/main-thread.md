@@ -174,7 +174,15 @@ on the short tasks it refused 6 Main Thread writes.
 
 **Progress.** An agent with `agent.WithPlanTool` reports its plan with
 `update_plan`; each update becomes a `progress` entry of its run, and the
-call stays out of the reply's tool digest.
+call stays out of the reply's tool digest. The plan is injected ahead of the
+history on every call, so each update makes the history miss the prompt
+cache on the next one. `agent.WithPlanAfterLatestInput` puts it right after
+the newest user message instead, so a plan update re-sends only the current
+turn uncached. Imported entries, notes and boundary input are user messages
+too, and each one moves the plan, so the steps since the previous input miss
+the cache once; a participant that imports often and rarely updates its plan
+may cache better with the default. Its effect on answer quality has not been
+measured.
 A projection shows only the newest progress of a run that is still going;
 once the run replied, transferred, reported, answered late or was
 interrupted, its progress drops out. A failed run keeps its last progress
