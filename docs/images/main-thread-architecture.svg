@@ -28,7 +28,7 @@
 <line class="l" x1="265" y1="50" x2="265" y2="94" marker-end="url(#a)"/>
 <text class="ts" x="257" y="77" text-anchor="end">query, steering</text>
 <line class="l" x1="335" y1="94" x2="335" y2="50" marker-end="url(#a)"/>
-<text class="ts" x="343" y="77">only the owner's output</text>
+<text class="ts" x="343" y="77">events; the owner's marked foreground</text>
 <rect class="box" x="40" y="94" width="520" height="58" rx="4"/>
 <text class="tb" x="300" y="118" text-anchor="middle">Coordinator</text>
 <text class="ts" x="300" y="139" text-anchor="middle">routing · owner and epoch · wakes · summary forks · ledger</text>
@@ -66,11 +66,11 @@
 <line class="le" x1="110" y1="256" x2="110" y2="318" marker-end="url(#a)"/>
 <text class="ts" x="118" y="291">entries past the cursor</text>
 <line class="le" x1="300" y1="318" x2="300" y2="256" marker-end="url(#a)"/>
-<text class="ts" x="308" y="291">publishes</text>
+<text class="ts" x="308" y="291">publishes via the Coordinator</text>
 <line class="lc" x1="560" y1="256" x2="560" y2="318" marker-end="url(#a)"/>
 <text class="ts" x="568" y="281">entries past the cursor, in full</text>
 <line class="lc" x1="870" y1="318" x2="870" y2="256" marker-end="url(#a)"/>
-<text class="ts" x="862" y="305" text-anchor="end">only the master publishes</text>
+<text class="ts" x="862" y="305" text-anchor="end">master publishes via the Coordinator</text>
 <rect class="edge" x="20" y="318" width="380" height="202" rx="4"/>
 <text class="te" x="36" y="342">Edge participant</text>
 <rect class="box" x="36" y="354" width="348" height="152" rx="4"/>
@@ -85,7 +85,7 @@
 <rect class="box" x="466" y="352" width="438" height="74" rx="4"/>
 <text class="tb" x="482" y="374">master</text>
 <text class="t" x="482" y="395">Cursor #43 · catches up when routed to</text>
-<text class="t" x="482" y="415">Large window, own notes; the only agent with thread tools</text>
+<text class="t" x="482" y="415">Large window, own notes; the only team agent with thread tools</text>
 <line class="lc" x1="571" y1="426" x2="571" y2="456" marker-start="url(#a)" marker-end="url(#a)"/>
 <line class="lc" x1="799" y1="426" x2="799" y2="456" marker-start="url(#a)" marker-end="url(#a)"/>
 <text class="ts" x="685" y="445" text-anchor="middle">TeamAssign / result</text>
