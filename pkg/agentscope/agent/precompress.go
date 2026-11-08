@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 
@@ -52,7 +53,7 @@ func (a *UnifiedAgent) maybeArmPrecompress(ctx context.Context, cfg *ContextConf
 	}
 
 	a.mu.Lock()
-	if p := a.pendingPrecompress; p != nil {
+	if p := a.readyLocked(); p != nil {
 		// A result that no longer matches the live state is dropped so a
 		// fresh generation can start; a still-valid one is left for the hard
 		// trigger to consume.
@@ -60,7 +61,7 @@ func (a *UnifiedAgent) maybeArmPrecompress(ctx context.Context, cfg *ContextConf
 			a.mu.Unlock()
 			return
 		}
-		a.pendingPrecompress = nil
+		a.dropReadyLocked()
 	}
 	if a.precompressRunning || len(a.state.Context) == 0 {
 		a.mu.Unlock()
@@ -71,6 +72,7 @@ func (a *UnifiedAgent) maybeArmPrecompress(ctx context.Context, cfg *ContextConf
 	prevSummary := a.state.Summary
 	systemPrompt := a.systemPrompt
 	plan := append([]tool.PlanItem(nil), a.state.Plan...)
+	thread := threadPromptMsgs(a.name, a.state.PeerSummary)
 	a.precompressRunning = true
 	a.mu.Unlock()
 
@@ -80,13 +82,13 @@ func (a *UnifiedAgent) maybeArmPrecompress(ctx context.Context, cfg *ContextConf
 	// them), so the generation is allowed to finish. Values (tracing, audit)
 	// carry over.
 	go a.runPrecompress(context.WithoutCancel(ctx), &cfgCopy, ctxSize,
-		snapshot, prevSummary, systemPrompt, plan)
+		snapshot, prevSummary, systemPrompt, thread, plan)
 }
 
 // runPrecompress generates the summary for the snapshot. Failures are
 // logged and discarded — the synchronous path owns retries and truncation
 // fallbacks at the hard trigger.
-func (a *UnifiedAgent) runPrecompress(ctx context.Context, cfg *ContextConfig, ctxSize int, snapshot []*message.Msg, prevSummary, systemPrompt string, plan []tool.PlanItem) {
+func (a *UnifiedAgent) runPrecompress(ctx context.Context, cfg *ContextConfig, ctxSize int, snapshot []*message.Msg, prevSummary, systemPrompt string, thread []*message.Msg, plan []tool.PlanItem) {
 	defer func() {
 		a.mu.Lock()
 		a.precompressRunning = false
@@ -97,13 +99,13 @@ func (a *UnifiedAgent) runPrecompress(ctx context.Context, cfg *ContextConfig, c
 		systemPrompt = middleware.ApplySystemPromptPipeline(ctx, a.middlewares, a.name, systemPrompt)
 	}
 	tools := a.toolkit.GetToolSchemas()
-	reserveTokens := int(float64(ctxSize) * cfg.ReserveRatio)
+	reserveTokens := a.reserveTokens(cfg, ctxSize)
 	if cfg.CompactStrategy == CompactStrategyFreshWindow {
 		// See compressContextImpl: budget 1 routes through tool-pair repair
 		// without reserving anything when nothing is in flight.
 		reserveTokens = 1
 	}
-	baseMsgs := compressionBaseMsgs(a.name, systemPrompt, prevSummary, plan)
+	baseMsgs := compressionBaseMsgs(a.name, systemPrompt, prevSummary, thread, plan)
 	msgsToCompress, msgsToReserve := a.splitMsgsForCompression(snapshot, baseMsgs, reserveTokens, tools)
 	if len(msgsToCompress) == 0 {
 		return
@@ -121,7 +123,14 @@ func (a *UnifiedAgent) runPrecompress(ctx context.Context, cfg *ContextConfig, c
 		logrus.WithError(err).WithField("agent", a.name).Warn("background pre-compression formatting failed")
 		return
 	}
-	if budget := summaryMaxTokens(cfg, ctxSize); budget > 0 {
+	// A blank summary (a custom template over empty fields) would empty the
+	// history if applied; it is discarded like a failed generation, so the
+	// next round may try again and the hard trigger compresses synchronously.
+	if strings.TrimSpace(newSummary) == "" {
+		logrus.WithField("agent", a.name).Warn("background pre-compression produced an empty summary")
+		return
+	}
+	if budget := a.ownSummaryBudget(cfg, ctxSize); budget > 0 {
 		if truncated, did := TruncateToolResult(newSummary, budget); did {
 			newSummary = truncated
 		}
@@ -129,6 +138,15 @@ func (a *UnifiedAgent) runPrecompress(ctx context.Context, cfg *ContextConfig, c
 
 	last := snapshot[len(snapshot)-1]
 	a.mu.Lock()
+	// A generation starts only when nothing valid waits, so a valid result
+	// waiting now is an offer made while this one ran: it is newer and wins.
+	if p := a.readyLocked(); p != nil && p.validLocked(a.state) {
+		a.mu.Unlock()
+		logrus.WithField("agent", a.name).Debug("background pre-compression discarded: a newer offer is waiting")
+		return
+	}
+	// Otherwise the background result replaces whatever waited.
+	a.dropReadyLocked()
 	a.pendingPrecompress = &precompressResult{
 		prevSummary: prevSummary,
 		summary:     newSummary,
@@ -141,12 +159,34 @@ func (a *UnifiedAgent) runPrecompress(ctx context.Context, cfg *ContextConfig, c
 	logrus.WithField("agent", a.name).Info("background pre-compression ready")
 }
 
+// readyLocked returns the summary waiting for the trigger: the pending
+// background result or offer, else the offer the state carries after a
+// reload. Caller holds a.mu.
+func (a *UnifiedAgent) readyLocked() *precompressResult {
+	if a.pendingPrecompress == nil && a.state.SummaryOffer != nil {
+		a.pendingPrecompress = a.state.SummaryOffer.result()
+	}
+	return a.pendingPrecompress
+}
+
+// dropReadyLocked drops the summary waiting for the trigger, the state's
+// offer included. Caller holds a.mu.
+func (a *UnifiedAgent) dropReadyLocked() {
+	a.pendingPrecompress = nil
+	a.state.SummaryOffer = nil
+}
+
 // validLocked reports whether the result still matches the live state: the
 // summary it built upon is unchanged and the snapshot's final message still
 // sits at the snapshot boundary (context only appends between rounds; a
 // compaction or checkpoint rollback breaks identity). The ID comparison
 // survives in-place cache clones that replace message pointers.
 func (p *precompressResult) validLocked(state *AgentState) bool {
+	// An offer can come from a checkpoint the agent did not write: reject
+	// bounds that would index outside the context, and an empty summary.
+	if p.snapshotLen <= 0 || p.reservedLen < 0 || p.reservedLen > p.snapshotLen || strings.TrimSpace(p.summary) == "" {
+		return false
+	}
 	if state.Summary != p.prevSummary || len(state.Context) < p.snapshotLen {
 		return false
 	}
@@ -161,7 +201,7 @@ func (p *precompressResult) validLocked(state *AgentState) bool {
 // applicable is pending.
 func (a *UnifiedAgent) applyReadyPrecompress(ctx context.Context) bool {
 	a.mu.Lock()
-	p := a.pendingPrecompress
+	p := a.readyLocked()
 	if p == nil {
 		a.mu.Unlock()
 		return false
@@ -169,11 +209,11 @@ func (a *UnifiedAgent) applyReadyPrecompress(ctx context.Context) bool {
 	if !p.validLocked(a.state) {
 		// Stale at the hard trigger stays stale (summary and context only
 		// diverge further): drop it so later rounds can arm afresh.
-		a.pendingPrecompress = nil
+		a.dropReadyLocked()
 		a.mu.Unlock()
 		return false
 	}
-	a.pendingPrecompress = nil
+	a.dropReadyLocked()
 	a.mu.Unlock()
 
 	newSummary := p.summary

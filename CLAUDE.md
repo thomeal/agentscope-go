@@ -36,6 +36,7 @@ feature is wired into every execution path.
 | OpenAI-compatible serving | [openaiserver/](pkg/agentscope/openaiserver/) | Experimental stateless text Chat Completions, server-owned tools and request admission; [guide](docs/openai-serving.md) |
 | External integrations | [mcp/](pkg/agentscope/mcp/), [a2a/](pkg/agentscope/a2a/), [channel/](pkg/agentscope/channel/) | Tool servers, remote agents and messaging channels |
 | Retrieval and memory | [rag/](pkg/agentscope/rag/), [embedding/](pkg/agentscope/embedding/), [memory/](pkg/agentscope/memory/) | Retrieval, embeddings and memory stores |
+| Cloud-edge shared session | [thread/](pkg/agentscope/thread/), [participant/](pkg/agentscope/thread/participant/), [route/](pkg/agentscope/thread/route/) | Experimental Main Thread log, Coordinator, transfer, background tasks, forked summaries and routing modes; [guide](docs/main-thread.md) |
 | Composition and scheduling | [pipeline/](pkg/agentscope/pipeline/), [team/](pkg/agentscope/team/), [schedule/](pkg/agentscope/schedule/) | Agent coordination and scheduled execution |
 | Discovery and skills | [credential/](pkg/agentscope/credential/), [hub/](pkg/agentscope/hub/), [skill/](pkg/agentscope/skill/) | Provider configuration, integration discovery and skill loading |
 | Edge and device support | [device/](pkg/agentscope/device/), [messagebus/](pkg/agentscope/messagebus/), [connectivity.go](pkg/agentscope/model/connectivity.go) | Device tools, pub/sub and cloud/local routing |
@@ -114,7 +115,7 @@ provides defaults. System-prompt transformation is a pipeline; the other hooks
 have their own handler contracts. In particular:
 
 - `OnReply` may consume a non-interrupted `ReplyEndEvent` to request another
-  round. Interrupted ends must propagate. Forward `CustomEvent` values whose
+  round. Interrupted and handed-off ends must propagate. Forward `CustomEvent` values whose
   names start with `agentscope.`; these carry internal round-boundary signals.
 - `OnCheckPermission` and its chain builder exist, but the current unified-agent
   and loop bridge paths do not automatically invoke that middleware hook.
@@ -246,6 +247,13 @@ request timeout and relies on the caller's context. Do not assume this describes
 every provider-specific transport. Tests for longer calls must cover cancellation
 as well as successful completion.
 
+`ConnectivityAwareModel` with `WithCanonicalReplay` and
+`FallbackChatModel.CanonicalReplay` (experimental) mark tool calls written by
+a less preferred member in `ToolCallBlock.Extra` and rewrite their arguments
+as sorted compact JSON only in the copy sent to a more preferred one; stored
+messages and each member's own calls stay as written. See
+[canonical replay](docs/edge-deployment.md#replaying-the-local-models-tool-calls-experimental).
+
 `SecretStr` and `ResolveAPIKey` support credential handling in provider configs.
 Keep keys out of logs, errors and test fixtures committed to the repository.
 `GenerateStructuredOutput` uses tool calling; its fallback and retry behavior
@@ -281,6 +289,27 @@ performs final local admission and owns an independent durable command/effect
 log. The host schedules plan steps; the package does not fetch media, control
 hardware or provide real-time/exactly-once physical guarantees. See
 [embodied contracts](docs/embodied-contracts.md).
+
+Experimental `thread` runs a cloud and an edge participant over one append-only
+log. The `Coordinator` is the only writer: it routes at query boundaries, guards
+reply and owner-change writes with `{owner, epoch}`, shows the user the
+foreground owner's events (others' confirmation requests pass marked
+`Foreground: false`). The log has no privacy classes: every participant reads
+every entry ([future work](docs/design/main-thread-privacy.md)).
+`thread/participant` adapts `UnifiedAgent` (and a TeamPipeline master) through
+the opt-in agent seams in `agent/thread_state.go`, `fork.go`,
+`compact_strict.go` and `handoff.go`; its writing tools are external tools
+answered in event order.
+`types.ReplyHandedOff` ends a reply after a committed transfer and, like an
+interrupted end, cannot be swallowed by `OnReply`. A participant fails
+`Activate` when its Sync was not applied; no Sync moves the cursor back (an
+edge clear is one Reset Sync with the activation). A failed owner's request
+fails over to the other side, queued behind any task running there (no
+takeover); a crash resumes the newest unanswered request on its owner. The
+cloud's own notes are offered (`OfferSummary`, checkpointed) and installed
+at its compression trigger. Agents match external results and confirmations by reply ID too,
+since tool-call IDs can repeat across replies. Checkpoints carry schema 3
+only when thread state is set. See [Main Thread](docs/main-thread.md).
 
 ### Context and model capabilities
 
@@ -327,7 +356,8 @@ overview head and next-steps tail survive.
 moves summarization latency off the reply's critical path: crossing the lower
 ratio starts a background generation from a context snapshot
 ([precompress.go](pkg/agentscope/agent/precompress.go)), and the hard trigger
-applies a still-valid result without a blocking model call. Validity is
+applies a still-valid result without a blocking model call (and still
+compresses synchronously when the context stays at the threshold). Validity is
 structural — same base summary plus the snapshot's boundary message identity
 — so checkpoint rollbacks and interleaved compactions safely discard it; the
 reserved suffix keeps the LIVE message versions so in-place truncation from
@@ -342,10 +372,15 @@ immune to compression, and re-injected into the model input on every call
 read-only for permission purposes and deliberately NOT concurrency-safe:
 updates are ordered state transitions, and batching would scramble
 last-write-wins against event order. Each successful update emits a
-`plan_updated` custom event. `WithContextRemainingTool` registers
-`get_context_remaining`, reporting the usage-grounded remaining budget as
-`{"tokens_left": N|null}`. Both tools follow the compress_context wiring
-pattern: the tool validates, a callback into the agent mutates state.
+`plan_updated` custom event. Experimental `WithPlanAfterLatestInput` moves
+the injected plan right after the newest user message (never after a
+reply's tool steps, so they keep their turn), so a plan update leaves the
+earlier history a cached prefix; forks capture that layout and the
+compression accounting counts the plan either way.
+`WithContextRemainingTool` registers `get_context_remaining`, reporting the
+usage-grounded remaining budget as `{"tokens_left": N|null}`. Both tools
+follow the compress_context wiring pattern: the tool validates, a callback
+into the agent mutates state.
 
 ### Tools, permissions and workspace boundaries
 
@@ -416,6 +451,12 @@ File and command tools can use a `tool.Backend` from the context.
 When that backend is present, inspect its path and operation semantics instead
 of assuming local OS behavior. Use `path` for workspace-relative paths with
 forward slashes and `filepath` for actual host filesystem paths.
+
+`ReadCache.SetRejectStaleWrites` (experimental, per cache) refuses a
+whole-file `Write` over a version that cache has not recorded: `Read` stores a
+content hash and skips cached copies while it is on, and the edit tools record
+their own results. It is a check before the write, not a lock; see
+[stale writes](docs/tools.md#stale-writes-on-a-shared-workspace-experimental).
 
 Local file-tool path confinement is opt-in through `tool.WithWorkspaceRoot`;
 it does not provide process or network isolation. Session grants widen the

@@ -7,8 +7,10 @@ import (
 
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/event"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/logging"
+	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/loop"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/message"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/middleware"
+	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/protocol"
 )
 
 // Checkpointing and crash-recovery (HARNESS_DESIGN F1).
@@ -61,14 +63,14 @@ func (a *UnifiedAgent) SaveCheckpoint(ctx context.Context) error {
 		st.PermissionCtx = a.engine.SnapshotContext()
 	}
 	// Preserve legacy writes for readers that support only schema 1. Recovery
-	// counters require schema 2 and must never silently disappear on downgrade.
-	st.SchemaVersion = 1
+	// counters require schema 2 and thread state schema 3; neither may
+	// silently disappear on downgrade, so their presence raises the version.
 	run := a.activeRecovery
 	if run != nil {
 		st.ReplyRecovery = run.snapshot()
 	}
+	st.SchemaVersion = st.checkpointSchemaVersion()
 	if st.ReplyRecovery != nil {
-		st.SchemaVersion = StateSchemaVersion
 		if _, err := middleware.WithReplyBudgetSnapshot(ctx, &st.ReplyRecovery.Budgets); err != nil {
 			a.mu.Unlock()
 			return fmt.Errorf("agent: checkpoint budgets: %w", err)
@@ -129,7 +131,7 @@ func (a *UnifiedAgent) ForkSession(ctx context.Context, newSessionID string) err
 	st.SessionID = newSessionID
 	st.ReplyID = ""
 	st.ReplyRecovery = nil
-	st.SchemaVersion = 1
+	st.SchemaVersion = st.checkpointSchemaVersion() // 1, or 3 with thread state
 	raw, err := json.Marshal(&st)
 	if err != nil {
 		return fmt.Errorf("agent: fork marshal: %w", err)
@@ -204,16 +206,20 @@ func (a *UnifiedAgent) awaitingCalls() (asking, submitted []message.ToolCallBloc
 // repromptAwaitingCalls re-drives HITL/external handshakes after a resume:
 // it re-emits the confirmation/execution events for pending calls and
 // records the outcomes, so a conversation restored via WithState continues
-// where it parked instead of ending silently at StateWait. Returns true if
-// any awaiting call was handled (the react loop should re-evaluate).
-func (a *UnifiedAgent) repromptAwaitingCalls(ctx context.Context, ch chan<- event.Event, replyID string, actingHandler middleware.ActingHandler) bool {
+// where it parked instead of ending silently at StateWait. The loop hooks
+// run around each call it executes with StateAct, as on the StateAct path.
+// Returns true if any awaiting call was handled (the react loop should
+// re-evaluate).
+func (a *UnifiedAgent) repromptAwaitingCalls(ctx context.Context, ch chan<- event.Event, replyID string, actingHandler middleware.ActingHandler,
+	hooks *loop.HookRunner, iter int) bool {
+	const state = protocol.StateAct
 	asking, submitted := a.awaitingCalls()
 	handled := false
 
 	for i := range asking {
 		tc := asking[i]
 		emit(ctx, ch, event.NewRequireUserConfirmEvent(replyID, []message.ToolCallBlock{tc}))
-		confirmed, resultTC := a.waitForConfirmation(ctx, tc.ID)
+		confirmed, resultTC := a.waitForConfirmation(ctx, a.resumedAnswerIDs(replyID), tc.ID)
 		if !confirmed {
 			a.saveToContext([]message.ContentBlock{message.ToolResultBlock{
 				Type:   "tool_result",
@@ -233,7 +239,9 @@ func (a *UnifiedAgent) repromptAwaitingCalls(ctx context.Context, ch chan<- even
 		// back, so force the allowed state first.
 		resultTC.State = message.ToolCallAllowed
 		a.replaceToolCallInContext(tc.ID, &resultTC)
+		hooks.BeforeToolExec(state, iter, resultTC.Name)
 		a.executeAndRecord(ctx, ch, replyID, &resultTC, actingHandler)
+		hooks.AfterToolExec(state, iter, resultTC.Name, nil)
 		handled = true
 	}
 
@@ -241,7 +249,9 @@ func (a *UnifiedAgent) repromptAwaitingCalls(ctx context.Context, ch chan<- even
 		tc := submitted[i]
 		// A restored call must honor the current toolkit, permissions and
 		// validators. Reuse normal recording and event assembly as well.
+		hooks.BeforeToolExec(state, iter, tc.Name)
 		a.executeAndRecord(ctx, ch, replyID, &tc, actingHandler)
+		hooks.AfterToolExec(state, iter, tc.Name, nil)
 		handled = true
 	}
 

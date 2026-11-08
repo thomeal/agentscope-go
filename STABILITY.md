@@ -24,7 +24,8 @@ import "github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope"
   `replay/evalkit`, `event/streamcheck`, `agenttest/faults`,
   `providercontract` (test-only), `console`, `channel`, `channel/dingtalk`,
   `hub` (built-in sources), `skill` (`Store` partitions), `middleware/memory`
-  (`FileStore` + `AgenticMemoryMiddleware`), `taskenvelope`, `tierrouter`, `embodied`.
+  (`FileStore` + `AgenticMemoryMiddleware`), `taskenvelope`, `tierrouter`, `embodied`,
+  `thread`, `thread/participant`, `thread/route`.
   These are the newer v3 infrastructure layers, harness tooling, the
   console/channel frontends, and the Phase 3 hub/skill/memory additions.
 - **Internal** (`internal/...`): no compatibility guarantee; do not import.
@@ -65,7 +66,15 @@ the returned entry no longer affects the cache.
 - Restored submitted tool calls now check the current toolkit, permissions and
   input before handoff. Calls whose tool is missing, inactive or no longer
   external become error results. Invalid successful answers become error
-  results; `SubmitExternalResult` still returns no error. Hosts should inspect
+  results; `SubmitExternalResult` still returns no error (the experimental
+  `SubmitExternalResultContext` and `SubmitUserConfirmContext` return the
+  context's error instead of blocking, and while no reply core runs replace a
+  stale value with the new one, which the next reply reads). A waiting reply
+  drops an external result or confirmation whose `ReplyID` names another
+  reply (a call re-asked after a plain checkpoint resume also accepts the
+  checkpoint's reply ID); an empty `ReplyID` still matches, without that
+  protection (the `app` and legacy `service` confirm endpoints send none), so
+  set it to the request event's `ReplyID`. Hosts should inspect
   the terminal event and must not mutate submitted results afterward.
 - External result metadata survives agent state and event reconstruction.
   Multi-block external outputs retain all blocks in recorded state; supported
@@ -166,6 +175,40 @@ ports and deferred work, including realtime/TUI, SOP and model-context wiring.
   provide real-time, exactly-once or physical-safety guarantees. See
   [embodied contracts](docs/embodied-contracts.md).
 
+- Experimental `thread` (with `thread/participant` and `thread/route`) lets a
+  cloud agent and an edge agent share one session through an append-only log
+  with one foreground owner, guarded owner/epoch writes, transfer, background
+  tasks and forked summaries; its log has no privacy classes. The agent seams it uses
+  (`WithForkCapture`, `ForkSnapshot`, `ForkSummary`, `ApplySummary`,
+  `OfferSummary`, `AgentState.SummaryOffer`, `CompactStrict`,
+  `ContextConfig.ThreadSummaryTokens`, `SetThreadSummaryTokens`,
+  `ApplyThreadUpdate`, `WithBoundaryInput`, `WithThreadInput`,
+  `ThreadView`, `ThreadSeqOf`, `ErrReplyInProgress`, `MarkHandedOff`,
+  `WithExclusiveTools`, `SubmitExternalResultContext`,
+  `SubmitUserConfirmContext`) are
+  experimental additions to the stable `agent` package and inert unless used.
+  The between-replies seams refuse while any reply core is still running, even
+  after its event stream closed; hosts that cancel a reply must let its core
+  finish first. Tested offline with scripted
+  models; its only live runs were in a withdrawn benchmark comparison. One
+  Coordinator process per log; no live quality, cost or latency claim. See [Main Thread](docs/main-thread.md).
+
+- `model.WithCanonicalReplay` (for `ConnectivityAwareModel`) and
+  `FallbackChatModel.CanonicalReplay` are Experimental additions to the
+  `model` package and off by default. They mark tool calls in
+  `ToolCallBlock.Extra` (`agentscope_writer_rank`) and rewrite only the copy
+  of the history sent to a more preferred model. Measured in stage 0 on one
+  cloud and one local model, for `write_file` only.
+
+- `agent.WithPlanAfterLatestInput` is an Experimental addition to the
+  `agent` package and changes only where the plan message sits in the model
+  input. Its effect on answer quality has not been measured.
+
+- `tool.ReadCache.SetRejectStaleWrites` and `ReadCacheEntry.Hash` are
+  Experimental. The check is off by default; `Read` records the hash either
+  way. The check is not a lock and covers the built-in Write tool; files
+  changed by other tools are seen only through their content.
+
 - Experimental `evalkit.Runner.RunManagedLoad` evaluates the managed entry point
   directly with independent scoring and all-arrival/cost reporting. It creates no
   qualification records; offline fixtures and opt-in live quality pilots are
@@ -228,7 +271,10 @@ limits. Shared governance across ordinary Agent/helper paths remains proposed.
   unfinished iteration on resume and pass current validation. See the
   [reply recovery guide](docs/reply-recovery.md).
 - Ordinary checkpoints keep schema 1; recovery checkpoints use schema 2 and
-  budget snapshot version 1. Older loaders reject schema 2. New loaders accept
+  budget snapshot version 1; checkpoints of agents holding Main Thread state
+  (peer summary or cursor) use schema 3, which takes
+  precedence. Older loaders reject schema 2, and loaders before schema 3
+  reject schema 3. New loaders accept
   older conversation state, but explicit recovery requires its typed snapshot.
   Use a pre-recovery checkpoint or fresh conversation when rolling back; do not
   remove counters to bypass resume validation. `SaveCheckpoint` returns errors;

@@ -11,6 +11,139 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
 
 ## [Unreleased]
 
+### Added — Main Thread: one session shared by a cloud and an edge agent (experimental)
+
+- New experimental packages `thread`, `thread/participant` and `thread/route`.
+  A Coordinator runs a cloud participant (one agent, or a master with
+  sub-agents through `pipeline.TeamPipeline`) and an edge participant over one
+  append-only log: routing at query boundaries (local based, cloud based and
+  hybrid modes, rules and an optional classifier with a fixed-size state
+  that holds the query and the participants, and the session's history
+  only with `route.Config.IncludeHistory`),
+  `transfer` of the foreground with a structured brief, background tasks and
+  reports, summaries written by forked requests that reuse the prompt cache
+  (with an optional guardrail on their text), a one-step clear for edge
+  handovers, chunked import with strict compaction as the edge's fallback, a
+  shared ledger, an opt-in tool-output list and leases. The log has no
+  privacy classes: every participant may read every entry (a design for
+  edge-only data and taint is left as future work in
+  `docs/design/main-thread-privacy.md`). The classifier call is
+  bounded by a timeout, after which routing falls through to the mode's
+  default. Hybrid's default is the cloud. Whoever owns the session, a query
+  the classifier leaves open goes there. Open means no classifier, a call
+  that is not made, fails or times out, an invalid answer, low confidence,
+  or a choice over `MaxLag`. The hybrid question is stage 0's, and the
+  participant descriptions follow stage 0 with tool calls in place of its
+  records.
+  Peer summaries are refreshed when what a handover would bring the edge
+  reaches a share of its window. The cloud's own notes follow Claude Code's
+  session memory (first notes at 10,000 tokens, edit-based updates every
+  5,000) and are installed at its compaction line without a model call;
+  the synchronous compression still runs when they leave the context over
+  the line.
+  Tool digests keep each call's arguments, cut at 200 characters. A failed
+  owner leaves a `failed` marker and hands the request to the other side,
+  queued behind any task running there, with the failed run's steering;
+  plan updates are logged as `progress`; after a crash the turn in flight is
+  resumed on its owner, with the user's steering since then and a warning to
+  check the actual state. See [Main Thread](docs/main-thread.md) and
+  `examples/main_thread`.
+- Opt-in `agent` seams it builds on, inert unless used: `ApplyThreadUpdate`,
+  `WithBoundaryInput`, `WithThreadInput`, `ThreadView`, `WithForkCapture`,
+  `ForkSnapshot`, `ForkSummary` (with `ForkRequest.KeepToolChoice` for
+  providers whose cache depends on the tool choice), `ApplySummary`,
+  `OfferSummary` (with `AgentState.SummaryOffer`, applied at the compression
+  trigger), `CompactStrict`, `ContextConfig.ThreadSummaryTokens` (the own
+  summary's share next to a peer summary, sized from the window by default)
+  and `SetThreadSummaryTokens`, `MarkHandedOff`, `WithExclusiveTools` (matched by the name
+  the toolkit resolves), and the context-aware `SubmitExternalResultContext`
+  and `SubmitUserConfirmContext`.
+- The loop hooks' `BeforeToolExec` and `AfterToolExec` now also run around
+  the awaiting calls a resumed reply executes. Unlike the normal tool path,
+  they run only once a call is confirmed: the confirmation wait is outside
+  them and a call denied again gets no hooks, and they receive `StateAct`
+  without a state transition.
+- `types.ReplyHandedOff` (`"handed_off"`) ends a reply after a committed
+  handoff. Like an interrupted end it cannot be swallowed by `OnReply`
+  middleware; `TeamRun` treats it as a normal end and the goal pipeline as
+  not completed.
+
+### Added — canonical replay of a local model's tool calls (experimental)
+
+- `model.WithCanonicalReplay()` makes a `ConnectivityAwareModel` send the
+  cloud the arguments of the local model's tool calls as compact JSON with
+  sorted keys; `FallbackChatModel.CanonicalReplay` does the same for the calls
+  of models later in the chain. The calls are marked in
+  `ToolCallBlock.Extra` as they pass through and rewritten only in the copy of
+  the history sent upstream: stored messages, the local model's requests and
+  each model's own calls are unchanged. In the Main Thread stage 0
+  experiments, 11 replayed requests holding a local model's `write_file`
+  calls made `gpt-6-luna` run into an 8,000-token test cap on 21 to 27 of 330
+  replies across three passes, all on the 8 where the local model wrote
+  `path` before `content`, and on none with sorted keys; in live runs such replies reached the model's 128K output limit. Only
+  `write_file` and that model pair were measured. Main Thread does not replay
+  local calls to the cloud (they reach it only as text digests) and is not
+  affected.
+
+### Added — plan after the newest user message (experimental)
+
+- `agent.WithPlanAfterLatestInput()` injects the `WithPlanTool` plan message
+  right after the newest user message in the context instead of after the
+  summary. With the plan ahead of the history, every plan update made the
+  whole history miss the provider's prefix cache on the next call; now the
+  history before the current turn stays cached. The plan never follows a
+  reply's tool steps, so they keep following their own user message; on a
+  reply's first call it directly follows the new input.
+  `GenerateStructuredResponseWithUsage` uses the same layout; the default is
+  unchanged, and the effect on answer quality has not been measured.
+
+### Added — stale-write check for shared workspaces (experimental)
+
+- `tool.ReadCache.SetRejectStaleWrites(true)` makes `Write` refuse to replace
+  a file whose content is not the version the agent last read or edited, so
+  agents sharing a workspace, such as a Main Thread's participants, cannot
+  overwrite each other's changes from an old copy. Read records the content's
+  SHA-256 (`ReadCacheEntry.Hash`) and, while the check is on, always reads the
+  file; the edit tools record their own results. Edits are not refused. The
+  setting is off by default and is not saved with the cache; Read records the
+  hash either way.
+
+### Changed — checkpoint schema version, answer matching and Responses status
+
+- `agent.StateSchemaVersion` is now 3. Checkpoints are stamped 3 only when an
+  agent holds thread state; others are still stamped 1, or 2 with reply
+  recovery, so older builds keep reading them. Loading accepts up to 3.
+- The OpenAI Responses adapter now sets `ChatResponse.Error` when a response's
+  `status` is present and not `completed` (for example cut at
+  `max_output_tokens`), in `Chat` and in the final `ChatStream` response;
+  `response.incomplete` and `response.failed` stream events end the stream.
+  Content and usage are kept. Before, a buffered `Chat` response, or a
+  `response.completed` event reporting another status, looked complete; a
+  stream ending in `response.incomplete` or `response.failed` already failed,
+  with a generic truncation error and without usage. On the buffered agent
+  path such a response now emits `model_partial_response`, so `TeamRun` and
+  the goal pipeline fail it where they used to accept it.
+- `UnifiedAgent` drops an external result or a user confirmation whose
+  `ReplyID` names a reply other than the waiting one. Tool-call IDs can repeat
+  across replies (Gemini numbers them per response), so a late answer to a
+  canceled reply could answer, or approve, a later call with the same ID. An
+  empty `ReplyID` still matches, so hosts that leave it empty keep tool-call-ID
+  matching only (in this repository the `app` confirm handler and the legacy
+  `service` confirm endpoint, whose requests carry no reply ID). A call that a
+  reply resumed from a plain checkpoint asks again also accepts the reply ID
+  the checkpoint held, so an answer to the request seen before the restart
+  still reaches it.
+
+### Changed — precompression
+
+- With `ContextConfig.PrecompressRatio` set, a context that is still at the
+  trigger after a ready summary is applied now also compresses synchronously,
+  instead of continuing above the trigger.
+- A blank background summary is discarded like a failed generation instead
+  of being applied, a background result does not replace a summary offered
+  (`OfferSummary`) while it ran, and an offer loaded from a checkpoint is
+  dropped when its bounds do not fit the context.
+
 ### Changed — Anthropic stream accumulation
 
 - Long, fragmented Anthropic-compatible streams (the parser is shared with MiniMax)

@@ -453,8 +453,42 @@ func (m *openaiResponseModel) parseResponse(raw map[string]any) (*ChatResponse, 
 			resp.Usage.OutputTokens = int(v)
 		}
 	}
+	// A response cut at max_output_tokens (or one that failed) still
+	// carries its partial output; keep it, but report the status so callers
+	// can tell it apart from a complete answer.
+	resp.Error = responseStatusError(raw, "")
 
 	return resp, nil
+}
+
+// responseStatusError reports a Responses API response whose status is not
+// "completed", naming the status and, when given, the incomplete_details
+// reason or the error message. A response without a status is accepted as
+// before. fallbackStatus is used when the object carries no status (a
+// streamed terminal event such as response.incomplete names it instead).
+func responseStatusError(obj map[string]any, fallbackStatus string) error {
+	status, _ := obj["status"].(string)
+	if status == "" {
+		status = fallbackStatus
+	}
+	if status == "" || status == "completed" {
+		return nil
+	}
+	var reason string
+	if details, ok := obj["incomplete_details"].(map[string]any); ok {
+		reason, _ = details["reason"].(string)
+	}
+	if reason == "" {
+		if e, ok := obj["error"].(map[string]any); ok {
+			if reason, _ = e["message"].(string); reason == "" {
+				reason, _ = e["code"].(string)
+			}
+		}
+	}
+	if reason != "" {
+		return fmt.Errorf("openai response: response %s: %s", status, reason)
+	}
+	return fmt.Errorf("openai response: response %s", status)
 }
 
 // processStream consumes the Responses SSE stream. Contract: exactly one
@@ -560,11 +594,16 @@ scanLoop:
 				tc.Input += delta
 			}
 
-		case "response.completed":
+		case "response.completed", "response.incomplete", "response.failed":
+			// Terminal events. The latter two (and a completed event whose
+			// response reports another status) keep the accumulated content
+			// and report the status on Error.
 			resp := &ChatResponse{IsLast: true, ModelName: m.cfg.Model}
 			resp.Content = buildStreamContent(accText, accThinking, reasoningItems, toolCalls, toolCallOrder)
+			fallbackStatus := strings.TrimPrefix(eventType, "response.")
 
-			if respObj, ok := event["response"].(map[string]any); ok {
+			respObj, ok := event["response"].(map[string]any)
+			if ok {
 				if id, ok := respObj["id"].(string); ok {
 					resp.ID = id
 				}
@@ -578,6 +617,7 @@ scanLoop:
 					}
 				}
 			}
+			resp.Error = responseStatusError(respObj, fallbackStatus)
 
 			if !send(*resp) {
 				return

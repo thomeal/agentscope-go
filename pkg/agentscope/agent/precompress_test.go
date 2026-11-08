@@ -73,6 +73,31 @@ func waitPrecompress(t *testing.T, a *UnifiedAgent) *precompressResult {
 	return nil
 }
 
+// TestPrecompress_StillOverAfterApplyCompresses: a ready summary that covers
+// too little leaves the context at the threshold; the trigger then also runs
+// the synchronous compression instead of sending an over-long request.
+func TestPrecompress_StillOverAfterApplyCompresses(t *testing.T) {
+	mock := &precompressMockModel{contextSize: 1000, perMessageTokens: 100}
+	a := newPrecompressAgent(mock, &ContextConfig{ContextSize: 1000, TriggerRatio: 0.8, ReserveRatio: 0.3})
+	seedContext(a, 2)
+	a.mu.Lock()
+	first := a.state.Context[0]
+	a.pendingPrecompress = &precompressResult{summary: "covers one message", snapshotLen: 1, lastMsg: first, lastMsgID: first.ID}
+	a.mu.Unlock()
+	seedContext(a, 8) // ten messages; nine remain after the ready summary
+	if err := a.compressContext(context.Background()); err != nil {
+		t.Fatalf("compressContext: %v", err)
+	}
+	if got := mock.chatCalls.Load(); got != 1 {
+		t.Fatalf("chat calls = %d, want 1: the synchronous compression must follow", got)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.state.Summary == "covers one message" || len(a.state.Context) >= 9 {
+		t.Fatalf("summary %q with %d messages: the context was not compressed further", a.state.Summary, len(a.state.Context))
+	}
+}
+
 // TestPrecompress_ArmsUnderThreshold: between the precompress ratio and the
 // hard trigger, compressContext kicks off background generation without
 // touching the live state.
@@ -347,5 +372,113 @@ func TestEmitTurnStats_DrainsCompressionUsage(t *testing.T) {
 	}
 	if a.takeCompressionUsage() != nil {
 		t.Error("drain must clear the accumulator")
+	}
+}
+
+// TestPrecompress_CorruptOfferIsDropped: an offer read from a checkpoint the
+// agent did not write must not index outside the context or install a blank
+// summary. Each case passes the boundary check, so only the bounds and text
+// checks stand between it and a panic or an emptied context.
+func TestPrecompress_CorruptOfferIsDropped(t *testing.T) {
+	cases := map[string]func(boundary string) *SummaryOffer{
+		"zero length":       func(string) *SummaryOffer { return &SummaryOffer{Text: "x", Len: 0} },
+		"negative keep":     func(b string) *SummaryOffer { return &SummaryOffer{Text: "x", Len: 2, Keep: -5, Boundary: b} },
+		"keep beyond len":   func(b string) *SummaryOffer { return &SummaryOffer{Text: "x", Len: 2, Keep: 5, Boundary: b} },
+		"blank summary":     func(b string) *SummaryOffer { return &SummaryOffer{Text: "  ", Len: 2, Keep: 1, Boundary: b} },
+		"length past state": func(b string) *SummaryOffer { return &SummaryOffer{Text: "x", Len: 9, Keep: 1, Boundary: b} },
+	}
+	for name, offer := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctxMsgs := []*message.Msg{
+				message.NewMsg("u", message.RoleUser, "one"),
+				message.NewMsg("u", message.RoleUser, "two"),
+				message.NewMsg("u", message.RoleUser, "three"),
+			}
+			st := &AgentState{Context: append([]*message.Msg(nil), ctxMsgs...), SummaryOffer: offer(ctxMsgs[1].ID)}
+			mock := &precompressMockModel{contextSize: 1000, perMessageTokens: 100}
+			a := NewUnifiedAgent("t", "sys", mock, WithState(st))
+			if a.applyReadyPrecompress(context.Background()) {
+				t.Fatal("a corrupt offer was applied")
+			}
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			if a.state.SummaryOffer != nil || a.pendingPrecompress != nil {
+				t.Fatal("a corrupt offer must be dropped")
+			}
+			if a.state.Summary != "" || len(a.state.Context) != 3 {
+				t.Fatalf("state changed: summary %q, %d messages", a.state.Summary, len(a.state.Context))
+			}
+		})
+	}
+}
+
+// TestPrecompress_CorruptOfferFallsBackToSyncCompression: at the trigger a
+// corrupt offer is dropped and the synchronous compression runs instead.
+func TestPrecompress_CorruptOfferFallsBackToSyncCompression(t *testing.T) {
+	mock := &precompressMockModel{contextSize: 1000, perMessageTokens: 100}
+	st := &AgentState{SummaryOffer: &SummaryOffer{Text: "x", Len: 0}}
+	a := NewUnifiedAgent("t", "sys", mock, WithState(st),
+		WithContextConfig(&ContextConfig{ContextSize: 1000, TriggerRatio: 0.8, ReserveRatio: 0.3}))
+	seedContext(a, 9)
+	if err := a.compressContext(context.Background()); err != nil {
+		t.Fatalf("compressContext: %v", err)
+	}
+	if got := mock.chatCalls.Load(); got != 1 {
+		t.Fatalf("chat calls = %d, want 1: the synchronous compression must run", got)
+	}
+}
+
+// gatedPrecompressModel blocks the background generation until released.
+type gatedPrecompressModel struct {
+	precompressMockModel
+	entered chan struct{}
+	gate    chan struct{}
+	once    atomic.Bool
+}
+
+func (m *gatedPrecompressModel) Chat(ctx context.Context, msgs []*message.Msg, opts ...model.CallOption) (*model.ChatResponse, error) {
+	if m.once.CompareAndSwap(false, true) {
+		close(m.entered)
+	}
+	<-m.gate
+	return m.precompressMockModel.Chat(ctx, msgs, opts...)
+}
+
+// TestPrecompress_NewerOfferWinsOverBackgroundResult: an offer made while a
+// background generation runs is newer than that generation's snapshot, so
+// the finished generation must not replace it.
+func TestPrecompress_NewerOfferWinsOverBackgroundResult(t *testing.T) {
+	m := &gatedPrecompressModel{entered: make(chan struct{}), gate: make(chan struct{})}
+	m.contextSize = 1000
+	m.perMessageTokens = 100
+	a := NewUnifiedAgent("t", "sys", m, WithContextConfig(&ContextConfig{
+		ContextSize: 1000, TriggerRatio: 0.8, ReserveRatio: 0.3, PrecompressRatio: 0.5,
+	}))
+	seedContext(a, 4)
+	if err := a.compressContext(context.Background()); err != nil {
+		t.Fatalf("compressContext: %v", err)
+	}
+	select {
+	case <-m.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the background generation did not start")
+	}
+	a.mu.Lock()
+	a.state.SummaryOffer = &SummaryOffer{Text: "the offer", Len: 4, Keep: 1, Boundary: a.state.Context[3].ID}
+	a.pendingPrecompress = a.state.SummaryOffer.result()
+	a.mu.Unlock()
+	close(m.gate)
+
+	p := waitPrecompress(t, a)
+	if p == nil || p.summary != "the offer" {
+		t.Fatalf("pending = %+v, want the offer", p)
+	}
+	if !a.applyReadyPrecompress(context.Background()) {
+		t.Fatal("the offer was not applied")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.state.Summary != "the offer" || a.state.SummaryOffer != nil {
+		t.Fatalf("summary %q, offer %+v", a.state.Summary, a.state.SummaryOffer)
 	}
 }

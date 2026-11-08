@@ -104,6 +104,38 @@ fmt.Println(cam.ActiveModel()) // "cloud" or "local"
 | Open | All calls go to local (no cloud attempts) |
 | Half-Open | Single probe to cloud; if success, close circuit |
 
+### Replaying the local model's tool calls (experimental)
+
+The two models share one history, so the cloud receives the tool calls the
+local model wrote while the cloud was away. Their arguments are in the local
+model's own form, which can differ from the cloud's: a local model may write
+`{"path": …, "content": …}` where the cloud writes `content` first. In the
+Main Thread stage 0 experiments, such calls made `gpt-6-luna` run away on its
+next whole-file write. Replaying 11 requests holding the local model's calls
+30 times each, with output capped at 8,000 tokens (the largest ordinary reply
+was 7,171), 21 to 27 of 330 replies ran into the cap across three passes, all
+on the 8 requests where the local model wrote `path` first, and none did with
+the keys sorted; in live runs such replies went on to the model's 128K output limit.
+`WithCanonicalReplay` sends the cloud those arguments as compact JSON with
+sorted keys:
+
+```go
+cam := model.NewConnectivityAwareModel(local, cloud, model.WithCanonicalReplay())
+```
+
+The local model's calls are marked in `ToolCallBlock.Extra` as they pass
+through (the mark is kept with the agent's messages and checkpoints; no
+formatter sends it), and only the copy of the history sent to the cloud is
+rewritten. The stored messages, the local model's own requests and the
+cloud's calls are unchanged, and the rewrite is deterministic, so cached
+prefixes stay stable. Calls written before the option was enabled, or whose
+arguments are not valid JSON, are sent as written. This was measured on one
+cloud and one local model, and only for `write_file`; the rewrite applies to
+every marked call, and its effect on other tools and other pairs is not
+established.
+`FallbackChatModel.CanonicalReplay` does the same for the calls of models
+later in its chain.
+
 ## Context Window and Timeouts for Local Models
 
 Two settings that cloud deployments never touch matter on the edge. Neither is
