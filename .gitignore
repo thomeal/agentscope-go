@@ -96,3 +96,5 @@ docs/superpowers/
 /PORTING_PLAN*.md
 /EVALUATOR_REPORT*.md
 /HARNESS_DESIGN.md
+.env
+__pycache__/
