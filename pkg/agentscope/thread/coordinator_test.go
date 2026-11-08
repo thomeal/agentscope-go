@@ -183,7 +183,7 @@ func TestCoordinatorRoutesAndSealsReply(t *testing.T) {
 	if got := kindsOf(log); !reflect.DeepEqual(got, []string{"user_input", "owner_change", "reply"}) {
 		t.Fatalf("log kinds = %v", got)
 	}
-	if log[0].Origin.Participant != "user" || log[0].Visibility != Shared || !strings.HasPrefix(log[0].DedupKey, "user:") {
+	if log[0].Origin.Participant != "user" || !strings.HasPrefix(log[0].DedupKey, "user:") {
 		t.Fatalf("user_input = %+v", log[0])
 	}
 	oc := log[1]
@@ -192,7 +192,7 @@ func TestCoordinatorRoutesAndSealsReply(t *testing.T) {
 	}
 	rep := log[2]
 	if rep.Origin != (Origin{Participant: "edge"}) || rep.BasedOn != 1 || rep.Text() != "hello from edge" ||
-		!strings.HasPrefix(rep.DedupKey, "reply:") || rep.Visibility != Shared || rep.Epoch != 1 {
+		!strings.HasPrefix(rep.DedupKey, "reply:") || rep.Epoch != 1 {
 		t.Fatalf("reply = %+v", rep)
 	}
 	calls := env.store.appends()
@@ -240,9 +240,6 @@ func TestCoordinatorSubmitValidationAndRetry(t *testing.T) {
 	if _, err := env.c.Submit(context.Background(), Query{Text: "  "}); err == nil {
 		t.Fatal("empty query accepted")
 	}
-	if _, err := env.c.Submit(context.Background(), Query{Text: "x", Disclosure: "secret"}); err == nil {
-		t.Fatal("unknown disclosure accepted")
-	}
 	first := env.submit(Query{OperationID: "op-1", Text: "hi"})
 	env.idle()
 	again := env.submit(Query{OperationID: "op-1", Text: "hi"})
@@ -281,7 +278,7 @@ func TestCoordinatorRouterDecisions(t *testing.T) {
 		case 3:
 			return RouteDecision{ClassifierCalls: 3}, errors.New("classifier down")
 		default:
-			return RouteDecision{Target: "cloud"}, nil // invalid for an edge-only query
+			return RouteDecision{Target: "nobody"}, nil // unknown: the default rule decides
 		}
 	}
 	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = router }, edge, cloud)
@@ -318,10 +315,10 @@ func TestCoordinatorRouterDecisions(t *testing.T) {
 	if acts := cloud.activations(); !containsText(syncTexts(acts[1].Sync), "two") {
 		t.Fatalf("parked input not imported: %v", syncTexts(acts[1].Sync))
 	}
-	env.submit(Query{Text: "four", Disclosure: DiscloseEdgeOnly})
+	env.submit(Query{Text: "four", Explicit: "edge"})
 	env.idle()
 	if acts := edge.activations(); len(acts) != 1 || acts[0].Input != "four" {
-		t.Fatalf("edge-only query went elsewhere: %+v", acts)
+		t.Fatalf("the default rule did not take the named participant: %+v", acts)
 	}
 
 	byKind := env.c.Ledger().TotalsByKind()[UsageClassifier]
@@ -342,13 +339,12 @@ func TestCoordinatorRouterDecisions(t *testing.T) {
 func TestCoordinatorRouteRequest(t *testing.T) {
 	store := NewMemoryStore(WithClock(fixedClock()))
 	mustAppend(t, store, nil,
-		Entry{Kind: KindSummary, Origin: Origin{Participant: "cloud"}, Visibility: Shared,
+		Entry{Kind: KindSummary, Origin: Origin{Participant: "cloud"},
 			Summary: &SummaryMeta{Target: "edge"}, Coverage: &Coverage{}, Content: textBlocks("the summary")},
-		Entry{Kind: KindArtifact, Visibility: Shared, Refs: []ArtifactRef{{URI: "file:///a"}}},
-		Entry{Kind: KindArtifact, Visibility: EdgeOnly, Refs: []ArtifactRef{{URI: "file:///b"}}},
+		Entry{Kind: KindArtifact, Refs: []ArtifactRef{{URI: "file:///a"}}},
+		Entry{Kind: KindArtifact, Refs: []ArtifactRef{{URI: "file:///b"}}},
 	)
 	edge, cloud := edgeCloud()
-	edge.setState(func(s *ParticipantState) { s.Tainted = true })
 	router := &fakeRouter{fn: func(_ context.Context, _ *RouteRequest) (RouteDecision, error) {
 		return RouteDecision{Target: "edge"}, nil
 	}}
@@ -365,17 +361,16 @@ func TestCoordinatorRouteRequest(t *testing.T) {
 		t.Fatalf("%d route requests", len(reqs))
 	}
 	req := reqs[0]
-	// The edge is tainted, so the unclassified query is handled as edge-only.
-	if req.OperationID != "op" || req.Query != "route me" || req.Disclosure != DiscloseEdgeOnly || req.Owner != "" ||
-		req.Explicit != "edge" || !reflect.DeepEqual(req.NeedsGroups, []string{"device"}) || !req.EdgeTainted {
+	if req.OperationID != "op" || req.Query != "route me" || req.Owner != "" ||
+		req.Explicit != "edge" || !reflect.DeepEqual(req.NeedsGroups, []string{"device"}) {
 		t.Fatalf("request = %+v", req)
 	}
 	if req.PeerSummary != "the summary" || !req.SummaryStale {
 		t.Fatalf("peer summary = %q stale %v", req.PeerSummary, req.SummaryStale)
 	}
-	// The cloud's lag leaves out the edge-only artifact and the query.
+	// Both lag behind the whole log, the query included.
 	if len(req.Participants) != 2 || req.Participants[0].Lag != 4 || !req.Participants[0].Available ||
-		req.Participants[1].Lag != 2 || req.Participants[1].Available {
+		req.Participants[1].Lag != 4 || req.Participants[1].Available {
 		t.Fatalf("candidates = %+v", req.Participants)
 	}
 	if len(req.Recent) != 4 {
@@ -396,19 +391,10 @@ func TestCoordinatorDefaultRoute(t *testing.T) {
 	if n := len(cloud.activations()); n != 2 {
 		t.Fatalf("cloud ran %d times", n)
 	}
-	// Naming the cloud for an edge-only query is refused, never overridden.
-	seq := env.submit(Query{Text: "secret", Disclosure: DiscloseEdgeOnly, Explicit: "cloud"})
-	env.idle()
-	m := findEntries(env.log(), KindMarker, MarkerNoOwner)
-	if len(m) != 1 || m[0].BasedOn != seq || !strings.Contains(m[0].Marker.Detail, "may not take") {
-		t.Fatalf("no_owner = %+v", m)
-	}
-	// An unclassified query avoids the cloud while the edge is tainted.
-	edge.setState(func(s *ParticipantState) { s.Tainted = true })
-	env.submit(Query{Text: "unclassified"})
+	env.submit(Query{Text: "back", Explicit: "edge"})
 	env.idle()
 	if owner, _ := env.c.Owner(); owner != "edge" {
-		t.Fatalf("tainted edge: owner = %s", owner)
+		t.Fatalf("explicit owner = %s", owner)
 	}
 }
 
@@ -519,32 +505,6 @@ func TestCoordinatorStrandedInputsStartNewCycle(t *testing.T) {
 	}
 }
 
-func TestCoordinatorEdgeOnlySteeringNeverReachesCloud(t *testing.T) {
-	edge, cloud := edgeCloud()
-	cloud.started = make(chan Activation, 8)
-	release := make(chan struct{})
-	cloud.push(gate(release, func(r *fakeRun) *ActivationEnd {
-		if s := r.pending(); s != nil {
-			t.Errorf("cloud got pending input %v", syncTexts(s))
-		}
-		return r.reply("done")
-	}))
-	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = zoneRouter() }, edge, cloud)
-	env.say("plan")
-	waitStarted(t, cloud)
-	secret := env.submit(Query{Text: "my PIN is 4242", Disclosure: DiscloseEdgeOnly})
-	close(release)
-	env.idle()
-
-	acts := edge.activations()
-	if len(acts) != 1 || acts[0].Trigger.Seq != secret {
-		t.Fatalf("edge activations = %+v", acts)
-	}
-	if containsText(cloud.seenTexts(), "4242") {
-		t.Fatal("edge-only input reached the cloud")
-	}
-}
-
 func TestCoordinatorMaxPendingInputs(t *testing.T) {
 	edge, cloud := edgeCloud()
 	edge.started = make(chan Activation, 8)
@@ -627,12 +587,6 @@ func TestCoordinatorTransferRefusals(t *testing.T) {
 	edge, cloud := edgeCloud()
 	var cloudUp atomic.Bool
 	cloudUp.Store(true)
-	policy := &fakePolicy{fn: func(text string) (Visibility, error) {
-		if strings.Contains(text, "private") {
-			return EdgeOnly, nil
-		}
-		return Shared, nil
-	}}
 	errs := map[string]error{}
 	edge.push(func(r *fakeRun) *ActivationEnd {
 		h := r.host()
@@ -650,7 +604,6 @@ func TestCoordinatorTransferRefusals(t *testing.T) {
 		cloudUp.Store(false)
 		try("unavailable", func(*TransferRequest) {})
 		cloudUp.Store(true)
-		try("private brief", func(q *TransferRequest) { q.Private = true; q.Brief.Goal = "use the private notes" })
 		return r.reply("staying")
 	})
 	cloud.push(func(r *fakeRun) *ActivationEnd {
@@ -660,7 +613,6 @@ func TestCoordinatorTransferRefusals(t *testing.T) {
 	})
 	env := newCoEnv(t, nil, func(cfg *Config) {
 		cfg.Available = func(name string) bool { return name != "cloud" || cloudUp.Load() }
-		cfg.Disclosure = policy
 	}, edge, cloud)
 	env.say("start")
 	env.idle()
@@ -670,13 +622,10 @@ func TestCoordinatorTransferRefusals(t *testing.T) {
 			t.Errorf("%s: %v, want ErrNotOwner", name, errs[name])
 		}
 	}
-	for _, name := range []string{"wrong origin", "unknown target", "self", "no goal", "unavailable", "private brief"} {
+	for _, name := range []string{"wrong origin", "unknown target", "self", "no goal", "unavailable"} {
 		if errs[name] == nil {
 			t.Errorf("%s: transfer succeeded", name)
 		}
-	}
-	if !errors.Is(errs["private brief"], errPrivateBrief) {
-		t.Errorf("private brief: %v", errs["private brief"])
 	}
 
 	// A background activation may not transfer.
@@ -690,118 +639,6 @@ func TestCoordinatorTransferRefusals(t *testing.T) {
 	env.idle()
 	if !errors.Is(errs["background caller"], ErrNotOwner) {
 		t.Errorf("background caller: %v", errs["background caller"])
-	}
-
-	// An edge-only query reaches the cloud through a Transfer only as a brief
-	// the policy clears (plan §12); the query itself stays a gap.
-	edge.push(func(r *fakeRun) *ActivationEnd {
-		_, errs["edge-only, private brief"] = r.host().Transfer(r.ctx, TransferRequest{From: Origin{Participant: "edge"},
-			Epoch: r.act.Epoch, To: "cloud", Brief: Brief{Goal: "fix it using the private notes", Remaining: []string{"x"}}})
-		_, errs["edge-only, cleared brief"] = r.transfer("cloud")
-		return &ActivationEnd{Reason: types.ReplyHandedOff}
-	})
-	cloud.push(replyWith("on it"))
-	env.submit(Query{Text: "my secret", Disclosure: DiscloseEdgeOnly})
-	env.idle()
-	if err := errs["edge-only, private brief"]; !errors.Is(err, errPrivateBrief) {
-		t.Errorf("edge-only input with a private brief: %v", err)
-	}
-	if err := errs["edge-only, cleared brief"]; err != nil {
-		t.Errorf("edge-only input with a cleared brief: %v", err)
-	}
-	if containsText(cloud.seenTexts(), "my secret") {
-		t.Error("the edge-only query reached the cloud")
-	}
-}
-
-// TestCoordinatorCloudTransferInAnEdgeOnlyCycle: once the edge has handed an
-// edge-only request to the cloud through a cleared brief, the cloud never saw
-// the request, so its own transfer to another cloud participant is not held
-// to the disclosure policy.
-func TestCoordinatorCloudTransferInAnEdgeOnlyCycle(t *testing.T) {
-	edge, cloud := edgeCloud()
-	cloud2 := newFakePart("cloud2", ZoneCloud)
-	policy := &fakePolicy{fn: func(text string) (Visibility, error) {
-		if strings.Contains(text, testBrief().Goal) {
-			return Shared, nil
-		}
-		return EdgeOnly, nil
-	}}
-	var edgeErr, cloudErr error
-	edge.push(func(r *fakeRun) *ActivationEnd {
-		_, edgeErr = r.transfer("cloud")
-		return &ActivationEnd{Reason: types.ReplyHandedOff}
-	})
-	cloud.push(func(r *fakeRun) *ActivationEnd {
-		_, cloudErr = r.host().Transfer(r.ctx, TransferRequest{From: Origin{Participant: "cloud"}, Epoch: r.act.Epoch,
-			To: "cloud2", Brief: Brief{Goal: "compare the hotel prices", Remaining: []string{"pick one"}}})
-		return &ActivationEnd{Reason: types.ReplyHandedOff}
-	})
-	cloud2.push(replyWith("booked"))
-	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Disclosure = policy }, edge, cloud, cloud2)
-	env.submit(Query{Text: "my secret", Disclosure: DiscloseEdgeOnly})
-	env.idle()
-	if edgeErr != nil {
-		t.Fatalf("edge transfer with a cleared brief: %v", edgeErr)
-	}
-	if cloudErr != nil {
-		t.Fatalf("cloud transfer in an edge-only cycle: %v", cloudErr)
-	}
-	policy.mu.Lock()
-	calls := append([]string(nil), policy.calls...)
-	policy.mu.Unlock()
-	if containsText(calls, "compare the hotel prices") {
-		t.Fatalf("the cloud's brief went through the disclosure policy: %q", calls)
-	}
-	if n := len(cloud2.activations()); n != 1 {
-		t.Fatalf("cloud2 activations = %d", n)
-	}
-	if containsText(cloud.seenTexts(), "my secret") || containsText(cloud2.seenTexts(), "my secret") {
-		t.Fatal("the edge-only query reached the cloud")
-	}
-}
-
-func TestCoordinatorPrivateBriefPolicy(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		policy DisclosurePolicy
-		ok     bool
-	}{
-		{"no policy", nil, false},
-		{"policy keeps it", &fakePolicy{fn: func(string) (Visibility, error) { return EdgeOnly, nil }}, false},
-		{"policy fails", &fakePolicy{fn: func(string) (Visibility, error) { return "", errors.New("down") }}, false},
-		{"policy clears it", &fakePolicy{fn: func(string) (Visibility, error) { return Shared, nil }}, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			edge, cloud := edgeCloud()
-			var err error
-			edge.push(func(r *fakeRun) *ActivationEnd {
-				_, err = r.host().Transfer(r.ctx, TransferRequest{From: Origin{Participant: "edge"}, Epoch: r.act.Epoch,
-					To: "cloud", Brief: testBrief(), Private: true, Text: "shown"})
-				if err != nil {
-					return r.reply("kept")
-				}
-				return &ActivationEnd{Reason: types.ReplyHandedOff}
-			})
-			env := newCoEnv(t, nil, func(cfg *Config) { cfg.Disclosure = tc.policy }, edge, cloud)
-			env.say("go")
-			env.idle()
-			if (err == nil) != tc.ok {
-				t.Fatalf("transfer error = %v", err)
-			}
-			if !tc.ok {
-				return
-			}
-			ocs := findEntries(env.log(), KindOwnerChange, "")
-			last := ocs[len(ocs)-1]
-			if last.Owner.Reason != ReasonTransfer || last.Visibility != Shared {
-				t.Fatalf("owner_change = %+v", last)
-			}
-			reps := findEntries(env.log(), KindReply, "")
-			if reps[0].Visibility != Shared {
-				t.Fatalf("declassified reply visibility = %s", reps[0].Visibility)
-			}
-		})
 	}
 }
 
@@ -856,7 +693,7 @@ func TestCoordinatorAssignReportAndWake(t *testing.T) {
 	edge.push(func(r *fakeRun) *ActivationEnd {
 		return &ActivationEnd{Reason: types.ReplyCompleted, Text: "42 photos", Digest: &ToolDigest{Calls: []ToolCallDigest{{Name: "Glob"}}}}
 	})
-	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = zoneRouter() }, edge, cloud)
+	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = cloudRouter() }, edge, cloud)
 	env.say("how many photos?")
 	env.idle()
 
@@ -934,7 +771,7 @@ func TestCoordinatorWakeLimit(t *testing.T) {
 	}, replyWith("woken"), replyWith("next answer"))
 	edge.push(replyWith("first result"), replyWith("second result"))
 	env := newCoEnv(t, nil, func(cfg *Config) {
-		cfg.Router = zoneRouter()
+		cfg.Router = cloudRouter()
 		cfg.Limits.MaxWakesPerQuery = 1
 	}, edge, cloud)
 	env.say("go")
@@ -981,7 +818,7 @@ func TestCoordinatorBusyTargetQueued(t *testing.T) {
 		return &ActivationEnd{Reason: types.ReplyHandedOff}
 	})
 	edge.push(gate(release, replyWith("long job done")), replyWith("hello user"), replyWith("second job done"))
-	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = zoneRouter() }, edge, cloud)
+	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = cloudRouter() }, edge, cloud)
 	env.say("go")
 	env.idle()
 
@@ -1015,7 +852,7 @@ func TestCoordinatorFailover(t *testing.T) {
 	if log[2].Text() != "partial" || log[3].BasedOn != q || log[4].BasedOn != q {
 		t.Fatalf("partial reply / markers = %+v %+v %+v", log[2], log[3], log[4])
 	}
-	if log[3].Marker.Detail != "edge failed: its activation ended with an error" || log[6].Marker.Detail != "cloud failed: cloud down" {
+	if log[3].Marker.Detail != "edge failed: disk /private/x failed" || log[6].Marker.Detail != "cloud failed: cloud down" {
 		t.Fatalf("failed markers = %q, %q", log[3].Marker.Detail, log[6].Marker.Detail)
 	}
 	fo := log[5]
@@ -1023,23 +860,17 @@ func TestCoordinatorFailover(t *testing.T) {
 		t.Fatalf("failover = %+v", fo.Owner)
 	}
 	acts := cloud.activations()
-	wantInput := `[edge failed: its activation ended with an error (#4). You now answer the user: continue their request #1 "fix it" ` +
+	wantInput := `[edge failed: disk /private/x failed (#4). You now answer the user: continue their request #1 "fix it" ` +
 		`from where edge left off. What edge did is in the summary and the entries above.]`
 	if len(acts) != 1 || acts[0].Input != wantInput || acts[0].Trigger.Seq != fo.Seq {
 		t.Fatalf("failover activation = %+v", acts)
-	}
-	for _, e := range log {
-		if strings.Contains(e.Text(), "/private") || (e.Marker != nil && strings.Contains(e.Marker.Detail, "/private")) {
-			t.Fatalf("the edge's error text reached the shared log: %+v", e)
-		}
 	}
 }
 
 // TestCoordinatorFailoverHandsOnSteering: the user steered the edge's run
 // twice before it failed. The failed marker records both messages, since
-// the run ended there. The cloud's failover takes the shared one, which its
-// reply records; the edge-only one, which the cloud may not read, starts
-// its own cycle on the edge afterwards instead of being lost.
+// the run ended there, and the cloud's failover takes both, which its reply
+// records.
 func TestCoordinatorFailoverHandsOnSteering(t *testing.T) {
 	edge, cloud := edgeCloud()
 	edge.started = make(chan Activation, 8)
@@ -1047,119 +878,30 @@ func TestCoordinatorFailoverHandsOnSteering(t *testing.T) {
 	edge.push(gate(release, func(r *fakeRun) *ActivationEnd {
 		r.pending()
 		return &ActivationEnd{Reason: types.ReplyError, Err: errors.New("model crashed")}
-	}), replyWith("noted privately"))
+	}))
 	cloud.push(replyWith("planned, in metric"))
 	env := newCoEnv(t, nil, nil, edge, cloud)
 	env.say("plan my trip")
 	waitStarted(t, edge)
 	metric := env.say("use metric units")
-	passport := env.submit(Query{Text: "my passport number is X", Disclosure: DiscloseEdgeOnly})
+	hotel := env.say("and book a hotel")
 	close(release)
 	env.idle()
 
 	log := env.log()
 	failed := findEntries(log, KindMarker, MarkerFailed)
-	if len(failed) != 1 || !slices.Equal(failed[0].Steered, []uint64{metric, passport}) {
+	if len(failed) != 1 || !slices.Equal(failed[0].Steered, []uint64{metric, hotel}) {
 		t.Fatalf("failed markers = %+v", failed)
 	}
 	replies := findEntries(log, KindReply, "")
-	if len(replies) != 2 || replies[0].Origin.Participant != "cloud" || !slices.Equal(replies[0].Steered, []uint64{metric}) ||
-		replies[1].Origin.Participant != "edge" || len(replies[1].Steered) != 0 {
+	if len(replies) != 1 || replies[0].Origin.Participant != "cloud" || !slices.Equal(replies[0].Steered, []uint64{metric, hotel}) {
 		t.Fatalf("replies = %+v", replies)
 	}
-	acts := edge.activations()
-	if len(acts) != 2 || acts[1].Trigger.Seq != passport || acts[1].Input != "my passport number is X" {
+	if acts := edge.activations(); len(acts) != 1 {
 		t.Fatalf("edge activations = %+v", acts)
 	}
-	if oc := log[len(log)-2]; oc.Kind != KindOwnerChange || oc.Owner.To != "edge" || oc.BasedOn != passport {
-		t.Fatalf("the routing of the edge-only input = %+v", oc)
-	}
-	if containsText(cloud.seenTexts(), "passport") {
-		t.Fatal("the edge-only steering reached the cloud")
-	}
-}
-
-// TestCoordinatorEdgeProgressIsNotPrivateMaterial: the edge's own progress
-// is edge-only, but it is a run's working state, not material the edge
-// holds: a later clear neither indexes it nor makes the edge private, so
-// the edge's next reply to a shared request stays shared.
-func TestCoordinatorEdgeProgressIsNotPrivateMaterial(t *testing.T) {
-	edge := newFakePart("edge", ZoneEdge)
-	cloud := newFakeForker("cloud")
-	env := newCoEnv(t, nil, func(cfg *Config) {
-		cfg.Router = &fakeRouter{fn: func(_ context.Context, req *RouteRequest) (RouteDecision, error) {
-			if strings.HasPrefix(req.Query, "edge:") {
-				return RouteDecision{Target: "edge", Source: RouteRule}, nil
-			}
-			return RouteDecision{Target: "cloud", Source: RouteRule}, nil
-		}}
-		cfg.Summaries.PeerEvery = 100
-	}, edge, cloud)
-	edge.push(func(r *fakeRun) *ActivationEnd {
-		r.plan("read the sensors", "report them")
-		return r.reply("sensors ok")
-	}, replyWith("lights on"))
-	cloud.push(grow(500, "week planned"))
-	env.say("edge: check the sensors")
-	env.idle()
-	env.say("cloud: plan the week")
-	env.idle()
-	last := env.say("edge: lights on")
-	env.idle()
-
-	if p := findEntries(env.log(), KindProgress, ""); len(p) != 1 || p[0].Visibility != EdgeOnly {
-		t.Fatalf("edge progress = %+v", p)
-	}
-	acts := edge.activations()
-	if len(acts) != 2 || acts[1].Sync == nil || !acts[1].Sync.Reset {
-		t.Fatalf("the edge's second activation must clear: %+v", acts)
-	}
-	if idx := acts[1].Sync.Index; idx != nil && *idx != "" {
-		t.Fatalf("the clear indexed the edge's progress: %q", *idx)
-	}
-	var reply *Entry
-	for _, e := range env.log() {
-		if e.Kind == KindReply && e.BasedOn == last {
-			reply = &e
-		}
-	}
-	if reply == nil || reply.Visibility != Shared {
-		t.Fatalf("the edge's reply after the clear = %+v; its own progress must not make it private", reply)
-	}
-	env.c.mu.Lock()
-	private := env.c.parts["edge"].private
-	env.c.mu.Unlock()
-	if private {
-		t.Fatal("the edge stays private after the clear")
-	}
-}
-
-// TestCoordinatorEdgeProgressStaysOnTheEdge: an edge run's plan may name
-// private material, so its progress is edge-only. When the edge fails, the
-// cloud's failover import withholds it and the failover note does not point
-// at it.
-func TestCoordinatorEdgeProgressStaysOnTheEdge(t *testing.T) {
-	edge, cloud := edgeCloud()
-	edge.push(func(r *fakeRun) *ActivationEnd {
-		r.plan("read /private/diary", "fix it")
-		return &ActivationEnd{Reason: types.ReplyError, Err: errors.New("model crashed")}
-	})
-	cloud.push(replyWith("fixed"))
-	env := newCoEnv(t, nil, nil, edge, cloud)
-	env.say("fix it")
-	env.idle()
-
-	progress := findEntries(env.log(), KindProgress, "")
-	if len(progress) != 1 || progress[0].Origin.Participant != "edge" || progress[0].Visibility != EdgeOnly || !strings.Contains(progress[0].Text(), "/private/diary") {
-		t.Fatalf("edge progress = %+v", progress)
-	}
-	acts := cloud.activations()
-	if len(acts) != 1 || strings.Contains(acts[0].Input, "progress") {
-		t.Fatalf("cloud failover activation = %+v", acts)
-	}
-	texts := syncTexts(acts[0].Sync)
-	if containsText(texts, "/private") || !containsText(texts, fmt.Sprintf("#%d withheld", progress[0].Seq)) {
-		t.Fatalf("the cloud's import must withhold the edge's progress: %q", texts)
+	if !containsText(cloud.seenTexts(), "and book a hotel") {
+		t.Fatal("the steering did not reach the cloud")
 	}
 }
 
@@ -1180,20 +922,6 @@ func TestCoordinatorFailoverWhenUnavailable(t *testing.T) {
 	acts := cloud.activations()
 	if len(acts) != 1 || !strings.HasPrefix(acts[0].Input, "[edge failed: it is unavailable (#") {
 		t.Fatalf("cloud activation = %+v", acts)
-	}
-}
-
-func TestCoordinatorNoFailoverForEdgeOnly(t *testing.T) {
-	edge, cloud := edgeCloud()
-	edge.push(func(*fakeRun) *ActivationEnd { return &ActivationEnd{Reason: types.ReplyError} })
-	env := newCoEnv(t, nil, nil, edge, cloud)
-	env.submit(Query{Text: "secret", Disclosure: DiscloseEdgeOnly})
-	env.idle()
-	if m := findEntries(env.log(), KindMarker, MarkerNoOwner); len(m) != 1 {
-		t.Fatalf("no_owner = %+v", m)
-	}
-	if n := len(cloud.activations()); n != 0 {
-		t.Fatalf("cloud ran %d times", n)
 	}
 }
 
@@ -1266,7 +994,7 @@ func TestCoordinatorInterruptQueuedForeground(t *testing.T) {
 		return &ActivationEnd{Reason: types.ReplyHandedOff}
 	})
 	edge.push(gate(release, replyWith("bg done")))
-	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = zoneRouter() }, edge, cloud)
+	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = cloudRouter() }, edge, cloud)
 	env.say("go")
 	<-transferred // the edge's foreground activation is queued behind its task
 	env.c.Interrupt()
@@ -1466,7 +1194,7 @@ func TestCoordinatorFailoverWaitsForTheTask(t *testing.T) {
 	if failed == nil || failed.BasedOn != seq || failed.Marker.Detail != "cloud failed: cloud model unreachable" {
 		t.Fatalf("failed marker = %+v", failed)
 	}
-	if progress == nil || progress.Origin.Participant != "cloud" || progress.BasedOn != seq || progress.Visibility != Shared ||
+	if progress == nil || progress.Origin.Participant != "cloud" || progress.BasedOn != seq ||
 		!strings.Contains(progress.Text(), "2. [in_progress] draft the morning") {
 		t.Fatalf("progress = %+v", progress)
 	}

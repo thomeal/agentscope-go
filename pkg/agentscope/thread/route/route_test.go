@@ -35,9 +35,6 @@ func TestNewValidatesConfig(t *testing.T) {
 		{"negative response limit", func(c *Config) { c.Limits.MaxResponseBytes = -1 }},
 		{"nil rule", func(c *Config) { c.Rules = []Rule{nil} }},
 		{"nil classifier pointer", func(c *Config) { c.Classifier = nilFake }},
-		{"remote classifier not hosted", func(c *Config) { c.Classifier = &stub{endpoint: "https://api.typesafe.ai/v1/systemone"} }},
-		{"LAN classifier not hosted", func(c *Config) { c.Classifier = &stub{endpoint: "http://192.168.1.5:8080/v1/systemone"} }},
-		{"unparsable endpoint not hosted", func(c *Config) { c.Classifier = &stub{endpoint: "http://[::1"} }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -45,60 +42,6 @@ func TestNewValidatesConfig(t *testing.T) {
 			tc.edit(&cfg)
 			if _, err := New(cfg); !errors.Is(err, ErrConfig) {
 				t.Fatalf("New error = %v, want ErrConfig", err)
-			}
-		})
-	}
-}
-
-func TestNewAcceptsOnDeviceEndpoints(t *testing.T) {
-	for _, endpoint := range []string{
-		"fake://classifier",
-		"http://127.0.0.1:8080/v1/systemone",
-		"https://127.0.0.2/v1/systemone",
-		"http://localhost:8080/v1/systemone",
-		"HTTP://LOCALHOST:8080/v1/systemone",
-		"http://[::1]:8080/v1/systemone",
-	} {
-		t.Run(endpoint, func(t *testing.T) {
-			if _, err := New(Config{Mode: Hybrid, Edge: "edge", Cloud: "cloud", Classifier: &stub{endpoint: endpoint}}); err != nil {
-				t.Fatalf("New: %v", err)
-			}
-		})
-	}
-	// A hosted classifier may be anywhere.
-	if _, err := New(Config{Mode: Hybrid, Edge: "edge", Cloud: "cloud", Hosted: true, Classifier: &stub{endpoint: "https://api.typesafe.ai/v1/systemone"}}); err != nil {
-		t.Fatalf("New hosted: %v", err)
-	}
-}
-
-// TestNewRefusesEndpointsNotShownOnDevice covers the on-device check failing
-// closed: a classifier that is not Hosted must name an http or https URL on a
-// loopback host, or be the offline fake. A target without a scheme or host,
-// a resolver URL and any other scheme may reach another machine.
-func TestNewRefusesEndpointsNotShownOnDevice(t *testing.T) {
-	for _, endpoint := range []string{
-		"api.example.com",
-		"api.example.com:443",
-		"dns:///classifier.example.com:443",
-		"classifier.example.com/v1/systemone",
-		"",
-		"in-process",
-		"unix:///run/piccolo.sock",
-		"ftp://127.0.0.1/classifier",
-		"//api.example.com/v1",
-		"http:///v1/systemone",
-		"http://localhost.example.com/v1",
-		"http://127.0.0.1.nip.io/v1",
-		"http://localhost@api.example.com/v1",
-		"http://10.0.0.8:8080/v1",
-	} {
-		t.Run(endpoint, func(t *testing.T) {
-			_, err := New(Config{Mode: Hybrid, Edge: "edge", Cloud: "cloud", Classifier: &stub{endpoint: endpoint}})
-			if !errors.Is(err, ErrConfig) || !strings.Contains(err.Error(), "set Hosted") {
-				t.Fatalf("New error = %v, want ErrConfig with the hint to set Hosted", err)
-			}
-			if _, err := New(Config{Mode: Hybrid, Edge: "edge", Cloud: "cloud", Hosted: true, Classifier: &stub{endpoint: endpoint}}); err != nil {
-				t.Fatalf("the same classifier configured as Hosted: %v", err)
 			}
 		})
 	}
@@ -180,10 +123,6 @@ func TestNoCandidate(t *testing.T) {
 		{"all offline", func(in *thread.RouteRequest) {
 			in.Participants = []thread.RouteCandidate{edgeCand(false), cloudCand(false)}
 		}, "unavailable: cloud, edge"},
-		{"edge offline and query edge-only", func(in *thread.RouteRequest) {
-			in.Participants = []thread.RouteCandidate{edgeCand(false), cloudCand(true)}
-			in.Disclosure = thread.DiscloseEdgeOnly
-		}, "withheld because the query is edge-only: cloud"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -200,59 +139,6 @@ func TestNoCandidate(t *testing.T) {
 	}
 }
 
-func TestDisclosureRemovesCloud(t *testing.T) {
-	// CloudBased defaults to the cloud, so a hard edge decision shows that
-	// the cloud was removed.
-	r := newRouter(t, Config{Mode: CloudBased})
-	cases := []struct {
-		name       string
-		disclosure thread.Disclosure
-		tainted    bool
-		want       string
-		source     thread.RouteSource
-	}{
-		{"shared", thread.DiscloseShared, false, "cloud", thread.RouteDefault},
-		{"shared and tainted", thread.DiscloseShared, true, "cloud", thread.RouteDefault},
-		{"unclassified", thread.DiscloseUnclassified, false, "cloud", thread.RouteDefault},
-		{"unclassified and tainted", thread.DiscloseUnclassified, true, "edge", thread.RouteHard},
-		{"empty and tainted", "", true, "edge", thread.RouteHard},
-		{"empty", "", false, "cloud", thread.RouteDefault},
-		{"edge-only", thread.DiscloseEdgeOnly, false, "edge", thread.RouteHard},
-		{"unknown value fails closed", "secret", false, "edge", thread.RouteHard},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			in := request()
-			in.Disclosure = tc.disclosure
-			in.EdgeTainted = tc.tainted
-			d, err := r.Route(context.Background(), in)
-			if err != nil {
-				t.Fatalf("Route: %v", err)
-			}
-			if d.Target != tc.want || d.Source != tc.source {
-				t.Fatalf("decision = %+v, want %s from %s", d, tc.want, tc.source)
-			}
-			if d.Source == thread.RouteHard && !strings.Contains(d.Reason, "withheld cloud") {
-				t.Fatalf("reason %q should say the cloud was withheld", d.Reason)
-			}
-		})
-	}
-}
-
-func TestDisclosureRemovesEveryCloudZoneParticipant(t *testing.T) {
-	r := newRouter(t, Config{Mode: CloudBased})
-	in := request()
-	in.Disclosure = thread.DiscloseEdgeOnly
-	in.Participants = append(in.Participants, namedCand("lab", thread.ZoneCloud, true))
-	d, err := r.Route(context.Background(), in)
-	if err != nil {
-		t.Fatalf("Route: %v", err)
-	}
-	if d.Target != "edge" || d.Source != thread.RouteHard {
-		t.Fatalf("decision = %+v, want edge from hard", d)
-	}
-}
-
 func TestExplicit(t *testing.T) {
 	r := newRouter(t, Config{Mode: LocalBased})
 	t.Run("names a candidate", func(t *testing.T) {
@@ -261,24 +147,6 @@ func TestExplicit(t *testing.T) {
 		d, err := r.Route(context.Background(), in)
 		if err != nil || d.Target != "cloud" || d.Source != thread.RouteExplicit {
 			t.Fatalf("decision = %+v, err %v", d, err)
-		}
-	})
-	t.Run("names the cloud for an edge-only query", func(t *testing.T) {
-		in := request()
-		in.Explicit = "cloud"
-		in.Disclosure = thread.DiscloseEdgeOnly
-		_, err := r.Route(context.Background(), in)
-		if !errors.Is(err, thread.ErrNotAllowed) || !strings.Contains(err.Error(), "edge-only") {
-			t.Fatalf("err = %v, want ErrNotAllowed naming the reason", err)
-		}
-	})
-	t.Run("names the cloud while the edge is tainted", func(t *testing.T) {
-		in := request()
-		in.Explicit = "cloud"
-		in.Disclosure = thread.DiscloseUnclassified
-		in.EdgeTainted = true
-		if _, err := r.Route(context.Background(), in); !errors.Is(err, thread.ErrNotAllowed) {
-			t.Fatalf("err = %v, want ErrNotAllowed", err)
 		}
 	})
 	t.Run("names an unavailable participant", func(t *testing.T) {
@@ -300,7 +168,7 @@ func TestExplicit(t *testing.T) {
 	t.Run("names the only candidate", func(t *testing.T) {
 		in := request()
 		in.Explicit = "edge"
-		in.Disclosure = thread.DiscloseEdgeOnly
+		in.Participants = []thread.RouteCandidate{edgeCand(true), cloudCand(false)}
 		d, err := r.Route(context.Background(), in)
 		if err != nil || d.Target != "edge" || d.Source != thread.RouteHard {
 			t.Fatalf("decision = %+v, err %v", d, err)
@@ -388,7 +256,7 @@ func TestRules(t *testing.T) {
 		t.Fatalf("rules ran as %v", seen)
 	}
 
-	// A rule that names a withheld participant is ignored too.
+	// A rule that names an unavailable participant is ignored too.
 	r = newRouter(t, Config{
 		Mode:  LocalBased,
 		Rules: []Rule{rule("offline", "cloud", true)},
@@ -636,62 +504,6 @@ func TestLagLimit(t *testing.T) {
 	}
 }
 
-func TestHostedClassifierNotAskedAboutEdgeOnlyQuery(t *testing.T) {
-	rec := &recorder{inner: choiceFake("edge", 0.99)}
-	r := newRouter(t, Config{Mode: Hybrid, Classifier: rec, Hosted: true})
-	in := request()
-	in.Disclosure = thread.DiscloseEdgeOnly
-	// Two edge participants stay candidates, so only the hosted check stops
-	// the classifier.
-	in.Participants = append(in.Participants, namedCand("tablet", thread.ZoneEdge, true))
-	in.Owner = "tablet"
-	d, resp, err := r.Decide(context.Background(), in)
-	if err != nil {
-		t.Fatalf("Decide: %v", err)
-	}
-	if rec.calls() != 0 || resp != nil {
-		t.Fatalf("the hosted classifier was asked about an edge-only query")
-	}
-	if d.Target != "tablet" || d.Source != thread.RouteDefault || !strings.Contains(d.Reason, "hosted classifier is not asked") {
-		t.Fatalf("decision = %+v", d)
-	}
-
-	// A local classifier is asked.
-	rec = &recorder{inner: choiceFake("edge", 0.99)}
-	r = newRouter(t, Config{Mode: Hybrid, Classifier: rec})
-	if _, err := r.Route(context.Background(), in); err != nil {
-		t.Fatalf("Route: %v", err)
-	}
-	if rec.calls() != 1 {
-		t.Fatalf("a local classifier should be asked, got %d calls", rec.calls())
-	}
-}
-
-func TestHostedClassifierNeverSeesEdgeOnlyEntries(t *testing.T) {
-	recent := []thread.Entry{
-		{Seq: 1, Kind: thread.KindUserInput, Visibility: thread.Shared, Content: textBlocks("public question")},
-		{Seq: 2, Kind: thread.KindReply, Origin: thread.Origin{Participant: "edge", Path: "master"}, Visibility: thread.EdgeOnly, Content: textBlocks("secret diagnosis")},
-		{Seq: 3, Kind: thread.KindReport, Origin: thread.Origin{Participant: "edge"}, Content: textBlocks("unset visibility secret")},
-		{Seq: 4, Kind: thread.KindReply, Origin: thread.Origin{Participant: "cloud", Path: "master"}, Visibility: thread.Shared, Content: textBlocks("public answer")},
-	}
-	for _, hosted := range []bool{true, false} {
-		rec := &recorder{inner: choiceFake("cloud", 0.99)}
-		r := newRouter(t, Config{Classifier: rec, Hosted: hosted})
-		in := request()
-		in.Recent = recent
-		if _, err := r.Route(context.Background(), in); err != nil {
-			t.Fatalf("Route: %v", err)
-		}
-		state := string(rec.last(t).State)
-		if !strings.Contains(state, "public question") || !strings.Contains(state, "public answer") {
-			t.Fatalf("hosted %v: shared entries missing from %s", hosted, state)
-		}
-		if got := strings.Contains(state, "secret"); got == hosted {
-			t.Fatalf("hosted %v: state %s, edge-only content present = %v", hosted, state, got)
-		}
-	}
-}
-
 func TestModeDefaults(t *testing.T) {
 	both := []thread.RouteCandidate{edgeCand(true), cloudCand(true)}
 	cases := []struct {
@@ -790,7 +602,7 @@ func TestStateTrimmingIsInReason(t *testing.T) {
 	r := newRouter(t, Config{Mode: LocalBased, Classifier: rec, Budget: StateBudget{Query: 50, Participants: 100, Total: 400}})
 	in := request()
 	in.PeerSummary = strings.Repeat("summary words ", 200)
-	in.Recent = []thread.Entry{{Seq: 9, Kind: thread.KindUserInput, Visibility: thread.Shared, Content: textBlocks("hello there")}}
+	in.Recent = []thread.Entry{{Seq: 9, Kind: thread.KindUserInput, Content: textBlocks("hello there")}}
 	d, err := r.Route(context.Background(), in)
 	if err != nil {
 		t.Fatalf("Route: %v", err)

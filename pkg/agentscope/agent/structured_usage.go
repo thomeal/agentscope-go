@@ -63,7 +63,7 @@ func (a *UnifiedAgent) GenerateStructuredResponseWithUsage(ctx context.Context, 
 	if a.state.Summary != "" {
 		msgs = append(msgs, message.UserMsg(a.name, "[Previous context summary]: "+a.state.Summary))
 	}
-	msgs = append(msgs, threadPromptMsgs(a.name, a.state.PeerSummary, a.state.ThreadIndex)...)
+	msgs = append(msgs, threadPromptMsgs(a.name, a.state.PeerSummary)...)
 	if len(a.state.Plan) > 0 {
 		msgs = append(msgs, planPromptMsg(a.name, a.state.Plan))
 	}

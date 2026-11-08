@@ -51,8 +51,8 @@ func TestStoreAppendValidation(t *testing.T) {
 		want  string
 	}{
 		{"empty batch", nil, "at least one entry"},
-		{"unknown kind", []Entry{{Kind: "chat", Visibility: Shared}}, "unknown entry kind"},
-		{"tool call content", []Entry{{Kind: KindReply, Visibility: Shared, Content: []message.ContentBlock{message.ToolCallBlock{Name: "Read"}}}}, "may not hold"},
+		{"unknown kind", []Entry{{Kind: "chat"}}, "unknown entry kind"},
+		{"tool call content", []Entry{{Kind: KindReply, Content: []message.ContentBlock{message.ToolCallBlock{Name: "Read"}}}}, "may not hold"},
 		{"tool result content", []Entry{{Kind: KindReport, Content: []message.ContentBlock{&message.ToolResultBlock{Name: "Read"}}}}, "may not hold"},
 		{"thinking content", []Entry{{Kind: KindReport, Content: []message.ContentBlock{message.ThinkingBlock{Thinking: "hm"}}}}, "may not hold"},
 		{"redacted thinking content", []Entry{{Kind: KindReport, Content: []message.ContentBlock{message.RedactedThinkingBlock{Data: "x"}}}}, "may not hold"},
@@ -67,16 +67,15 @@ func TestStoreAppendValidation(t *testing.T) {
 		{"nil source pointer", []Entry{{Kind: KindReport, Content: []message.ContentBlock{message.DataBlock{Source: (*message.URLSource)(nil)}}}}, "cannot be stored"},
 		{"data without source", []Entry{{Kind: KindReport, Content: []message.ContentBlock{message.DataBlock{}}}}, "cannot be stored"},
 		{"data with string source", []Entry{{Kind: KindReport, Content: []message.ContentBlock{message.DataBlock{Source: "x"}}}}, "cannot be stored"},
-		{"owner change without owner", []Entry{{Kind: KindOwnerChange, Visibility: Shared}}, "owner_change needs"},
-		{"owner change without target", []Entry{{Kind: KindOwnerChange, Visibility: Shared, Owner: &OwnerChange{From: "edge"}}}, "owner_change needs"},
+		{"owner change without owner", []Entry{{Kind: KindOwnerChange}}, "owner_change needs"},
+		{"owner change without target", []Entry{{Kind: KindOwnerChange, Owner: &OwnerChange{From: "edge"}}}, "owner_change needs"},
 		{"summary without coverage", []Entry{{Kind: KindSummary, Summary: &SummaryMeta{Target: "edge"}}}, "needs a coverage"},
-		{"progress without run", []Entry{{Kind: KindProgress, Visibility: Shared, Content: textBlocks("1. [in_progress] x")}}, "needs the run"},
+		{"progress without run", []Entry{{Kind: KindProgress, Content: textBlocks("1. [in_progress] x")}}, "needs the run"},
 		{"summary without meta", []Entry{{Kind: KindSummary, Coverage: &Coverage{Through: 1}}}, "needs a target"},
 		{"summary without target", []Entry{{Kind: KindSummary, Coverage: &Coverage{Through: 1}, Summary: &SummaryMeta{}}}, "needs a target"},
 		{"assign without task", []Entry{{Kind: KindAssign}}, "assign needs"},
 		{"assign without id", []Entry{{Kind: KindAssign, Task: &Task{}}}, "assign needs"},
 		{"marker without payload", []Entry{{Kind: KindMarker}}, "marker needs"},
-		{"unknown visibility", []Entry{{Kind: KindReport, Visibility: "public"}}, "unknown visibility"},
 		{"invalid second entry", []Entry{report("edge", "ok"), {Kind: KindMarker}}, "batch entry 1"},
 		{"key repeated in batch", []Entry{withKey(report("edge", "a"), "k"), withKey(report("edge", "b"), "k")}, "repeats within the batch"},
 	}
@@ -95,24 +94,6 @@ func TestStoreAppendValidation(t *testing.T) {
 					t.Errorf("a rejected batch wrote entries: head %+v", h)
 				}
 			})
-		}
-	})
-}
-
-func TestStoreEmptyVisibilityIsEdgeOnly(t *testing.T) {
-	eachStore(t, func(t *testing.T, s Store) {
-		e := report("edge", "local")
-		e.Visibility = ""
-		mustAppend(t, s, nil, e)
-		got, ok, err := s.Get(context.Background(), 1)
-		if err != nil || !ok {
-			t.Fatalf("Get: %v %v", ok, err)
-		}
-		if got.Visibility != EdgeOnly {
-			t.Errorf("visibility %q, want %q", got.Visibility, EdgeOnly)
-		}
-		if cloud := mustRead(t, s, 0, Filter{Zone: ZoneCloud}, 0); len(cloud) != 0 {
-			t.Errorf("cloud read %d edge-only entries", len(cloud))
 		}
 	})
 }
@@ -179,8 +160,8 @@ func TestStoreGuard(t *testing.T) {
 		background := []Entry{
 			userInput("u"),
 			report("cloud", "r"),
-			{Kind: KindAssign, Visibility: Shared, Task: &Task{ID: "t-1"}, To: []string{"cloud"}},
-			{Kind: KindArtifact, Visibility: Shared, Refs: []ArtifactRef{{URI: "file:///a"}}},
+			{Kind: KindAssign, Task: &Task{ID: "t-1"}, To: []string{"cloud"}},
+			{Kind: KindArtifact, Refs: []ArtifactRef{{URI: "file:///a"}}},
 			{Kind: KindSummary, Coverage: &Coverage{Through: 2}, Summary: &SummaryMeta{Target: "edge"}},
 			{Kind: KindMarker, Marker: &Marker{Kind: MarkerRecovered}},
 		}
@@ -284,7 +265,7 @@ func TestStoreConcurrentAppends(t *testing.T) {
 					if _, err := s.Append(context.Background(), batch, nil); err != nil {
 						errs <- err
 					}
-					if _, err := s.Read(context.Background(), 0, Filter{Zone: ZoneCloud}, 5); err != nil {
+					if _, err := s.Read(context.Background(), 0, Filter{Kinds: []Kind{KindReport}}, 5); err != nil {
 						errs <- err
 					}
 				}
@@ -313,15 +294,13 @@ func TestStoreConcurrentAppends(t *testing.T) {
 
 func TestStoreReadFilters(t *testing.T) {
 	eachStore(t, func(t *testing.T, s Store) {
-		edgeOnly := report("edge", "private")
-		edgeOnly.Visibility = EdgeOnly
 		toCloud := report("edge", "for cloud")
 		toCloud.To = []string{"cloud"}
-		assign := Entry{Kind: KindAssign, Origin: Origin{Participant: "cloud"}, Visibility: Shared, Task: &Task{ID: "t"}, To: []string{"edge", "cloud"}}
+		assign := Entry{Kind: KindAssign, Origin: Origin{Participant: "cloud"}, Task: &Task{ID: "t"}, To: []string{"edge", "cloud"}}
 		mustAppend(t, s, &Guard{},
 			userInput("hello"),        // 1
 			replyFrom("cloud", "hi"),  // 2
-			edgeOnly,                  // 3
+			report("edge", "found"),   // 3
 			toCloud,                   // 4
 			assign,                    // 5
 			ownerChange("", "cloud"),  // 6
@@ -340,12 +319,10 @@ func TestStoreReadFilters(t *testing.T) {
 			{"after the end", 7, Filter{}, 0, nil},
 			{"far after the end", 1000, Filter{}, 0, nil},
 			{"limit", 1, Filter{}, 2, []uint64{2, 3}},
-			{"cloud zone", 0, Filter{Zone: ZoneCloud}, 0, []uint64{1, 2, 4, 5, 6, 7}},
-			{"edge zone", 0, Filter{Zone: ZoneEdge}, 0, []uint64{1, 2, 3, 4, 5, 6, 7}},
 			{"kinds", 0, Filter{Kinds: []Kind{KindReply, KindOwnerChange}}, 0, []uint64{2, 6, 7}},
 			{"to", 0, Filter{To: "cloud"}, 0, []uint64{4, 5}},
 			{"exclude origin", 0, Filter{ExcludeOrigin: "cloud"}, 0, []uint64{1, 3, 4, 6}},
-			{"combined with limit", 2, Filter{Zone: ZoneCloud, ExcludeOrigin: "edge"}, 2, []uint64{5, 6}},
+			{"combined with limit", 2, Filter{Kinds: []Kind{KindAssign, KindOwnerChange, KindReply}, ExcludeOrigin: "edge"}, 2, []uint64{5, 6}},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
@@ -378,10 +355,9 @@ func TestStoreGet(t *testing.T) {
 
 func richEntry() Entry {
 	return Entry{
-		Kind:       KindOwnerChange,
-		Origin:     Origin{Participant: "edge", Path: "master"},
-		To:         []string{"cloud"},
-		Visibility: Shared,
+		Kind:   KindOwnerChange,
+		Origin: Origin{Participant: "edge", Path: "master"},
+		To:     []string{"cloud"},
 		Content: []message.ContentBlock{
 			message.TextBlock{Type: "text", Text: "hand over"},
 			message.DataBlock{Type: "data", Source: map[string]any{"raw": "x"}},
@@ -396,7 +372,7 @@ func richEntry() Entry {
 			Refs: []ArtifactRef{{URI: "file:///b"}},
 		}},
 		Task:   &Task{ID: "t-1"},
-		Marker: &Marker{Kind: MarkerGap, Detail: "d"},
+		Marker: &Marker{Kind: MarkerRestarted, Detail: "d"},
 	}
 }
 

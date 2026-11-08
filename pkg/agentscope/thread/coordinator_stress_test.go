@@ -37,12 +37,12 @@ func checkOwnership(t *testing.T, env *coEnv) {
 	}
 }
 
-// checkNotStranded checks invariant 7 at idle: every task has its final
-// report, no Notify report the current owner may read is past its cursor or
-// still waits for a foreground activation of it, no user input waits unless
-// it is parked, and no user input was dropped: each one is answered (a
-// reply, marker or owner change is based on it), reached a participant that
-// may read it through an import or Pending, or still waits.
+// checkNotStranded checks invariant 6 at idle: every task has its final
+// report, no Notify report to the current owner is past its cursor or still
+// waits for a foreground activation of it, no user input waits unless it is
+// parked, and no user input was dropped: each one is answered (a reply,
+// marker or owner change is based on it), reached a participant through an
+// import or Pending, or still waits.
 func checkNotStranded(t *testing.T, env *coEnv, parts map[string]*fakePart) {
 	t.Helper()
 	log := env.log()
@@ -69,7 +69,7 @@ func checkNotStranded(t *testing.T, env *coEnv, parts map[string]*fakePart) {
 		cur := f.State().Cursor
 		for i := range log {
 			e := &log[i]
-			if e.Kind == KindReport && e.Notify && e.Addressed(owner) && e.Seq > cur && f.desc.Zone.CanRead(e.EffectiveVisibility()) {
+			if e.Kind == KindReport && e.Notify && e.Addressed(owner) && e.Seq > cur {
 				t.Errorf("notify report #%d to the idle owner %s is past its cursor %d", e.Seq, owner, cur)
 			}
 		}
@@ -100,13 +100,13 @@ func checkNotStranded(t *testing.T, env *coEnv, parts map[string]*fakePart) {
 			continue
 		}
 		reached := false
-		for name, f := range parts {
-			if f.desc.Zone.CanRead(e.EffectiveVisibility()) && containsText(imported[name], fmt.Sprintf("[#%d user]", e.Seq)) {
+		for name := range parts {
+			if containsText(imported[name], fmt.Sprintf("[#%d user]", e.Seq)) {
 				reached = true
 			}
 		}
 		if !reached {
-			t.Errorf("user input #%d was dropped: nothing answered it and no participant that may read it received it", e.Seq)
+			t.Errorf("user input #%d was dropped: nothing answered it and no participant received it", e.Seq)
 		}
 	}
 }
@@ -155,14 +155,14 @@ func TestCoordinatorNeverStranded(t *testing.T) {
 			edge, cloud := edgeCloud()
 			edge.script, cloud.script = randomScript(pick), randomScript(pick)
 			env := newCoEnv(t, nil, func(cfg *Config) {
-				cfg.Router = zoneRouter()
+				cfg.Router = cloudRouter()
 				cfg.Limits.MaxWakesPerQuery = 1000
 				cfg.Limits.MaxPendingInputs = 1000
 			}, edge, cloud)
 			for i := 0; i < 8; i++ {
 				q := Query{Text: fmt.Sprintf("query %d", i)}
 				if pick(4) == 0 {
-					q.Disclosure = DiscloseEdgeOnly
+					q.Explicit = "edge"
 				}
 				env.submit(q)
 				if pick(2) == 0 {
@@ -172,31 +172,14 @@ func TestCoordinatorNeverStranded(t *testing.T) {
 			env.idle()
 			checkNotStranded(t, env, map[string]*fakePart{"edge": edge, "cloud": cloud})
 			checkOwnership(t, env)
-			for _, s := range cloud.appliedSyncs() {
-				if containsText(syncTexts(&s), "query") && containsEdgeOnlyInput(env, syncTexts(&s)) {
-					t.Fatal("an edge-only query reached the cloud")
-				}
-			}
 		})
 	}
-}
-
-// containsEdgeOnlyInput reports whether texts render an edge-only user input.
-func containsEdgeOnlyInput(env *coEnv, texts []string) bool {
-	log := env.log()
-	for i := range log {
-		e := &log[i]
-		if e.Kind == KindUserInput && e.Visibility == EdgeOnly && containsText(texts, fmt.Sprintf("[#%d user]", e.Seq)) {
-			return true
-		}
-	}
-	return false
 }
 
 func TestCoordinatorConcurrentSubmits(t *testing.T) {
 	edge, cloud := edgeCloud()
 	env := newCoEnv(t, nil, func(cfg *Config) {
-		cfg.Router = zoneRouter()
+		cfg.Router = cloudRouter()
 		cfg.Limits.MaxPendingInputs = 200
 	}, edge, cloud)
 	var wg sync.WaitGroup
@@ -204,7 +187,7 @@ func TestCoordinatorConcurrentSubmits(t *testing.T) {
 		wg.Go(func() {
 			q := Query{Text: fmt.Sprintf("q%d", i)}
 			if i%5 == 0 {
-				q.Disclosure = DiscloseEdgeOnly
+				q.Explicit = "edge"
 			}
 			if _, err := env.c.Submit(t.Context(), q); err != nil {
 				t.Errorf("Submit: %v", err)
@@ -217,10 +200,5 @@ func TestCoordinatorConcurrentSubmits(t *testing.T) {
 	checkNotStranded(t, env, map[string]*fakePart{"edge": edge, "cloud": cloud})
 	if n := len(findEntries(env.log(), KindUserInput, "")); n != 40 {
 		t.Fatalf("%d user inputs", n)
-	}
-	for _, a := range cloud.activations() {
-		if a.Trigger.EffectiveVisibility() != Shared {
-			t.Fatalf("cloud triggered by %+v", a.Trigger)
-		}
 	}
 }

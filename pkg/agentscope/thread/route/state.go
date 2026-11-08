@@ -67,9 +67,6 @@ type StateStats struct {
 	QueryTokens, SummaryTokens, RecentTokens, ParticipantTokens, TotalTokens int
 	// QueryCut is set when the query was cut in the middle to Budget.Query.
 	QueryCut bool
-	// QueryWithheld is set when an edge-only query was left out because the
-	// classifier is hosted.
-	QueryWithheld bool
 	// SummaryStale is set when a stale summary was left out.
 	SummaryStale bool
 	// SummaryCut is set when the summary was cut in the middle to
@@ -84,9 +81,6 @@ type StateStats struct {
 	RecentKept int
 	// RecentFiltered counts entries of kinds the state never carries.
 	RecentFiltered int
-	// RecentWithheld counts edge-only entries left out because the classifier
-	// is hosted.
-	RecentWithheld int
 	// RecentDropped counts older entries that did not fit Budget.Recent.
 	RecentDropped int
 	// RecentDroppedForTotal counts entries dropped, oldest first, so the state
@@ -159,41 +153,35 @@ type stateParticipant struct {
 // BuildState builds the classifier state the router would send for in: a
 // JSON object with the query, the peer summary, recent entries and the
 // participants. It is deterministic: the same input gives the same bytes,
-// whatever the order of in.Participants. It reads cfg.Hosted, cfg.Budget and
-// cfg.Count only, filling zero budget fields and a nil counter with their
-// defaults.
+// whatever the order of in.Participants. It reads cfg.Budget and cfg.Count
+// only, filling zero budget fields and a nil counter with their defaults.
 //
-// A hosted classifier sees only shared entries, and an edge-only query is
-// left out. When the state is over Budget.Total, recent entries are dropped
-// oldest first, then the summary is cut in the middle, then left out. An
-// error means the state cannot fit even then.
+// When the state is over Budget.Total, recent entries are dropped oldest
+// first, then the summary is cut in the middle, then left out. An error
+// means the state cannot fit even then.
 func BuildState(cfg Config, in thread.RouteRequest) (json.RawMessage, StateStats, error) { //nolint:gocritic // value parameters keep the documented API
 	budget, err := cfg.Budget.withDefaults()
 	if err != nil {
 		return nil, StateStats{}, err
 	}
-	c := Config{Hosted: cfg.Hosted, Budget: budget, Count: cfg.Count}
+	c := Config{Budget: budget, Count: cfg.Count}
 	if c.Count == nil {
 		c.Count = defaultCount
 	}
-	return buildState(&c, &in, normalizeDisclosure(in.Disclosure))
+	return buildState(&c, &in)
 }
 
 // buildState expects a normalized budget and counter.
-func buildState(cfg *Config, in *thread.RouteRequest, disclosure thread.Disclosure) (json.RawMessage, StateStats, error) {
+func buildState(cfg *Config, in *thread.RouteRequest) (json.RawMessage, StateStats, error) {
 	var stats StateStats
 	count := cfg.Count
 	b := cfg.Budget
 	doc := stateDoc{Recent: []stateEntry{}}
 
-	if cfg.Hosted && disclosure == thread.DiscloseEdgeOnly {
-		stats.QueryWithheld = true
-	} else {
-		doc.Query = in.Query
-		if count(doc.Query) > b.Query {
-			doc.Query, _ = cutMiddle(doc.Query, func(s string) bool { return count(s) <= b.Query })
-			stats.QueryCut = true
-		}
+	doc.Query = in.Query
+	if count(doc.Query) > b.Query {
+		doc.Query, _ = cutMiddle(doc.Query, func(s string) bool { return count(s) <= b.Query })
+		stats.QueryCut = true
 	}
 
 	if in.PeerSummary != "" {
@@ -284,10 +272,6 @@ func recentEntries(cfg *Config, in *thread.RouteRequest, stats *StateStats) ([]s
 		e := &in.Recent[i]
 		if !recentKinds[e.Kind] {
 			stats.RecentFiltered++
-			continue
-		}
-		if cfg.Hosted && e.EffectiveVisibility() != thread.Shared {
-			stats.RecentWithheld++
 			continue
 		}
 		pool = append(pool, toStateEntry(e))
@@ -396,9 +380,13 @@ func participantList(in *thread.RouteRequest, count func(string) int, budget int
 	return parts, n, nil
 }
 
-// encode marshals v compactly without HTML escaping, so the classifier reads
-// "<" rather than "<".
-func encode(v any) ([]byte, error) {
+// encode is encodeJSON; tests replace it to make the state fail to encode.
+// Replacing it is safe only while no route test runs in parallel.
+var encode = encodeJSON
+
+// encodeJSON marshals v compactly without HTML escaping, so the classifier
+// reads "<" rather than "<".
+func encodeJSON(v any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)

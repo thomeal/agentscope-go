@@ -50,22 +50,21 @@ func TestBuildStateShape(t *testing.T) {
 	cloud.Lag = 3
 	in := thread.RouteRequest{
 		Query:        "Book a table <tonight> & pay",
-		Disclosure:   thread.DiscloseShared,
 		Owner:        "edge",
 		PeerSummary:  "User planned a trip.",
 		Participants: []thread.RouteCandidate{cloud, edgeCand(true, "device")},
 		Recent: []thread.Entry{
-			{Seq: 10, Kind: thread.KindUserInput, Visibility: thread.Shared, Content: textBlocks("Find flights")},
-			{Seq: 11, Kind: thread.KindReply, Origin: thread.Origin{Participant: "cloud", Path: "master"}, Visibility: thread.Shared,
+			{Seq: 10, Kind: thread.KindUserInput, Content: textBlocks("Find flights")},
+			{Seq: 11, Kind: thread.KindReply, Origin: thread.Origin{Participant: "cloud", Path: "master"},
 				Content: textBlocks("Found two."), Digest: &thread.ToolDigest{Calls: []thread.ToolCallDigest{{Name: "WebSearch", Args: `{"query":"x"}`}, {Name: "WebSearch", Args: `{"query":"y"}`}}}},
-			{Seq: 12, Kind: thread.KindSummary, Visibility: thread.Shared, Content: textBlocks("a summary entry")},
-			{Seq: 13, Kind: thread.KindMarker, Visibility: thread.Shared, Marker: &thread.Marker{Kind: thread.MarkerInterrupted}},
-			{Seq: 14, Kind: thread.KindOwnerChange, Visibility: thread.Shared, Owner: &thread.OwnerChange{From: "cloud", To: "edge", Reason: thread.ReasonRouter}},
-			{Seq: 15, Kind: thread.KindArtifact, Origin: thread.Origin{Participant: "edge"}, Visibility: thread.Shared,
+			{Seq: 12, Kind: thread.KindSummary, Content: textBlocks("a summary entry")},
+			{Seq: 13, Kind: thread.KindMarker, Marker: &thread.Marker{Kind: thread.MarkerInterrupted}},
+			{Seq: 14, Kind: thread.KindOwnerChange, Owner: &thread.OwnerChange{From: "cloud", To: "edge", Reason: thread.ReasonRouter}},
+			{Seq: 15, Kind: thread.KindArtifact, Origin: thread.Origin{Participant: "edge"},
 				Refs: []thread.ArtifactRef{{URI: "file://plan.md", Summary: "trip plan"}}},
-			{Seq: 16, Kind: thread.KindAssign, Origin: thread.Origin{Participant: "cloud", Path: "master"}, Visibility: thread.Shared,
+			{Seq: 16, Kind: thread.KindAssign, Origin: thread.Origin{Participant: "cloud", Path: "master"},
 				Content: textBlocks("Check the calendar"), Task: &thread.Task{ID: "t1"}},
-			{Seq: 17, Kind: thread.KindOwnerChange, Visibility: thread.Shared, Owner: &thread.OwnerChange{To: "cloud", Reason: thread.ReasonTransfer,
+			{Seq: 17, Kind: thread.KindOwnerChange, Owner: &thread.OwnerChange{To: "cloud", Reason: thread.ReasonTransfer,
 				Brief: &thread.Brief{Goal: "Pay", Remaining: []string{"pay the deposit"}}}},
 		},
 	}
@@ -97,7 +96,7 @@ func TestBuildStateDeterministic(t *testing.T) {
 	in := request()
 	in.PeerSummary = "summary"
 	for i := 1; i <= 20; i++ {
-		in.Recent = append(in.Recent, thread.Entry{Seq: uint64(i), Kind: thread.KindUserInput, Visibility: thread.Shared, Content: textBlocks(fmt.Sprintf("message %d", i))})
+		in.Recent = append(in.Recent, thread.Entry{Seq: uint64(i), Kind: thread.KindUserInput, Content: textBlocks(fmt.Sprintf("message %d", i))})
 	}
 	first, _ := mustBuild(t, Config{}, in)
 	again, _ := mustBuild(t, Config{}, in)
@@ -114,7 +113,7 @@ func TestBuildStateDeterministic(t *testing.T) {
 func TestBuildStateRecentBudget(t *testing.T) {
 	in := request()
 	for i := 1; i <= 30; i++ {
-		in.Recent = append(in.Recent, thread.Entry{Seq: uint64(i), Kind: thread.KindUserInput, Visibility: thread.Shared, Content: textBlocks(fmt.Sprintf("message number %02d", i))})
+		in.Recent = append(in.Recent, thread.Entry{Seq: uint64(i), Kind: thread.KindUserInput, Content: textBlocks(fmt.Sprintf("message number %02d", i))})
 	}
 	// Each entry encodes to 71 runes, 18 tokens: three fit in 60.
 	raw, stats := mustBuild(t, Config{Budget: StateBudget{Recent: 60}}, in)
@@ -129,7 +128,7 @@ func TestBuildStateRecentBudget(t *testing.T) {
 
 func TestBuildStateEntryText(t *testing.T) {
 	in := request()
-	in.Recent = []thread.Entry{{Seq: 1, Kind: thread.KindReport, Origin: thread.Origin{Participant: "edge"}, Visibility: thread.Shared, Content: textBlocks(strings.Repeat("é", 1000))}}
+	in.Recent = []thread.Entry{{Seq: 1, Kind: thread.KindReport, Origin: thread.Origin{Participant: "edge"}, Content: textBlocks(strings.Repeat("é", 1000))}}
 	raw, _ := mustBuild(t, Config{}, in)
 	s := decodeState(t, raw)
 	text := s.Recent[0].Text
@@ -182,7 +181,7 @@ func TestBuildStateTotalBudget(t *testing.T) {
 	in := request()
 	in.PeerSummary = "START " + strings.Repeat("summary words ", 300) + " END"
 	for i := 1; i <= 5; i++ {
-		in.Recent = append(in.Recent, thread.Entry{Seq: uint64(i), Kind: thread.KindUserInput, Visibility: thread.Shared, Content: textBlocks("question")})
+		in.Recent = append(in.Recent, thread.Entry{Seq: uint64(i), Kind: thread.KindUserInput, Content: textBlocks("question")})
 	}
 	budget := StateBudget{Query: 50, Participants: 100, Total: 400}
 	raw, stats := mustBuild(t, Config{Budget: budget}, in)
@@ -204,7 +203,7 @@ func TestBuildStateTotalBudget(t *testing.T) {
 	big := strings.Repeat("w", 1200)
 	in.Recent = nil
 	for i := 1; i <= 6; i++ {
-		in.Recent = append(in.Recent, thread.Entry{Seq: uint64(i), Kind: thread.KindUserInput, Visibility: thread.Shared, Content: textBlocks(big)})
+		in.Recent = append(in.Recent, thread.Entry{Seq: uint64(i), Kind: thread.KindUserInput, Content: textBlocks(big)})
 	}
 	raw, stats = mustBuild(t, Config{Budget: StateBudget{Query: 100, Participants: 100, Recent: 2000, Total: 700}}, in)
 	s = decodeState(t, raw)
@@ -233,48 +232,6 @@ func TestBuildStateSummaryDropped(t *testing.T) {
 	}
 	if !strings.Contains(stats.trimNote(), "left out the summary") {
 		t.Fatalf("note = %q", stats.trimNote())
-	}
-}
-
-func TestBuildStateHosted(t *testing.T) {
-	in := request()
-	in.Query = "my blood test results"
-	in.Recent = []thread.Entry{
-		{Seq: 1, Kind: thread.KindUserInput, Visibility: thread.Shared, Content: textBlocks("shared question")},
-		{Seq: 2, Kind: thread.KindReply, Origin: thread.Origin{Participant: "edge"}, Visibility: thread.EdgeOnly, Content: textBlocks("private reply")},
-		{Seq: 3, Kind: thread.KindReport, Origin: thread.Origin{Participant: "edge"}, Content: textBlocks("unset visibility")},
-	}
-	cases := []struct {
-		name       string
-		hosted     bool
-		disclosure thread.Disclosure
-		query      bool
-		seqs       []uint64
-	}{
-		{"hosted, edge-only query", true, thread.DiscloseEdgeOnly, false, []uint64{1}},
-		{"hosted, unknown disclosure", true, "secret", false, []uint64{1}},
-		{"hosted, shared query", true, thread.DiscloseShared, true, []uint64{1}},
-		{"hosted, unclassified query", true, "", true, []uint64{1}},
-		{"local, edge-only query", false, thread.DiscloseEdgeOnly, true, []uint64{1, 2, 3}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			in.Disclosure = tc.disclosure
-			raw, stats := mustBuild(t, Config{Hosted: tc.hosted}, in)
-			s := decodeState(t, raw)
-			if (s.Query != nil) != tc.query || stats.QueryWithheld == tc.query {
-				t.Fatalf("query present = %v, want %v (%s)", s.Query != nil, tc.query, raw)
-			}
-			if !tc.query && strings.Contains(string(raw), "blood") {
-				t.Fatalf("the withheld query leaked: %s", raw)
-			}
-			if got := recentSeqs(s); !slices.Equal(got, tc.seqs) {
-				t.Fatalf("recent seqs = %v, want %v", got, tc.seqs)
-			}
-			if wantWithheld := 3 - len(tc.seqs); stats.RecentWithheld != wantWithheld {
-				t.Fatalf("withheld %d, want %d", stats.RecentWithheld, wantWithheld)
-			}
-		})
 	}
 }
 
@@ -309,7 +266,7 @@ func TestBuildStateErrors(t *testing.T) {
 	}
 	in := request()
 	in.PeerSummary = "a summary"
-	in.Recent = []thread.Entry{{Seq: 1, Kind: thread.KindUserInput, Visibility: thread.Shared, Content: textBlocks("hi")}}
+	in.Recent = []thread.Entry{{Seq: 1, Kind: thread.KindUserInput, Content: textBlocks("hi")}}
 	_, _, err := BuildState(Config{Count: huge}, in)
 	if err == nil || !strings.Contains(err.Error(), "over the total budget") {
 		t.Fatalf("an unfittable state: %v", err)
@@ -326,5 +283,38 @@ func TestCutHelpers(t *testing.T) {
 	}
 	if cutEnd("short", 10) != "short" || cutEnd("abcdef", 4) != "abc…" {
 		t.Fatal("cutEnd")
+	}
+}
+
+// TestBuildStateReportsEncodeFailures: whichever encoding fails (a recent
+// entry, the participant list, the total or the final document), the build
+// returns the error and no state.
+func TestBuildStateReportsEncodeFailures(t *testing.T) {
+	defer func(orig func(any) ([]byte, error)) { encode = orig }(encode)
+	in := request()
+	in.PeerSummary = "User planned a trip."
+	in.Recent = []thread.Entry{{Seq: 10, Kind: thread.KindUserInput, Content: textBlocks("Find flights")}}
+	boom := errors.New("boom")
+	for fail := 1; ; fail++ {
+		calls := 0
+		encode = func(v any) ([]byte, error) {
+			if calls++; calls == fail {
+				return nil, boom
+			}
+			return encodeJSON(v)
+		}
+		raw, _, err := BuildState(Config{}, in)
+		if calls < fail {
+			if err != nil || raw == nil {
+				t.Fatalf("with no failure: %v", err)
+			}
+			if fail < 5 {
+				t.Fatalf("the build made only %d encodings", calls)
+			}
+			return
+		}
+		if !errors.Is(err, boom) || raw != nil {
+			t.Fatalf("encoding %d failed: raw=%s err=%v", fail, raw, err)
+		}
 	}
 }

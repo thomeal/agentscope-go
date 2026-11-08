@@ -33,8 +33,8 @@ const (
 	KindReport Kind = "report"
 	// KindArtifact records an artifact reference. It wakes nobody.
 	KindArtifact Kind = "artifact"
-	// KindMarker records an interruption, a recovery, unknown effects, a
-	// projection gap or the absence of an owner.
+	// KindMarker records an interruption, a recovery, unknown effects or the
+	// absence of an owner.
 	KindMarker Kind = "marker"
 	// KindProgress is a run's plan as its agent's newest plan_updated event
 	// left it: what the run had done and meant to do next. It wakes nobody.
@@ -44,34 +44,15 @@ const (
 	KindProgress Kind = "progress"
 )
 
-// Visibility controls which participants may receive an entry.
-type Visibility string
-
-const (
-	// Shared entries may enter any participant's requests.
-	Shared Visibility = "shared"
-	// EdgeOnly entries never enter a cloud request. An entry with an empty
-	// visibility is treated as EdgeOnly.
-	EdgeOnly Visibility = "edge_only"
-)
-
-// Zone is a participant's trust zone.
+// Zone is where a participant runs. Every participant reads every entry.
 type Zone string
 
 const (
-	// ZoneEdge runs on the device and may read every entry.
+	// ZoneEdge runs on the device, with a small window.
 	ZoneEdge Zone = "edge"
-	// ZoneCloud runs off the device and reads Shared entries only.
+	// ZoneCloud runs off the device.
 	ZoneCloud Zone = "cloud"
 )
-
-// CanRead reports whether a participant in zone z may receive the entry.
-func (z Zone) CanRead(v Visibility) bool {
-	if z == ZoneEdge {
-		return true
-	}
-	return v == Shared
-}
 
 // Origin identifies who produced an entry: a participant and the agent path
 // inside it, such as cloud/master. The user and the Coordinator have an
@@ -220,7 +201,8 @@ type ArtifactRef struct {
 
 // Coverage is the range a summary covers, recorded by the Coordinator before
 // the fork, never inferred from messages or the model. Every entry with
-// Seq <= Through is in the snapshot except the ones listed in Excluded.
+// Seq <= Through is in the snapshot except the ones listed in Excluded:
+// entries of other participants past the snapshot's cursor.
 type Coverage struct {
 	Through  uint64   `json:"through"`
 	Excluded []uint64 `json:"excluded,omitempty"`
@@ -258,21 +240,15 @@ const (
 	// carries the host's account (Config.RecoveryNote).
 	MarkerRestarted MarkerKind = "restarted"
 	// MarkerFailed records an activation that ended with an error, and why.
-	// An edge error's own text is left out, since it may name private data.
 	MarkerFailed MarkerKind = "failed"
 	// MarkerUnknownEffects records that tools may have run with no recorded
 	// result, so the next owner must check state before repeating them.
 	MarkerUnknownEffects MarkerKind = "unknown_effects"
-	// MarkerGap records entries a projection withheld.
-	MarkerGap MarkerKind = "gap"
 	// MarkerNoOwner records that no participant can take the foreground.
 	MarkerNoOwner MarkerKind = "no_owner"
 	// MarkerRejected records late output from a participant that was no
 	// longer the owner. The text is kept as a report.
 	MarkerRejected MarkerKind = "rejected_output"
-	// MarkerSetting records a change to a host-held switch, such as letting
-	// the cloud read edge tool results.
-	MarkerSetting MarkerKind = "setting"
 )
 
 // Marker is the payload of a marker entry.
@@ -291,22 +267,21 @@ type Task struct {
 // Entry is one record in the Main Thread. Content never holds tool calls,
 // tool results or thinking.
 type Entry struct {
-	Seq        uint64                 `json:"seq"`
-	Epoch      uint64                 `json:"epoch"`
-	Kind       Kind                   `json:"kind"`
-	Origin     Origin                 `json:"origin"`
-	To         []string               `json:"to,omitempty"`
-	Visibility Visibility             `json:"visibility"`
-	BasedOn    uint64                 `json:"based_on,omitempty"`
-	Content    []message.ContentBlock `json:"-"`
-	Digest     *ToolDigest            `json:"digest,omitempty"`
-	Refs       []ArtifactRef          `json:"refs,omitempty"`
-	Coverage   *Coverage              `json:"coverage,omitempty"`
-	Summary    *SummaryMeta           `json:"summary,omitempty"`
-	Owner      *OwnerChange           `json:"owner,omitempty"`
-	Task       *Task                  `json:"task,omitempty"`
-	Marker     *Marker                `json:"marker,omitempty"`
-	Notify     bool                   `json:"notify,omitempty"`
+	Seq      uint64                 `json:"seq"`
+	Epoch    uint64                 `json:"epoch"`
+	Kind     Kind                   `json:"kind"`
+	Origin   Origin                 `json:"origin"`
+	To       []string               `json:"to,omitempty"`
+	BasedOn  uint64                 `json:"based_on,omitempty"`
+	Content  []message.ContentBlock `json:"-"`
+	Digest   *ToolDigest            `json:"digest,omitempty"`
+	Refs     []ArtifactRef          `json:"refs,omitempty"`
+	Coverage *Coverage              `json:"coverage,omitempty"`
+	Summary  *SummaryMeta           `json:"summary,omitempty"`
+	Owner    *OwnerChange           `json:"owner,omitempty"`
+	Task     *Task                  `json:"task,omitempty"`
+	Marker   *Marker                `json:"marker,omitempty"`
+	Notify   bool                   `json:"notify,omitempty"`
 	// Run is set on a progress entry: the ID of the activation it reports on.
 	Run string `json:"run,omitempty"`
 	// Steered lists, on the entry that ends a run, the user inputs the run
@@ -318,16 +293,9 @@ type Entry struct {
 	// recovery takes none of them for an open request; after a failure or
 	// an interrupt they share the fate of the run's request. A failed wake
 	// queues them again; an interrupted one ends them.
-	Steered []uint64 `json:"steered,omitempty"`
-	// Tainted is set when the writer had read an untrusted source, so the
-	// content may carry injected instructions.
-	Tainted bool `json:"tainted,omitempty"`
-	// Disclosure is set on a user_input entry: the query's disclosure as
-	// Submit resolved it. Recovery restores a waiting input with it, so an
-	// unclassified query keeps the routing-time taint check after a restart.
-	Disclosure Disclosure `json:"disclosure,omitempty"`
-	DedupKey   string     `json:"dedup_key,omitempty"`
-	Time       time.Time  `json:"time"`
+	Steered  []uint64  `json:"steered,omitempty"`
+	DedupKey string    `json:"dedup_key,omitempty"`
+	Time     time.Time `json:"time"`
 }
 
 // Text joins the entry's text blocks.
@@ -344,14 +312,6 @@ func (e *Entry) Text() string {
 // Addressed reports whether the entry names participant p as a recipient.
 func (e *Entry) Addressed(p string) bool {
 	return slices.Contains(e.To, p)
-}
-
-// EffectiveVisibility treats an unset visibility as EdgeOnly.
-func (e *Entry) EffectiveVisibility() Visibility {
-	if e.Visibility == Shared {
-		return Shared
-	}
-	return EdgeOnly
 }
 
 // entryAlias is Entry without its JSON methods.

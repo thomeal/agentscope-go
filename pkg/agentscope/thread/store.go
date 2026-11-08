@@ -25,9 +25,6 @@ type Head struct {
 
 // Filter narrows a Read. Zero values mean no filter.
 type Filter struct {
-	// Zone keeps only entries a participant in this zone may read, judged
-	// with Zone.CanRead and the entry's EffectiveVisibility.
-	Zone Zone
 	// Kinds keeps only entries of these kinds.
 	Kinds []Kind
 	// To keeps only entries whose To names this participant.
@@ -37,9 +34,6 @@ type Filter struct {
 }
 
 func (f *Filter) matches(e *Entry) bool {
-	if f.Zone != "" && !f.Zone.CanRead(e.EffectiveVisibility()) {
-		return false
-	}
 	if len(f.Kinds) > 0 && !slices.Contains(f.Kinds, e.Kind) {
 		return false
 	}
@@ -228,9 +222,6 @@ func (s *logState) replay(batch []Entry) error {
 		if err := validateEntry(e); err != nil {
 			return fmt.Errorf("entry %d: %w", e.Seq, err)
 		}
-		if e.Visibility == "" {
-			e.Visibility = EdgeOnly
-		}
 		seq++
 		if e.Seq != seq {
 			return fmt.Errorf("entry has seq %d, want %d", e.Seq, seq)
@@ -309,22 +300,14 @@ func validateEntry(e *Entry) error {
 	default:
 		return fmt.Errorf("thread: unknown entry kind %q", e.Kind)
 	}
-	switch e.Visibility {
-	case "", Shared, EdgeOnly:
-	default:
-		return fmt.Errorf("thread: unknown visibility %q", e.Visibility)
-	}
 	return ValidateContent(e.Content)
 }
 
 // normalizeEntry returns a deep copy of a validated entry in the form the
-// log stores: EdgeOnly for an empty visibility and value content blocks
-// with their type tags set, so the copy survives a JSON round trip.
+// log stores: value content blocks with their type tags set, so the copy
+// survives a JSON round trip.
 func normalizeEntry(e *Entry) (Entry, error) {
 	c := cloneEntry(e)
-	if c.Visibility == "" {
-		c.Visibility = EdgeOnly
-	}
 	blocks, err := normalizeBlocks(e.Content)
 	if err != nil {
 		return Entry{}, err

@@ -71,7 +71,7 @@ func (a *UnifiedAgent) maybeArmPrecompress(ctx context.Context, cfg *ContextConf
 	prevSummary := a.state.Summary
 	systemPrompt := a.systemPrompt
 	plan := append([]tool.PlanItem(nil), a.state.Plan...)
-	thread := threadPromptMsgs(a.name, a.state.PeerSummary, a.state.ThreadIndex)
+	thread := threadPromptMsgs(a.name, a.state.PeerSummary)
 	a.precompressRunning = true
 	a.mu.Unlock()
 

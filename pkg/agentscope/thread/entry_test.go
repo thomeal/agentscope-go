@@ -11,13 +11,12 @@ import (
 
 func TestEntryJSONRoundTrip(t *testing.T) {
 	in := Entry{
-		Seq:        7,
-		Epoch:      2,
-		Kind:       KindReply,
-		Origin:     Origin{Participant: "cloud", Path: "master"},
-		To:         []string{"edge"},
-		Visibility: Shared,
-		BasedOn:    5,
+		Seq:     7,
+		Epoch:   2,
+		Kind:    KindReply,
+		Origin:  Origin{Participant: "cloud", Path: "master"},
+		To:      []string{"edge"},
+		BasedOn: 5,
 		Content: []message.ContentBlock{
 			message.TextBlock{Type: "text", ID: "t1", Text: "here is the chart"},
 			message.DataBlock{Type: "data", ID: "d1", Name: "chart.png", Source: message.Base64Source{Type: "base64", Data: "aGk=", MediaType: "image/png"}},
@@ -31,7 +30,6 @@ func TestEntryJSONRoundTrip(t *testing.T) {
 		Task:     &Task{ID: "t-3", Notify: true},
 		Marker:   &Marker{Kind: MarkerUnknownEffects, Detail: "d"},
 		Notify:   true,
-		Tainted:  true,
 		DedupKey: "k",
 		Time:     testTime,
 	}
@@ -90,15 +88,6 @@ func TestEntryHelpers(t *testing.T) {
 	}
 	if !e.Addressed("edge") || e.Addressed("cloud") {
 		t.Error("Addressed")
-	}
-	for v, want := range map[Visibility]Visibility{"": EdgeOnly, EdgeOnly: EdgeOnly, Shared: Shared, "other": EdgeOnly} {
-		e.Visibility = v
-		if got := e.EffectiveVisibility(); got != want {
-			t.Errorf("EffectiveVisibility(%q) = %q, want %q", v, got, want)
-		}
-	}
-	if !ZoneEdge.CanRead(EdgeOnly) || !ZoneEdge.CanRead(Shared) || ZoneCloud.CanRead(EdgeOnly) || !ZoneCloud.CanRead(Shared) {
-		t.Error("CanRead")
 	}
 	for o, want := range map[Origin]string{{}: "coordinator", {Participant: "edge"}: "edge", {Participant: "cloud", Path: "master"}: "cloud/master"} {
 		if got := o.String(); got != want {

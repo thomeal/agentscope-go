@@ -22,10 +22,8 @@
 //  3. The current owner is the target of the last owner_change entry.
 //  4. Only the current owner's foreground activation reaches the user. Writes
 //     the user can see carry a Guard with the owner and epoch.
-//  5. edge_only entries never enter a cloud request; projections leave a gap
-//     marker instead.
-//  6. A participant's cursor and the content imported up to it are updated in
+//  5. A participant's cursor and the content imported up to it are updated in
 //     one state change and one checkpoint.
-//  7. Entries are never stranded: after every activation the Coordinator
+//  6. Entries are never stranded: after every activation the Coordinator
 //     checks for entries addressed to the participant past its cursor.
 package thread

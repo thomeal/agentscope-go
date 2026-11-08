@@ -10,30 +10,26 @@ import (
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope"
 )
 
-// maybeStartCycleLocked starts a query cycle when the foreground is free:
-// for the oldest skipped input (one a cycle for a newer input could not
-// carry), else for the newest undelivered, unparked input. Older inputs stay
-// queued until the cycle's owner is known: those it may read are then
-// dropped as context its activation imports, the others start their own
-// cycle afterwards.
+// maybeStartCycleLocked starts a query cycle for the newest undelivered,
+// unparked input when the foreground is free. Older inputs stay queued until
+// the cycle's owner is known; they are then dropped as context its
+// activation imports.
 func (c *Coordinator) maybeStartCycleLocked() {
 	if c.closed || c.fg != nil || c.routing {
 		return
 	}
-	idx := slices.IndexFunc(c.inputs, func(r *inputRec) bool { return r.skipped && !r.parked })
-	if idx < 0 {
-		for i := len(c.inputs) - 1; i >= 0; i-- {
-			if !c.inputs[i].parked {
-				idx = i
-				break
-			}
+	idx := -1
+	for i := len(c.inputs) - 1; i >= 0; i-- {
+		if !c.inputs[i].parked {
+			idx = i
+			break
 		}
 	}
 	if idx < 0 {
 		return
 	}
 	in := c.inputs[idx]
-	c.cycle = cycleState{input: in.entry.Seq, text: in.entry.Text(), disclosure: in.q.Disclosure}
+	c.cycle = cycleState{input: in.entry.Seq, text: in.entry.Text()}
 	c.routing = true
 	ctx, cancel := context.WithCancel(c.ctx)
 	c.fgCancel = cancel
@@ -56,8 +52,8 @@ func (c *Coordinator) waitingInputsLocked() int {
 
 // parkLocked parks in until a later cycle carries it, and retires the oldest
 // parked inputs beyond MaxPendingInputs: they stay in the log as context, so
-// nothing is lost, but they no longer wait (an edge-only input parked while
-// no edge could take it would otherwise wait for an edge cycle forever).
+// nothing is lost, but they no longer wait (an input parked while no
+// participant could take it would otherwise wait forever).
 func (c *Coordinator) parkLocked(in *inputRec) {
 	in.parked = true
 	parked := 0
@@ -103,24 +99,16 @@ func (c *Coordinator) olderInputsLocked(in *inputRec) []*inputRec {
 }
 
 // dropContextInputsLocked settles the inputs older than in once its cycle
-// went to ps: those ps may read are dropped, because its activation imports
-// them, and returned so the entry that ends its run records them
-// (Entry.Steered); an unparked one it may not read is skipped and starts its
-// own cycle later, so it is never dropped unanswered.
-func (c *Coordinator) dropContextInputsLocked(in *inputRec, ps *partState) []*inputRec {
+// started: they are dropped, because its activation imports them, and
+// returned so the entry that ends its run records them (Entry.Steered).
+func (c *Coordinator) dropContextInputsLocked(in *inputRec) []*inputRec {
 	var dropped []*inputRec
 	c.inputs = slices.DeleteFunc(c.inputs, func(r *inputRec) bool {
 		if r.entry.Seq >= in.entry.Seq {
 			return false
 		}
-		if ps.desc.Zone.CanRead(r.entry.EffectiveVisibility()) {
-			dropped = append(dropped, r)
-			return true
-		}
-		if !r.parked {
-			r.skipped = true
-		}
-		return false
+		dropped = append(dropped, r)
+		return true
 	})
 	return dropped
 }
@@ -187,10 +175,9 @@ func (c *Coordinator) finishRoutingLocked(ctx context.Context, in *inputRec, dec
 		// Based on the input, so recovery knows which request the new
 		// owner was answering.
 		oc := Entry{
-			Kind:       KindOwnerChange,
-			Visibility: Shared,
-			BasedOn:    seq,
-			Owner:      &OwnerChange{From: c.owner, To: dec.Target, Reason: ReasonRouter},
+			Kind:    KindOwnerChange,
+			BasedOn: seq,
+			Owner:   &OwnerChange{From: c.owner, To: dec.Target, Reason: ReasonRouter},
 		}
 		if c.commitLocked("", []Entry{oc}, &Guard{Owner: c.owner, Epoch: c.epoch}) == nil {
 			c.parkLocked(in)
@@ -199,7 +186,7 @@ func (c *Coordinator) finishRoutingLocked(ctx context.Context, in *inputRec, dec
 		}
 	}
 	c.removeInputLocked(in)
-	carried := c.dropContextInputsLocked(in, ps)
+	carried := c.dropContextInputsLocked(in)
 	a := c.newActivationLocked(ps, actUser, &in.entry, true, 0)
 	a.cycleInput = seq
 	a.steered = carried
@@ -225,7 +212,6 @@ func (c *Coordinator) routeRequest(ctx context.Context, in *inputRec) (RouteRequ
 	req := RouteRequest{
 		OperationID: in.q.OperationID,
 		Query:       in.entry.Text(),
-		Disclosure:  in.q.Disclosure,
 		Owner:       owner,
 		Explicit:    in.q.Explicit,
 		NeedsGroups: slices.Clone(in.q.NeedsGroups),
@@ -234,17 +220,13 @@ func (c *Coordinator) routeRequest(ctx context.Context, in *inputRec) (RouteRequ
 	for _, ps := range c.order {
 		ok := c.available(ps.name)
 		avail[ps.name] = ok
-		st := ps.p.State()
-		lag, _ := c.countReadable(ctx, ps.desc.Zone, st.Cursor, false)
+		lag, _ := c.countAfter(ctx, ps.p.State().Cursor, false)
 		req.Participants = append(req.Participants, RouteCandidate{Descriptor: cloneDescriptor(&ps.desc), Available: ok, Lag: uint64(lag)})
-		if ps.name == c.edge {
-			req.EdgeTainted = st.Tainted
-		}
 	}
 	if edge := c.parts[c.edge]; edge != nil {
 		if s := c.newestSummary(ctx, edge.name); s != nil {
 			req.PeerSummary = s.Text()
-			n, _ := c.countReadable(ctx, edge.desc.Zone, s.Coverage.Through, true)
+			n, _ := c.countAfter(ctx, s.Coverage.Through, true)
 			req.SummaryStale = n > c.cfg.Import.StaleAfter
 		}
 	}
@@ -260,10 +242,9 @@ func (c *Coordinator) routeRequest(ctx context.Context, in *inputRec) (RouteRequ
 	return req, avail
 }
 
-// countReadable counts the entries after seq a zone may read, leaving out
-// summaries when asked.
-func (c *Coordinator) countReadable(ctx context.Context, z Zone, after uint64, skipSummaries bool) (int, error) {
-	entries, err := c.store.Read(ctx, after, Filter{Zone: z}, 0)
+// countAfter counts the entries after seq, leaving out summaries when asked.
+func (c *Coordinator) countAfter(ctx context.Context, after uint64, skipSummaries bool) (int, error) {
+	entries, err := c.store.Read(ctx, after, Filter{}, 0)
 	if err != nil {
 		return 0, err
 	}
@@ -299,9 +280,9 @@ func newestSummaryFor(entries []Entry, target string) *Entry {
 }
 
 // route asks the router and checks its answer. A router error other than
-// ErrNoCandidate or ErrNotAllowed, or a target that is unknown, unavailable
-// or may not take the query, falls back to the default rule. The error is
-// non-nil only when no participant may take the query or ctx ended.
+// ErrNoCandidate or ErrNotAllowed, or a target that is unknown or
+// unavailable, falls back to the default rule. The error is non-nil only
+// when no participant may take the query or ctx ended.
 func (c *Coordinator) route(ctx context.Context, req *RouteRequest, avail map[string]bool) (RouteDecision, error) {
 	if c.cfg.Router == nil {
 		return c.defaultRoute(req, avail)
@@ -309,10 +290,10 @@ func (c *Coordinator) route(ctx context.Context, req *RouteRequest, avail map[st
 	dec, err := c.cfg.Router.Route(ctx, *req)
 	switch {
 	case err == nil:
-		if c.validTarget(dec.Target, req, avail) {
+		if c.validTarget(dec.Target, avail) {
 			return dec, nil
 		}
-		agentscope.Log().WithField("target", dec.Target).Warn("thread: router chose a participant that may not take the query; using the default rule")
+		agentscope.Log().WithField("target", dec.Target).Warn("thread: router chose an unknown or unavailable participant; using the default rule")
 	case errors.Is(err, ErrNoCandidate), errors.Is(err, ErrNotAllowed):
 		return dec, err
 	case ctx.Err() != nil:
@@ -325,27 +306,27 @@ func (c *Coordinator) route(ctx context.Context, req *RouteRequest, avail map[st
 	return fb, ferr
 }
 
-// validTarget reports whether name may own the query now.
-func (c *Coordinator) validTarget(name string, req *RouteRequest, avail map[string]bool) bool {
-	ps := c.parts[name]
-	return ps != nil && avail[name] && mayTake(ps.desc.Zone, req.Disclosure, req.EdgeTainted)
+// validTarget reports whether name may own the query now: it is registered
+// and available.
+func (c *Coordinator) validTarget(name string, avail map[string]bool) bool {
+	return c.parts[name] != nil && avail[name]
 }
 
 // defaultRoute is the rule without a router: the participant the user named
-// when it may take the query, else the owner when it may, else the first
-// available participant that may.
+// when it is available, else the owner when it is, else the first available
+// participant.
 func (c *Coordinator) defaultRoute(req *RouteRequest, avail map[string]bool) (RouteDecision, error) {
 	if req.Explicit != "" {
-		if c.validTarget(req.Explicit, req, avail) {
+		if c.validTarget(req.Explicit, avail) {
 			return RouteDecision{Target: req.Explicit, Source: RouteExplicit, Reason: "named by the user", Confidence: 1}, nil
 		}
 		return RouteDecision{}, fmt.Errorf("%w: %q", ErrNotAllowed, req.Explicit)
 	}
-	if req.Owner != "" && c.validTarget(req.Owner, req, avail) {
+	if req.Owner != "" && c.validTarget(req.Owner, avail) {
 		return RouteDecision{Target: req.Owner, Source: RouteDefault, Reason: "stay with the owner", Confidence: 1}, nil
 	}
 	for _, ps := range c.order {
-		if c.validTarget(ps.name, req, avail) {
+		if c.validTarget(ps.name, avail) {
 			return RouteDecision{Target: ps.name, Source: RouteDefault, Reason: "first available participant", Confidence: 1}, nil
 		}
 	}

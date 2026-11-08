@@ -132,16 +132,12 @@ func (s *failSaver) SaveState(ctx context.Context, id string, st *agent.AgentSta
 func TestSettleFailuresAreReported(t *testing.T) {
 	saver := &failSaver{memSaver: newMemSaver()}
 	saver.fail.Store(true)
-	// Taint without a boundary reaches the agent only after the reply.
+	// The agent does not save after a final answer: the first save is the
+	// one after the reply.
 	f := newFixture(t, fixtureOptions{
-		noPrep: true,
-		cfg:    AgentConfig{TaintingTools: []string{"web_fetch"}},
-		tools:  []tool.Tool{textTool("web_fetch", "payload")},
-		agent:  []agent.AgentOption{agent.WithStateSaver(saver)},
-		respond: steps(
-			resp("", call("c1", "web_fetch", map[string]any{"url": "u"})),
-			textResp("done"),
-		),
+		noPrep:  true,
+		agent:   []agent.AgentOption{agent.WithStateSaver(saver)},
+		respond: steps(textResp("done")),
 	})
 	_, end := activate(t, f.p, foreground(1, "fetch"), nil)
 	if end.Err == nil || !strings.Contains(end.Err.Error(), "update the agent after the reply") || !strings.Contains(end.Err.Error(), "disk full") {
@@ -196,11 +192,11 @@ func TestSettleFailuresAreReported(t *testing.T) {
 }
 
 // TestInputEstimates covers the rough input estimate a team participant
-// reports before its first master: text, tool calls and results, thinking,
-// summaries and the index count; a reset starts the estimate over.
+// reports before its first master: text, tool calls and results, thinking
+// and summaries count; a reset starts the estimate over.
 func TestInputEstimates(t *testing.T) {
 	st := &agent.AgentState{
-		Summary: "ssss", ThreadIndex: "iiii", PeerSummary: &agent.PeerSummary{Text: "pppp"},
+		Summary: "ssss", PeerSummary: &agent.PeerSummary{Text: "pppp"},
 		Context: []*message.Msg{
 			nil,
 			message.UserMsg("user", "uuuu"),
@@ -211,11 +207,10 @@ func TestInputEstimates(t *testing.T) {
 			message.NewMsg("a", message.RoleUser, []message.ContentBlock{message.ToolResultBlock{Type: "tool_result", ID: "1", Name: "ab", Output: "rrrr"}}),
 		},
 	}
-	if n := stateTokens(st); n != 7 { // 28 characters
+	if n := stateTokens(st); n != 6 { // 24 characters
 		t.Fatalf("state estimate = %d", n)
 	}
-	idx := "iiii"
-	if n := updateTokens(&agent.ThreadUpdate{Index: &idx, PeerSummary: &agent.PeerSummary{Text: "pppp"}, Messages: []*message.Msg{message.UserMsg("u", "mmmm")}}); n != 3 {
+	if n := updateTokens(&agent.ThreadUpdate{PeerSummary: &agent.PeerSummary{Text: "pppp"}, Messages: []*message.Msg{message.UserMsg("u", "mmmm")}}); n != 2 {
 		t.Fatalf("update estimate = %d", n)
 	}
 
@@ -276,13 +271,14 @@ func (s *gateSaver) SaveState(ctx context.Context, id string, st *agent.AgentSta
 func TestSubmitUserConfirmAfterCancelIsNotDelivered(t *testing.T) {
 	saver := newGateSaver()
 	defer saver.release()
+	// In the default mode a host tool without an allow rule asks first.
 	f := newFixture(t, fixtureOptions{
-		cfg:   AgentConfig{TaintingTools: []string{"web_fetch"}},
+		mode:  permission.ModeDefault,
 		tools: []tool.Tool{textTool("web_fetch", "payload")},
 		agent: []agent.AgentOption{agent.WithStateSaver(saver)},
 		respond: steps(
 			resp("", call("c1", "web_fetch", map[string]any{"url": "u"})),
-			resp("", call("c2", ToolTransfer, transferArgs("edge"))),
+			textResp("must not be called"),
 		),
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -315,8 +311,8 @@ func TestSubmitUserConfirmAfterCancelIsNotDelivered(t *testing.T) {
 	if !errors.Is(submitErr, context.Canceled) || took > submitTimeout/2 {
 		t.Fatalf("submit after cancel: %v after %v", submitErr, took)
 	}
-	if end.Reason != types.ReplyInterrupted || len(f.host.snapshot().transfers) != 0 {
-		t.Fatalf("end: %+v", end)
+	if end.Reason != types.ReplyInterrupted || f.m.calls() != 1 || len(f.host.snapshot().recorded) != 0 {
+		t.Fatalf("end: %+v calls=%d", end, f.m.calls())
 	}
 }
 
@@ -428,17 +424,17 @@ func TestAgentParticipantSavesTheFinishedReply(t *testing.T) {
 
 // TestTeamStateBeforeTheFirstMasterComesFromLoad covers a team participant
 // built over a persisted master: before its first activation State reports
-// the loaded cursor, taint and an input estimate, queued updates add to it,
+// the loaded cursor and an input estimate, queued updates add to it,
 // and a factory that does not restore the loaded state fails instead of
 // losing entries.
 func TestTeamStateBeforeTheFirstMasterComesFromLoad(t *testing.T) {
 	ctx := context.Background()
-	persisted := &agent.AgentState{SessionID: "master-session", ThreadCursor: 9, Tainted: true,
+	persisted := &agent.AgentState{SessionID: "master-session", ThreadCursor: 9,
 		Summary: strings.Repeat("s", 400), Context: []*message.Msg{message.UserMsg("user", "EARLIER-QUESTION "+strings.Repeat("q", 383))}}
 	load := func(context.Context) (*agent.AgentState, error) { return persisted, nil }
 
 	f := newTeamFixture(t, teamOptions{cfg: TeamConfig{Load: load}, master: queued(textResp("restored answer"))})
-	if st := f.tp.State(); st.Cursor != 9 || !st.Tainted || st.InputTokens != 200 || st.Busy || st.Window != 0 {
+	if st := f.tp.State(); st.Cursor != 9 || st.InputTokens != 200 || st.Busy || st.Window != 0 {
 		t.Fatalf("state before the first master = %+v", st)
 	}
 	if err := f.tp.Sync(ctx, thread.Sync{Cursor: 5}); err == nil {
@@ -490,7 +486,7 @@ func TestTeamStateBeforeTheFirstMasterComesFromLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st := tp.State(); st.Cursor != 0 || st.Tainted || st.InputTokens != 0 {
+	if st := tp.State(); st.Cursor != 0 || st.InputTokens != 0 {
 		t.Fatalf("no persisted state is a new session: %+v", st)
 	}
 }

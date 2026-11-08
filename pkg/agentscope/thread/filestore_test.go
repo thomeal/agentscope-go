@@ -51,12 +51,12 @@ func TestFileStoreReopen(t *testing.T) {
 	mustAppend(t, s, nil, withKey(report("cloud", "keyed"), "k1"))
 	// Blocks without their type tags must still come back as the same
 	// block types after a reopen.
-	media := Entry{Kind: KindUserInput, Visibility: EdgeOnly, Content: []message.ContentBlock{
+	media := Entry{Kind: KindUserInput, Content: []message.ContentBlock{
 		message.TextBlock{Text: "look"},
 		message.DataBlock{Source: message.Base64Source{Data: "aGk=", MediaType: "image/png"}},
 		message.HintBlock{Hint: []message.ContentBlock{message.TextBlock{Text: "inner"}}},
 	}}
-	mustAppend(t, s, nil, media, Entry{Kind: KindSummary, Visibility: EdgeOnly, Coverage: &Coverage{Through: 3}, Summary: &SummaryMeta{Target: "edge"}})
+	mustAppend(t, s, nil, media, Entry{Kind: KindSummary, Coverage: &Coverage{Through: 3}, Summary: &SummaryMeta{Target: "edge"}})
 	before := mustRead(t, s, 0, Filter{}, 0)
 	head := mustHead(t, s)
 	if err := s.Close(); err != nil {
@@ -215,7 +215,7 @@ func TestFileStoreCorrupt(t *testing.T) {
 			return "null\n" + rawLine(t, at(1, 0, userInput("a")))
 		}, "empty batch"},
 		{"invalid entry", func(t *testing.T) string {
-			return rawLine(t, at(1, 1, Entry{Kind: KindOwnerChange, Visibility: Shared}))
+			return rawLine(t, at(1, 1, Entry{Kind: KindOwnerChange}))
 		}, "owner_change needs"},
 	}
 	for _, tc := range cases {
@@ -231,18 +231,6 @@ func TestFileStoreCorrupt(t *testing.T) {
 				t.Fatalf("error %v, want ErrCorrupt containing %q", err, tc.want)
 			}
 		})
-	}
-}
-
-func TestFileStoreReplayNormalizesVisibility(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "thread.jsonl")
-	e := at(1, 0, userInput("a"))
-	e.Visibility = ""
-	writeFile(t, path, []byte(rawLine(t, e)))
-	s := openTestFileStore(t, path, WithoutSync())
-	got, _, _ := s.Get(context.Background(), 1)
-	if got.Visibility != EdgeOnly {
-		t.Fatalf("replayed visibility %q, want %q", got.Visibility, EdgeOnly)
 	}
 }
 

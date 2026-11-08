@@ -33,14 +33,13 @@ const ThreadSeqMetadataKey = "thread_seq"
 const ThreadEventInputInjected = "thread_input_injected"
 
 // PeerSummary is a summary another participant's model wrote for this agent's
-// window. It covers the shared thread entries with seq <= Through except the
+// window. It covers the thread entries with seq <= Through except the
 // Excluded ones.
 type PeerSummary struct {
 	Text     string   `json:"text"`
 	Origin   string   `json:"origin,omitempty"`   // e.g. "cloud/master"
 	Through  uint64   `json:"through,omitempty"`  // coverage: entries with seq <= Through ...
 	Excluded []uint64 `json:"excluded,omitempty"` // ... except these
-	Tainted  bool     `json:"tainted,omitempty"`
 }
 
 // Covers reports whether the summary speaks for the thread entry seq.
@@ -113,25 +112,19 @@ func ThreadSeqOf(m *message.Msg) (uint64, bool) {
 	return 0, false
 }
 
-// threadPromptMsgs builds the thread messages prepareModelInput injects after
-// the agent's own summary: the peer summary and the thread index. It returns
-// nil when both slots are empty, so agents that never use threads send the
-// same requests as before.
-func threadPromptMsgs(agentName string, peer *PeerSummary, index string) []*message.Msg {
-	var msgs []*message.Msg
-	if peer != nil && peer.Text != "" {
-		origin := peer.Origin
-		if origin == "" {
-			origin = "peer"
-		}
-		msgs = append(msgs, message.UserMsg(agentName, "[Summary from "+origin+
-			", covering the shared thread through #"+strconv.FormatUint(peer.Through, 10)+"]:\n"+peer.Text))
+// threadPromptMsgs builds the thread message prepareModelInput injects after
+// the agent's own summary: the peer summary. It returns nil when the slot is
+// empty, so agents that never use threads send the same requests as before.
+func threadPromptMsgs(agentName string, peer *PeerSummary) []*message.Msg {
+	if peer == nil || peer.Text == "" {
+		return nil
 	}
-	if index != "" {
-		msgs = append(msgs, message.UserMsg(agentName,
-			"[Thread index: entries kept out of the summary; read them with thread_read]:\n"+index))
+	origin := peer.Origin
+	if origin == "" {
+		origin = "peer"
 	}
-	return msgs
+	return []*message.Msg{message.UserMsg(agentName, "[Summary from "+origin+
+		", covering the shared thread through #"+strconv.FormatUint(peer.Through, 10)+"]:\n"+peer.Text)}
 }
 
 // ThreadUpdate is one atomic change to an agent's thread state.
@@ -139,8 +132,7 @@ type ThreadUpdate struct {
 	// Reset clears Context, the agent's own Summary, the read cache, any
 	// pending background precompression and the provider-grounded token
 	// floor (lastModelInputTokens), before anything else applies. Permission
-	// grants, Plan, Tainted, Private and the toolkit are kept. Only allowed
-	// between replies.
+	// grants, Plan and the toolkit are kept. Only allowed between replies.
 	Reset bool
 	// PeerSummary, when non-nil, replaces the slot. Context messages that
 	// carry a thread seq covered by it (seq <= Through and not Excluded) are
@@ -153,8 +145,6 @@ type ThreadUpdate struct {
 	// ClearPeerSummary removes the slot (used by tests and resets). It may not
 	// be combined with PeerSummary.
 	ClearPeerSummary bool
-	// Index, when non-nil, replaces ThreadIndex.
-	Index *string
 	// Messages are appended after the removal. They follow Observe's rules
 	// (no system role, no tool_call, tool_result or thinking blocks) and
 	// should carry ThreadSeqMetadataKey. The agent owns them afterwards.
@@ -162,12 +152,6 @@ type ThreadUpdate struct {
 	// Cursor is the new ThreadCursor; zero keeps the current value. It may
 	// not move backwards.
 	Cursor uint64
-	// Taint, when non-nil, sets or clears Tainted.
-	Taint *bool
-	// Private, when non-nil, sets or clears Private. Clearing leaves a set
-	// flag set while the agent holds a Plan: the plan outlives a Reset and
-	// may name what a private run read. It never sets a clear flag.
-	Private *bool
 }
 
 // BoundaryInput supplies thread updates inside a running reply. It is called
@@ -183,20 +167,6 @@ type BoundaryInput func(ctx context.Context) (*ThreadUpdate, error)
 // inside a reply) or a persistence failure ends the reply as an error.
 func WithBoundaryInput(src BoundaryInput) AgentOption {
 	return func(a *UnifiedAgent) { a.boundaryInput = src }
-}
-
-// WithPrivacyProbe installs probe (EXPERIMENTAL): it reports whether what the
-// agent's state may now hold includes data that must stay on the device.
-// SaveCheckpoint (and so every automatic checkpoint) asks it before copying
-// the state, without holding the agent's lock, and a true answer sets
-// AgentState.Private first; the probe never clears it. A host keeps the flag
-// sound by answering true no later than the checkpoint that first holds the
-// data: mark the run private when it starts on a private input, from a loop
-// hook's AfterToolExec (which runs before the step's checkpoint, also for
-// calls restored from a checkpoint), from the tool itself, or through a
-// ThreadUpdate's Private.
-func WithPrivacyProbe(probe func() bool) AgentOption {
-	return func(a *UnifiedAgent) { a.privacyProbe = probe }
 }
 
 type threadInputKey struct{}
@@ -232,9 +202,6 @@ func (a *UnifiedAgent) tagThreadInputLocked(m *message.Msg, seq uint64) {
 type ThreadView struct {
 	Cursor          uint64
 	PeerSummary     *PeerSummary
-	Index           string
-	Tainted         bool
-	Private         bool
 	ContextMessages int
 	// InputTokens estimates the model input the next call would send (the
 	// system prompt with state awareness and skill instructions, summaries,
@@ -267,9 +234,6 @@ func (a *UnifiedAgent) ThreadView() ThreadView {
 	v := ThreadView{
 		Cursor:          a.state.ThreadCursor,
 		PeerSummary:     a.state.PeerSummary.clone(),
-		Index:           a.state.ThreadIndex,
-		Tainted:         a.state.Tainted,
-		Private:         a.state.Private,
 		ContextMessages: len(a.state.Context),
 	}
 	input := cloneMsgs(a.modelInputLocked(a.systemPrompt))
@@ -335,7 +299,7 @@ func cloneMsgs(msgs []*message.Msg) []*message.Msg {
 }
 
 // ErrReplyInProgress is wrapped by the error a between-replies operation
-// (ApplyThreadUpdate, ApplySummary, CompactStrict, SetTainted) returns while
+// (ApplyThreadUpdate, ApplySummary, CompactStrict) returns while
 // a reply is still in flight (EXPERIMENTAL): a caller may wait and retry.
 var ErrReplyInProgress = errors.New("a reply is in progress")
 
@@ -428,9 +392,6 @@ func (a *UnifiedAgent) applyThreadUpdateLocked(u *ThreadUpdate) {
 			a.lastModelInputTokens = 0
 		}
 	}
-	if u.Index != nil {
-		a.state.ThreadIndex = *u.Index
-	}
 	for _, m := range u.Messages {
 		if m != nil {
 			a.state.Context = append(a.state.Context, m)
@@ -438,12 +399,6 @@ func (a *UnifiedAgent) applyThreadUpdateLocked(u *ThreadUpdate) {
 	}
 	if u.Cursor != 0 {
 		a.state.ThreadCursor = u.Cursor
-	}
-	if u.Taint != nil {
-		a.state.Tainted = *u.Taint
-	}
-	if u.Private != nil {
-		a.state.Private = *u.Private || (a.state.Private && len(a.state.Plan) > 0)
 	}
 }
 
@@ -653,7 +608,7 @@ func (a *UnifiedAgent) reserveTokens(cfg *ContextConfig, ctxSize int) int {
 	reserve := int(float64(ctxSize) * cfg.ReserveRatio)
 	a.mu.Lock()
 	total := a.threadSummaryTotalLocked(cfg, ctxSize)
-	thread := threadPromptMsgs(a.name, a.state.PeerSummary, a.state.ThreadIndex)
+	thread := threadPromptMsgs(a.name, a.state.PeerSummary)
 	a.mu.Unlock()
 	if total <= 0 || len(thread) == 0 {
 		return reserve

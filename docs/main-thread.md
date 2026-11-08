@@ -27,9 +27,9 @@ go run ./examples/main_thread
 go test -count=1 ./pkg/agentscope/thread/... ./examples/main_thread
 ```
 
-The example runs a short scripted session (a shared query on the cloud with a
-sub-agent, a transfer to the edge, an edge-only query that stays on the edge,
-a background task with a report) and prints the log, the owner and the ledger.
+The example runs a short scripted session (a query on the cloud with a
+sub-agent, a transfer to the edge, a query the user names for the edge, a
+background task with a report) and prints the log, the owner and the ledger.
 
 ## Concepts
 
@@ -46,10 +46,10 @@ the store checks, so output from a participant that lost the foreground can
 never be written as a reply. It is kept as a report with a
 `rejected_output` marker instead.
 
-**Visibility.** Every entry is `shared` or `edge_only`. The cloud zone never
-reads `edge_only` entries: its imports show a gap marker such as
-`[#101–#102 withheld: edge-only entries]` instead, its `thread_read` leaves
-them out, and the hosted classifier never sees them.
+**No privacy classes.** Every participant may read every entry, and the
+cloud imports the edge's entries like any others. Keeping some data on the
+device is future work; see
+[Main Thread privacy](design/main-thread-privacy.md).
 
 **Cursors.** Each participant's agent state holds the last entry it imported
 (`ThreadCursor`, schema version 3 checkpoints). The cursor and the imported
@@ -61,10 +61,7 @@ The invariants the Coordinator keeps are listed in
 
 ## How a query flows
 
-1. `Coordinator.Submit` appends the user input with the visibility the host's
-   disclosure decision gives it (`DiscloseShared`, `DiscloseEdgeOnly` or
-   `DiscloseUnclassified`). An unclassified input submitted while the edge is
-   tainted is stored and handled as edge-only.
+1. `Coordinator.Submit` appends the user input.
 2. If an activation is running, the input is steering for the current owner and
    arrives at its next safe boundary (after a tool step, before the next model
    call). Routing only happens at a query boundary.
@@ -74,8 +71,8 @@ The invariants the Coordinator keeps are listed in
    summaries"), then starts its reply. Events stream to the user.
 5. When the reply ends, the visible text and the tool digest are sealed into a
    reply entry. An interrupted reply gets an `interrupted` marker. A failed
-   one gets a `failed` marker with the error (an edge error's text is
-   withheld), `unknown_effects` when it had called tools, then one failover
+   one gets a `failed` marker with the error, `unknown_effects` when it had
+   called tools, then one failover
    to another participant that may take the query, or `no_owner`. The entry
    that ends the run (the `failed` or `interrupted` marker, else the reply)
    lists the inputs it took besides its trigger (`Entry.Steered`): the
@@ -101,9 +98,7 @@ The import that goes with it (a clear with the newest peer summary for the
 edge, an incremental import otherwise) brings the `failed` marker and the
 failed run's last progress, so the new owner reads the error and the task
 state instead of being told them at length. The new owner also takes the
-inputs that steered the failed run, when it may read them; one it may not
-read (edge-only steering of an edge run that fails over to the cloud) starts
-its own cycle after the failover instead of being lost. Without a new owner
+inputs that steered the failed run. Without a new owner
 the request ends with `no_owner`, and its steering with it. A failed wake
 does not fail over (its report was already answered); the inputs that
 steered it are queued again.
@@ -118,10 +113,9 @@ steered it are queued again.
 | `cloud_based` | cloud | go to the edge only for simple requests or device-only tools and data |
 | `hybrid` | none | best participant per query; low confidence stays with the current owner |
 
-The decision order is fixed: availability and disclosure (an edge-only query
-never reaches the cloud; neither does an unclassified one while the edge is
-tainted), a participant the user named, tool groups only one side holds, host
-rules, the classifier, then the mode's default. A classifier error, an invalid
+The decision order is fixed: availability, a participant the user named,
+tool groups only one side holds, host rules, the classifier, then the mode's
+default. A classifier error, an invalid
 answer, confidence below the threshold or a call that runs out of
 `route.Config.Timeout` (default 10 s) falls through to the default; routing
 never blocks the user on the classifier.
@@ -134,18 +128,14 @@ the participants. The hybrid question is stage 0's word for word, apart from
 the participant names. The participant descriptions are stage 0's too, with
 tool calls in place of the benchmark's records and the host's description in
 place of its record-ID line. The question carries no warning about the
-state's content, because the disclosure rules above run before the
-classifier is asked. A state that steers the classifier can cost
-quality or money, but cannot send an edge-only query to the cloud. A
-hosted classifier only sees shared entries and is not called for an edge-only
-query. A classifier configured as on-device (`Hosted: false`) is accepted only
-when its endpoint is an `http`/`https` URL on `localhost` or a loopback
-address, or the offline fake; anything else needs `Hosted: true`.
+state's content: a state that steers the classifier can cost quality or
+money. The state holds the query and recent entries whatever the
+classifier's endpoint, so a hosted classifier sees them.
 `route.BuildState` returns the exact state for logs.
 
 The three windows involved are therefore bounded separately: the cloud's own
 window (own notes from 10,000 tokens, installed at its compaction line), the
-edge's 8K window (peer summary, index and budgeted imports) and the
+edge's 8K window (peer summary and budgeted imports) and the
 classifier's prompt (fixed state budget).
 
 ## Handing the foreground over
@@ -157,14 +147,6 @@ guarded write, ends the caller's reply with `types.ReplyHandedOff` (no further
 model call; `OnReply` middleware cannot swallow it) and starts the target with
 the brief. It never waits for a summary fork. Unlike a sub-agent call, nothing
 returns to the caller: the other side continues with the user.
-
-An edge-only request may still be handed to the cloud, but only through its
-brief: the brief of a transfer from an edge context holding edge-only material
-(an edge-only request included) goes to the cloud only when the host's
-`DisclosurePolicy` clears it, and the request itself stays a gap in the cloud's
-projection. Without a policy, or when it does not clear the brief, the
-transfer is refused; the model gets the reason and may rewrite the brief or
-continue itself.
 
 ## Background work
 
@@ -180,17 +162,12 @@ resources (for example a file path) so two participants cannot use one at the
 same time.
 
 **Progress.** An agent with `agent.WithPlanTool` reports its plan with
-`update_plan`; each update becomes a `progress` entry of its run (edge-only
-for an edge participant), and the call stays out of the reply's tool digest.
+`update_plan`; each update becomes a `progress` entry of its run, and the
+call stays out of the reply's tool digest.
 A projection shows only the newest progress of a run that is still going;
 once the run replied, transferred, reported, answered late or was
 interrupted, its progress drops out. A failed run keeps its last progress
-visible, which is what a failover or a recovery points at. A finished run's
-progress is not material the edge holds: a clear drops it instead of
-indexing it, and it never makes the edge private. The edge's progress of a
-running or failed run does count as private material when it is imported
-back into the edge, because the run may have read private data the
-Coordinator cannot see.
+visible, which is what a failover or a recovery points at.
 
 ## A cloud master with sub-agents
 
@@ -229,8 +206,8 @@ tool. The main thread is never touched by a fork
   for the edge's window whenever the newest one is outdated, within the
   edge's `SummaryBudget` or, when that is zero, 5/6 of the edge's local
   summary total (2,560 tokens of an 8,192-token window; see below), and appends it as a `summary` entry with its coverage:
-  through the cloud's last sealed entry, excluding edge-only entries and
-  entries written by others after the cloud's cursor. The cloud imports what it
+  through the cloud's last sealed entry, excluding entries written by others
+  after the cloud's cursor. The cloud imports what it
   lacks in full, so everything else up to its cursor is in the fork's snapshot.
   `ForkGuard` (participant option) runs the host's guardrail rules on every
   summary a fork writes, since a fork does not pass through the reply loop.
@@ -265,10 +242,9 @@ tool. The main thread is never touched by a fork
 * **Clear rule (edge handover).** When the edge is about to run after another
   participant held the foreground since the edge last acted, and the newest
   peer summary is newer than the edge's last activity, the edge's context is
-  replaced in one update that goes with the activation: the peer summary, a
-  short index of the edge-only entries the summary cannot hold (readable in
-  full with `thread_read`), and the entries the summary does not cover,
-  including the edge's own when the summary excludes them. The edge does not
+  replaced in one update that goes with the activation: the peer summary and
+  the entries the summary does not cover, including the edge's own when the
+  summary excludes them. The edge does not
   need its older context: the summary speaks for it. The update is not
   chunked or compacted on the way in: what outgrows the window is the edge
   agent's own compression's job, as in any reply; nor is what reaches the edge
@@ -297,46 +273,17 @@ tool. The main thread is never touched by a fork
   it, a negative one turns it off, and `UnifiedAgent.SetThreadSummaryTokens`
   changes it at run time. The own summary gets what the peer summary leaves,
   a newly arrived peer summary elides an older own summary to that share at
-  once, and the peer summary and index no longer eat the recent tail's
+  once, and the peer summary no longer eats the recent tail's
   `ReserveRatio` share. The peer summary's own budget, when the edge's
   descriptor leaves `SummaryBudget` at zero, is 5/6 of that total (stage 0:
   2,500 of 3,000).
 
 The event list is opt-in (stage 0 measured no gain from it): with
-`CaptureOutputs` set on the cloud participant and `event_read` installed on the
-edge, the cloud's tool outputs are kept outside the log and every context, and
-the edge reads them on demand with `event_read` (outline, search, page; every
-read is capped). Nothing is pushed. The cloud reads edge tool outputs only when the host
-sets `Config.CloudReadsEdge`, and never an edge-only record (outputs of
-private tools, or recorded while the edge context was private).
-
-## Privacy and taint
-
-* An edge participant's writes are `edge_only` while its context holds
-  edge-only material, unless the host's `DisclosurePolicy` classifies the text
-  (including the tool digest) as shareable. A clear that imports nothing
-  edge-only resets this, unless the private edge agent keeps a plan across
-  the clear (the plan may name what a private run read): it then stays
-  private until a clear finds it without a plan. A plan never makes an edge
-  private that was not.
-* The edge agent saves this privacy in its checkpoint (`AgentState.Private`),
-  in the same state that holds what made it private. A Sync that imports
-  edge-only material carries `Sync.Private`; the participant's privacy probe
-  (`agent.WithPrivacyProbe`) marks every checkpoint written after the run took
-  an edge-only trigger or import, read an edge-only entry or ran a private
-  tool; and the run's end sets the flag once more. `ParticipantState.Private`
-  reports it.
-* Tools listed as tainting (web fetch, search, mail) mark the activation and
-  its entries `Tainted`; importing a tainted entry taints the importer. With
-  `agent.WithTaintGate` and a permission engine, a tainted agent's allowed
-  calls to gated tools (by default the four writing thread tools) need the
-  user's confirmation. In `ModeDontAsk`, and in the loop bridge, which cannot
-  ask the user, gated calls are denied instead. The participant's own check
-  for a write in the same step as a tainting tool is coarser: once the gate
-  list names any tool besides the thread tools, every thread write counts as
-  gated there.
-* Failover from a failed edge activation to the cloud never carries the edge's
-  error text.
+`CaptureOutputs` set on a participant and `event_read` installed on its peer,
+that participant's tool outputs are kept outside the log and every context,
+and the peer in the other zone reads them on demand with `event_read`
+(outline, search, page; every read is capped). Nothing is pushed, and a
+participant is never offered records from its own zone.
 
 ## Wiring
 
@@ -347,7 +294,7 @@ store := thread.NewMemoryStore() // or thread.OpenFileStore(path)
 
 edgeDesc := thread.Descriptor{Name: "edge", Zone: thread.ZoneEdge, Window: 8192,
     SummaryBudget: 1024, ToolGroups: []string{"device"},
-    Description: "Small on-device model with the device tools and the user's private data."}
+    Description: "Small on-device model with the device tools."}
 prep, err := participant.Prepare(edgeDesc, participant.PrepareOptions{})
 // handle err
 edgeAgent := agent.NewUnifiedAgent("edge", edgePrompt, edgeModel,
@@ -355,24 +302,21 @@ edgeAgent := agent.NewUnifiedAgent("edge", edgePrompt, edgeModel,
         agent.WithToolkit(tool.NewToolkit(append(prep.Tools(), deviceTools...)...)),
         agent.WithPermissionContext(permission.NewContext(permission.ModeDefault)),
         agent.WithContextConfig(&agent.ContextConfig{ContextSize: 8192}))...)
-edge, err := prep.Participant(participant.AgentConfig{Descriptor: edgeDesc, Agent: edgeAgent,
-    PrivateTools: []string{"read_sensor"}})
+edge, err := prep.Participant(participant.AgentConfig{Descriptor: edgeDesc, Agent: edgeAgent})
 
 cloud, err := participant.NewTeamParticipant(participant.TeamConfig{
     Descriptor: cloudDesc, Master: buildMaster, Members: members,
-    Load: loadMasterState, // reads the checkpoint buildMaster restores from
-    TaintingTools: []string{"web_fetch"}})
+    Load: loadMasterState}) // reads the checkpoint buildMaster restores from
 
 router, err := route.New(route.Config{Mode: route.Hybrid, Edge: "edge", Cloud: "cloud",
-    Classifier: jevClassifier, Hosted: true})
+    Classifier: jevClassifier})
 
 coord, err := thread.NewCoordinator(ctx, thread.Config{
-    Store: store, Participants: []thread.Participant{edge, cloud}, Router: router,
-    Disclosure: policy})
+    Store: store, Participants: []thread.Participant{edge, cloud}, Router: router})
 defer coord.Close()
 
 go func() { for ev := range coord.Events() { render(ev) } }() // must be drained
-_, err = coord.Submit(ctx, thread.Query{Text: "…", Disclosure: thread.DiscloseShared})
+_, err = coord.Submit(ctx, thread.Query{Text: "…"})
 err = coord.WaitIdle(ctx)
 ```
 
@@ -425,9 +369,9 @@ wherever it stands in the log (an input sent while the previous reply was
 still streaming, or right after an interrupt, ran after that reply or
 marker), and the open requests with an entry after the newest finished
 request (such as an input skipped by an earlier cycle that got its own
-cycle afterwards). The owner resumes the turn's requests it may take as
-one: the newest of them that an entry is based on (an owner change,
-progress, a marker), else the newest, with the others joined to it. An
+cycle afterwards). The owner resumes the turn's requests as one: the
+newest of them that an entry is based on (an owner change, progress, a
+marker), else the newest, with the others joined to it. An
 input a failed or interrupted run listed (`Entry.Steered`) goes with that
 run's request: it is joined when the request is resumed and ends when the
 request ended without an answer.
@@ -438,27 +382,13 @@ process stopped, on one line), the failure before the restart if any, and
 the latest progress. The input also warns that work done before the restart
 may or may not have taken effect, so the owner checks the actual state
 before redoing anything. A request a Transfer handed to the owner is resumed
-there even when the owner may not read it: for an edge-only request the edge
-handed to the cloud through a cleared brief, the input points at the
-transfer's brief instead of quoting the request. The cloud only ever had the
-brief, and its context holds it again after the restart's import, from its
-checkpoint or projected from the log. The inputs joined to a resumed request
-are quoted, so a request the owner may not read is never joined: another
-edge-only request in the turn gets a `recovered` marker if it ran, and is
-queued again if nothing is based on it. The marker has the request's visibility,
-or the brief's when the owner resumes from one, so the recovery note must
-never hold edge-only material. After the restart an
-edge counts as private exactly when its checkpoint says so
-(`ParticipantState.Private`): a run's private reading, also one the stop cut
-off, is saved with the flag, and the log shows neither. A custom edge
-participant must report the flag from its restored state. If the owner is gone
-or may take none of the turn's requests, the turn's routing never finished:
-its request is routed again behind a `requeue:` marker that counts the
-restart. A turn input the owner may not take that nothing is based on never
-ran on it and is queued again as Submit would queue it (an edge-only input
-is routed on its own after the cloud's resumed run); one that something is
-based on, and an open request whose entries all precede the newest finished
-one, gets a `recovered` marker and is not re-run. A run that ends normally
+there like any other, and the input quotes it. If the owner is gone, the
+turn's routing never finished: its request is routed again behind a
+`requeue:` marker that counts the restart, the turn's other inputs that
+nothing is based on are queued again as Submit would queue them, and one
+that something is based on gets a `recovered` marker. An open request whose
+entries all precede the newest finished one gets a `recovered` marker and is
+not re-run. A run that ends normally
 with no text and no tool calls writes no reply, so recovery cannot tell it
 finished; such a request is taken as in flight. After two restarts of the same
 request it gets a `recovered` marker on its newest restart and waits for
@@ -491,24 +421,20 @@ leaving it for recovery.
   compresses synchronously.
 * Resuming a request after a restart cannot tell which of its tool calls took
   effect; the resumed owner is told to check the actual state.
-* An edge agent built without `Prepare` has no privacy probe: a checkpoint it
-  saves during a reply lacks that reply's privacy, which is saved when the
-  activation ends. A crash in between restores the edge as shared.
-* A plan the edge agent keeps across clears keeps the edge private until a
-  clear finds it without a plan, even when the plan no longer names private
-  data.
 * Providers that report no usage show up as unknown usage; the agent's
   per-call event reports zeros in that case, which the participant treats as
   unknown.
-* A gated tool called in the same step as a tainting tool is refused once and
-  asks the user when called again, because the agent's taint changes at step
-  boundaries. With a gate list beyond the thread tools, this applies to every
-  thread write (see "Privacy and taint").
 * A settle failure after a normal end (a note or a checkpoint the participant
   could not save) is logged; the Coordinator reports end errors only for
   failed ends.
 * The loop bridge (`UnifiedAgentRunner.LoopOptions`) cannot hand the
   foreground over or ask the user; use the Coordinator.
-* The privacy guarantee covers what this runtime sends: the log, imports,
-  briefs, reports, the classifier state and the event list. It does not cover
-  tools a host gives the cloud that reach edge data by other means.
+* No privacy boundary: the cloud reads the edge's entries, briefs, reports
+  and recorded tool outputs, and a hosted classifier reads the query and
+  recent entries. Do not give the edge data that must stay on the device.
+  Untrusted tool output is not tracked either: nothing gates a write after a
+  web fetch beyond the host's permission rules. The design for both is in
+  [Main Thread privacy](design/main-thread-privacy.md). Logs and checkpoints
+  written by earlier, unreleased builds that had privacy classes still load:
+  their edge-only entries are then read like any others, and a saved thread
+  index is dropped.

@@ -12,7 +12,6 @@ import (
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/event"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/message"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/model"
-	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/pipeline"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/thread"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/types"
 )
@@ -20,11 +19,6 @@ import (
 // partialResponseEvent is the CustomEvent the agent emits when a provider
 // delivered a partial model response.
 const partialResponseEvent = "model_partial_response"
-
-// exclusiveRejectionSuffix ends the error result the agent records for every
-// call of a step that mixed an exclusive tool with other calls
-// (agent.WithExclusiveTools). Such calls never ran.
-const exclusiveRejectionSuffix = " must be called alone; call it again by itself"
 
 // errNoTerminal reports a reply stream that closed without its ReplyEnd.
 // planToolName is the tool agent.WithPlanTool installs.
@@ -40,7 +34,6 @@ type callRecord struct {
 	state          message.ToolResultState
 	done           bool
 	rejected       bool // part of a step the agent refused to run
-	tainted        bool
 	output         strings.Builder
 	cut            bool
 }
@@ -68,8 +61,7 @@ type replyPath struct {
 
 // tracker follows one activation's event stream on the forwarder goroutine:
 // the main agent's visible text, the tool calls for the digest and the call
-// count, taint and privacy from tool results, the event list and the usage
-// ledger. It also answers the participant's external thread tools at their
+// count, the event list and the usage ledger. It also answers the participant's external thread tools at their
 // exact place in the stream.
 type tracker struct {
 	c    *core
@@ -87,12 +79,7 @@ type tracker struct {
 	sawModel   bool
 	segment    []*callRecord // calls since the activation started or the last transfer
 	all        []*callRecord
-	confirmed  map[string]bool
 	mainEnd    *event.ReplyEndEvent
-	// checkTainted is whether the agent had been told about the taint when
-	// it permission-checked the calls of the main agent's current step: its
-	// taint as of the boundary before the step's model call.
-	checkTainted bool
 	// writes are the writing calls answered in this activation, by call ID;
 	// writeOrder keeps the order they were answered in.
 	writes     map[string]*writeRecord
@@ -124,7 +111,7 @@ type writeRecord struct {
 }
 
 func newTracker(c *core, act *activation, host thread.Host) *tracker {
-	return &tracker{c: c, act: act, host: host, paths: map[string]*replyPath{}, confirmed: map[string]bool{}}
+	return &tracker{c: c, act: act, host: host, paths: map[string]*replyPath{}}
 }
 
 // handle processes one event and reports whether to forward it, and on which
@@ -153,10 +140,6 @@ func (t *tracker) handle(ev event.Event) (forward bool, path string) {
 		rp.modelOpen = true
 		if main {
 			t.modelRound, t.partial, t.sawModel = true, false, true
-			// The step's boundary ran before this event was emitted, and no
-			// later one can run before the step's writing calls are answered
-			// here, so this is the taint the agent checks the step with.
-			t.checkTainted = t.act.agentTainted()
 		}
 	case event.ModelCallEndEvent:
 		t.recordUsage(rp, &e)
@@ -193,9 +176,6 @@ func (t *tracker) handle(ev event.Event) (forward bool, path string) {
 			w.delivered = e.State == w.result.State && w.output.String() == w.result.GetOutputText()
 		}
 	case event.RequireUserConfirmEvent:
-		for i := range e.ToolCalls {
-			t.confirmed[e.ToolCalls[i].ID] = true
-		}
 		if t.onConfirm != nil {
 			t.onConfirm(rp.path, &e)
 		}
@@ -243,21 +223,6 @@ func (t *tracker) appendOutput(r *callRecord, delta string) {
 
 func (t *tracker) endCall(r *callRecord, state message.ToolResultState) {
 	r.state, r.done = state, true
-	// A call of a mixed exclusive step never ran but ends here too; marking
-	// taint or privacy for it errs on the safe side.
-	if state != message.ToolResultDenied {
-		if t.c.tainting[r.name] {
-			t.act.markTainted()
-		}
-		if t.c.private[r.name] {
-			t.act.markPrivate()
-		}
-	}
-	r.tainted, _ = t.act.flags()
-	if r.path == "" && r.name == pipeline.TeamAssignToolName &&
-		(state != message.ToolResultError || !strings.HasSuffix(r.output.String(), exclusiveRejectionSuffix)) {
-		t.act.assignResult()
-	}
 }
 
 // finishRound closes the agent's current step: a step that mixed transfer
@@ -288,10 +253,7 @@ func (t *tracker) finishAll() {
 	}
 }
 
-// capture records a finished tool result in the host's event list. The
-// output of a private tool is edge-only, and so is every output captured once
-// the activation is private: the private material may be anywhere in what the
-// agent did afterwards. A cloud reader never reads an edge-only record.
+// capture records a finished tool result in the host's event list.
 func (t *tracker) capture(r *callRecord) {
 	if !t.c.capture || !r.done || (r.state != message.ToolResultSuccess && r.state != message.ToolResultError) {
 		return
@@ -300,18 +262,11 @@ func (t *tracker) capture(r *callRecord) {
 		return
 	}
 	rec := thread.EventRecord{
-		Origin:  thread.Origin{Participant: t.c.desc.Name, Path: r.path},
-		Zone:    t.c.desc.Zone,
-		Tool:    r.name,
-		Target:  thread.ToolTarget(r.args),
-		Output:  r.output.String(),
-		Tainted: r.tainted,
-	}
-	// An unmarked edge record is edge-only; the participant marks what it
-	// knows to be shareable.
-	rec.Visibility = thread.Shared
-	if _, private := t.act.flags(); private || t.c.private[r.name] {
-		rec.Visibility = thread.EdgeOnly
+		Origin: thread.Origin{Participant: t.c.desc.Name, Path: r.path},
+		Zone:   t.c.desc.Zone,
+		Tool:   r.name,
+		Target: thread.ToolTarget(r.args),
+		Output: r.output.String(),
 	}
 	t.host.RecordEvent(rec)
 }
@@ -446,13 +401,10 @@ func (t *tracker) answerExternal(rp *replyPath, e *event.RequireExternalExecutio
 
 // end builds the activation's end. waitErr is a team run's error.
 func (t *tracker) end(ctxErr, waitErr error) *thread.ActivationEnd {
-	tainted, private := t.act.flags()
 	end := &thread.ActivationEnd{
 		Text:      t.text.String(),
 		Digest:    t.digest(""),
 		ToolCalls: t.toolCalls(),
-		Tainted:   tainted,
-		Private:   private,
 	}
 	switch {
 	case t.mainEnd != nil:

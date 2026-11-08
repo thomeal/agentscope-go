@@ -51,7 +51,7 @@ func TestCoordinatorTaskFailureReports(t *testing.T) {
 			return &ActivationEnd{Reason: types.ReplyExceedMaxIters, Text: "most of it"}
 		},
 	)
-	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = zoneRouter() }, edge, cloud)
+	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = cloudRouter() }, edge, cloud)
 	env.say("go")
 	env.idle()
 	log := env.log()
@@ -59,9 +59,8 @@ func TestCoordinatorTaskFailureReports(t *testing.T) {
 	for _, e := range findEntries(log, KindReport, "") {
 		got = append(got, e.Text())
 	}
-	// The edge's error text ("boom") stays out of a report to the cloud.
 	want := []string{
-		"Task t-1 failed: it ended with an error\nPartial output:\nhalf",
+		"Task t-1 failed: boom\nPartial output:\nhalf",
 		"Task t-2 failed: it was interrupted",
 		"Task t-3 failed: it ended with an error",
 		"Task t-4 failed: it ended with no answer",
@@ -118,7 +117,7 @@ func TestCoordinatorTaskOnUnavailableParticipant(t *testing.T) {
 		return r.reply("queued")
 	}, replyWith("the job failed"))
 	env := newCoEnv(t, nil, func(cfg *Config) {
-		cfg.Router = zoneRouter()
+		cfg.Router = cloudRouter()
 		// Up while routing and while assigning, down when the task starts.
 		cfg.Available = func(name string) bool { return name != "edge" || edgeCalls.Add(1) <= 2 }
 	}, edge, cloud)
@@ -165,39 +164,6 @@ func TestCoordinatorBackpressureKeepsOrder(t *testing.T) {
 	}
 	if len(deltas) != 20 || deltas[0] != "00 " || deltas[19] != "19 " {
 		t.Fatalf("deltas = %q", deltas)
-	}
-}
-
-func TestCoordinatorPrivateWritesBetweenEdges(t *testing.T) {
-	edge, cloud := edgeCloud()
-	phone := newFakePart("phone", ZoneEdge)
-	edge.push(func(r *fakeRun) *ActivationEnd {
-		if _, _, err := r.assign("phone", "read my messages", false); err != nil {
-			t.Errorf("assign to another edge: %v", err)
-		}
-		r.say("phone takes over")
-		if _, err := r.transfer("phone"); err != nil {
-			t.Errorf("transfer to another edge: %v", err)
-		}
-		return &ActivationEnd{Reason: types.ReplyHandedOff}
-	})
-	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Summaries.PeerTarget = "edge" }, edge, cloud, phone)
-	env.submit(Query{Text: "my secret plan", Disclosure: DiscloseEdgeOnly})
-	env.idle()
-	log := env.log()
-	assigns := findEntries(log, KindAssign, "")
-	ocs := findEntries(log, KindOwnerChange, "")
-	if len(assigns) != 1 || assigns[0].Visibility != EdgeOnly {
-		t.Fatalf("assign = %+v", assigns)
-	}
-	if last := ocs[len(ocs)-1]; last.Owner.To != "phone" || last.Visibility != EdgeOnly {
-		t.Fatalf("transfer = %+v", last)
-	}
-	if acts := phone.activations(); len(acts) != 2 {
-		t.Fatalf("phone ran %d times", len(acts))
-	}
-	if n := len(cloud.activations()); n != 0 {
-		t.Fatalf("cloud ran %d times", n)
 	}
 }
 

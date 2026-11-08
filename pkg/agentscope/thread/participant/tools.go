@@ -32,9 +32,6 @@ var allToolNames = []string{ToolTransfer, ToolAssignTask, ToolReport, ToolPublis
 // writeTools are the external thread tools the participant answers itself.
 var writeTools = map[string]bool{ToolTransfer: true, ToolAssignTask: true, ToolReport: true, ToolPublishArtifact: true}
 
-// defaultTaintGate gates every tool that moves data out of the participant.
-var defaultTaintGate = []string{ToolTransfer, ToolAssignTask, ToolReport, ToolPublishArtifact}
-
 // threadReadMaxRunes caps one thread_read output.
 const threadReadMaxRunes = 6000
 
@@ -70,9 +67,7 @@ func newThreadTool(c *core, name string) *threadTool {
 // them from its event forwarder.
 func (t *threadTool) IsExternalTool() bool { return t.external }
 
-// CheckPermissions allows every thread tool; deny and ask rules still apply,
-// and the taint gate turns an allowed writing call into a confirmation once
-// the agent has read untrusted content.
+// CheckPermissions allows every thread tool; deny and ask rules still apply.
 func (t *threadTool) CheckPermissions(map[string]any, *permission.Context) permission.Decision {
 	return permission.Decision{Behavior: permission.BehaviorAllow, Message: "thread tool " + t.ToolName}
 }
@@ -89,9 +84,9 @@ func (t *threadTool) Execute(ctx context.Context, input map[string]any) (*tool.T
 	}
 	host := t.c.hostOf()
 	if t.ToolName == ToolThreadRead {
-		return t.c.threadRead(ctx, host, act, input), nil
+		return t.c.threadRead(ctx, host, input), nil
 	}
-	return t.c.eventRead(host, act, input), nil
+	return t.c.eventRead(host, input), nil
 }
 
 func failf(format string, args ...any) *tool.ToolResponse {
@@ -273,15 +268,6 @@ func (t *tracker) write(call *message.ToolCallBlock, w *writeRecord) message.Too
 	if err != nil {
 		return errorResult(call, "the arguments are not valid JSON: "+err.Error())
 	}
-	tainted, _ := t.act.flags()
-	if tainted && !t.confirmed[call.ID] && !t.checkTainted && t.c.gated(call.Name) {
-		// The agent was not tainted yet when it checked this call, so the
-		// user never confirmed it. Its next boundary taints it, and calling
-		// again asks the user. Once the agent knows about the taint its own
-		// gate has decided: an unconfirmed call then is not gated.
-		return errorResult(call, call.Name+" did not run: this activation read untrusted content after the call "+
-			"was checked, so the user has to confirm it. Call "+call.Name+" again.")
-	}
 	switch call.Name {
 	case ToolTransfer:
 		return t.transfer(call, in, w)
@@ -345,12 +331,11 @@ func (t *tracker) transfer(call *message.ToolCallBlock, in map[string]any, w *wr
 		return errorResult(call, "transfer refused: "+strings.TrimPrefix(err.Error(), "thread: ")+". Fix the brief and call transfer again.")
 	}
 	text, digest := t.text.String(), t.digest(call.ID)
-	tainted, private := t.act.flags()
 	// Every event sent so far showed the text sealed here; the Coordinator
 	// forwards that many before the transfer's entries and the new owner.
 	seq, err := t.host.Transfer(t.act.ctx, thread.TransferRequest{
 		From: t.origin(), Epoch: t.act.epoch, To: to, Brief: brief,
-		Text: text, Digest: digest, Tainted: tainted, Private: private,
+		Text: text, Digest: digest,
 		EventsBefore: t.eventsSent(),
 	})
 	if errors.Is(err, thread.ErrNotOwner) {
@@ -399,10 +384,8 @@ func (t *tracker) assign(call *message.ToolCallBlock, in map[string]any, w *writ
 		return errorResult(call, "unknown participant "+to+"; participants: "+strings.Join(t.peerNames(), ", "))
 	}
 	notify := boolArg(in, "notify")
-	tainted, private := t.act.flags()
 	id, seq, err := t.host.Assign(t.act.ctx, thread.AssignRequest{
-		From: t.origin(), Epoch: t.act.epoch, Depth: t.act.depth, To: to, Text: task,
-		Notify: notify, Tainted: tainted, Private: private,
+		From: t.origin(), Epoch: t.act.epoch, Depth: t.act.depth, To: to, Text: task, Notify: notify,
 	})
 	if err != nil {
 		return errorResult(call, writeFailure(ToolAssignTask, err))
@@ -422,10 +405,9 @@ func (t *tracker) report(call *message.ToolCallBlock, in map[string]any, w *writ
 	if text == "" {
 		return errorResult(call, "report needs text: the result to publish")
 	}
-	tainted, private := t.act.flags()
 	seq, err := t.host.Report(t.act.ctx, thread.ReportRequest{
 		From: t.origin(), Text: text, To: strList(in, "to"), TaskID: strArg(in, "task_id"),
-		Notify: boolArg(in, "notify"), Tainted: tainted, Private: private,
+		Notify: boolArg(in, "notify"),
 	})
 	if err != nil {
 		return errorResult(call, writeFailure(ToolReport, err))
@@ -440,9 +422,8 @@ func (t *tracker) publish(call *message.ToolCallBlock, in map[string]any, w *wri
 		return errorResult(call, "publish_artifact needs uri: where the artifact is")
 	}
 	ref := thread.ArtifactRef{URI: uri, Summary: strArg(in, "summary"), Size: int64(intArg(in, "size"))}
-	tainted, private := t.act.flags()
 	seq, err := t.host.Publish(t.act.ctx, thread.PublishRequest{
-		From: t.origin(), Refs: []thread.ArtifactRef{ref}, Text: strArg(in, "text"), Tainted: tainted, Private: private,
+		From: t.origin(), Refs: []thread.ArtifactRef{ref}, Text: strArg(in, "text"),
 	})
 	if err != nil {
 		return errorResult(call, writeFailure(ToolPublishArtifact, err))
@@ -453,7 +434,7 @@ func (t *tracker) publish(call *message.ToolCallBlock, in map[string]any, w *wri
 
 // ---------------------------------------------------------------- reading tools
 
-func (c *core) threadRead(ctx context.Context, host thread.Host, act *activation, in map[string]any) *tool.ToolResponse {
+func (c *core) threadRead(ctx context.Context, host thread.Host, in map[string]any) *tool.ToolResponse {
 	q := thread.ReadQuery{Seqs: seqList(in, "seqs"), Limit: intArg(in, "limit")}
 	q.After, _ = seqArg(in["after"])
 	for _, k := range strList(in, "kinds") {
@@ -474,12 +455,6 @@ func (c *core) threadRead(ctx context.Context, host thread.Host, act *activation
 	cutAt := 0 // where a single entry too long for the output was cut
 	for i := range entries {
 		e := &entries[i]
-		if e.Tainted {
-			act.markTainted()
-		}
-		if c.desc.Zone == thread.ZoneEdge && e.EffectiveVisibility() == thread.EdgeOnly {
-			act.markPrivate()
-		}
 		text := c.renderForRead(entries[i : i+1])
 		if text == "" {
 			continue
@@ -543,7 +518,7 @@ func (c *core) renderForRead(one []thread.Entry) string {
 		}
 		return fmt.Sprintf("[#%d summary from %s%s%s]\n%s", e.Seq, e.Origin, target, through, e.Text())
 	}
-	p := thread.Project(one, &thread.ProjectionSpec{Participant: c.desc.Name, Zone: c.desc.Zone, IncludeOwn: true})
+	p := thread.Project(one, &thread.ProjectionSpec{Participant: c.desc.Name, IncludeOwn: true})
 	parts := make([]string, 0, len(p.Messages))
 	for _, m := range p.Messages {
 		if t := m.GetTextContent("\n"); t != nil {
@@ -553,7 +528,7 @@ func (c *core) renderForRead(one []thread.Entry) string {
 	return strings.Join(parts, "\n")
 }
 
-func (c *core) eventRead(host thread.Host, act *activation, in map[string]any) *tool.ToolResponse {
+func (c *core) eventRead(host thread.Host, in map[string]any) *tool.ToolResponse {
 	name := c.desc.Name
 	limit := intArg(in, "limit")
 	switch strArg(in, "action") {
@@ -562,7 +537,7 @@ func (c *core) eventRead(host thread.Host, act *activation, in map[string]any) *
 			limit = defaultEventOutline
 		}
 		limit = min(limit, maxEventOutline)
-		return renderOutline(act, host.EventOutline(name, limit), "No tool outputs are available to read.")
+		return renderOutline(host.EventOutline(name, limit), "No tool outputs are available to read.")
 	case "search":
 		query := strArg(in, "query")
 		if query == "" {
@@ -572,7 +547,7 @@ func (c *core) eventRead(host thread.Host, act *activation, in map[string]any) *
 			limit = defaultEventOutline
 		}
 		limit = min(limit, maxEventOutline)
-		return renderOutline(act, host.EventSearch(name, query, limit), "No tool outputs match "+query+".")
+		return renderOutline(host.EventSearch(name, query, limit), "No tool outputs match "+query+".")
 	case "page":
 		id := strArg(in, "id")
 		if id == "" {
@@ -583,25 +558,9 @@ func (c *core) eventRead(host thread.Host, act *activation, in map[string]any) *
 		if err != nil {
 			return failf("event_read page %s failed: %v", id, err)
 		}
-		// EventPage does not say whether the record is tainted; look it up and
-		// count a record that is no longer listed as tainted.
-		tainted := true
-		for _, s := range host.EventOutline(name, 0) {
-			if s.ID == id {
-				tainted = s.Tainted
-				break
-			}
-		}
-		if tainted {
-			act.markTainted()
-		}
 		end := min(offset+utf8.RuneCountInString(text), total)
 		var sb strings.Builder
-		fmt.Fprintf(&sb, "%s characters %d-%d of %d", id, min(offset, total), end, total)
-		if tainted {
-			sb.WriteString(" (untrusted source)")
-		}
-		sb.WriteString(":\n")
+		fmt.Fprintf(&sb, "%s characters %d-%d of %d:\n", id, min(offset, total), end, total)
 		sb.WriteString(text)
 		if end < total {
 			fmt.Fprintf(&sb, "\n[More: event_read action=page id=%s offset=%d]", id, end)
@@ -612,16 +571,13 @@ func (c *core) eventRead(host thread.Host, act *activation, in map[string]any) *
 	}
 }
 
-func renderOutline(act *activation, list []thread.EventSummary, empty string) *tool.ToolResponse {
+func renderOutline(list []thread.EventSummary, empty string) *tool.ToolResponse {
 	if len(list) == 0 {
 		return tool.NewTextResponse(empty)
 	}
 	var sb strings.Builder
 	for i := range list {
 		s := &list[i]
-		if s.Tainted {
-			act.markTainted()
-		}
 		if i > 0 {
 			sb.WriteByte('\n')
 		}
@@ -629,11 +585,7 @@ func renderOutline(act *activation, list []thread.EventSummary, empty string) *t
 		if s.Target != "" {
 			sb.WriteString(" " + s.Target)
 		}
-		fmt.Fprintf(&sb, " (from %s, %d characters", s.Origin, s.Size)
-		if s.Tainted {
-			sb.WriteString(", untrusted source")
-		}
-		sb.WriteString(")")
+		fmt.Fprintf(&sb, " (from %s, %d characters)", s.Origin, s.Size)
 		if s.FirstLine != "" {
 			sb.WriteString(": " + s.FirstLine)
 		}

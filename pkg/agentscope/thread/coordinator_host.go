@@ -18,11 +18,6 @@ type coordHost struct {
 
 var _ Host = (*coordHost)(nil)
 
-// errPrivateBrief is returned when a private edge context would send text to
-// the cloud that the disclosure policy did not clear.
-var errPrivateBrief = errors.New("thread: the edge context holds private data, so this text may not leave the device; " +
-	"rewrite it without the private details, or continue on the device")
-
 func (h *coordHost) caller(name string) error {
 	if name != h.ps.name {
 		return fmt.Errorf("thread: participant %s may not act as %q", h.ps.name, name)
@@ -42,16 +37,6 @@ func (h *coordHost) target(name string) (*partState, error) {
 	return ps, nil
 }
 
-// cloudSafe asks the disclosure policy whether content written by a private
-// edge context may go to the cloud.
-func (h *coordHost) cloudSafe(ctx context.Context, content string) error {
-	v, ok := h.c.classify(ctx, content)
-	if !ok || v != Shared {
-		return errPrivateBrief
-	}
-	return nil
-}
-
 // running returns the caller's running activation, nil if none.
 func (h *coordHost) runningLocked() *activation { return h.ps.running }
 
@@ -69,6 +54,18 @@ func (h *coordHost) writableLocked(ctx context.Context, a *activation) error {
 	}
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("%w: %s: %w", ErrInterrupted, h.ps.name, err)
+	}
+	return nil
+}
+
+// lockForWrite takes the mutex for a write and checks that it may be made
+// (writableLocked). It returns with the mutex held, or with an error and the
+// mutex released.
+func (h *coordHost) lockForWrite(ctx context.Context) error {
+	h.c.mu.Lock()
+	if err := h.writableLocked(ctx, h.runningLocked()); err != nil {
+		h.c.mu.Unlock()
+		return err
 	}
 	return nil
 }
@@ -126,78 +123,38 @@ func (h *coordHost) Transfer(ctx context.Context, req TransferRequest) (uint64, 
 		return 0, fmt.Errorf("thread: %s is unavailable", to.name)
 	}
 
-	var a *activation
-	briefVis, replyVis := Shared, Shared
-	for {
-		c.mu.Lock()
-		a, err = h.checkTransferLocked(req.Epoch)
-		if err != nil {
-			c.mu.Unlock()
-			return 0, err
-		}
-		// An edge may still hand an edge-only request to the cloud, but only
-		// through a brief the disclosure policy clears (plan §12): the
-		// request itself stays a gap in the cloud's projection. A cloud
-		// caller never saw the request.
-		private := c.privateLocked(h.ps, a, req.Private) ||
-			(h.ps.desc.Zone == ZoneEdge && c.cycle.disclosure == DiscloseEdgeOnly)
-		c.mu.Unlock()
-
-		brief := req.Brief.Render()
-		if private {
-			if to.desc.Zone == ZoneCloud {
-				if err := h.cloudSafe(ctx, brief); err != nil {
-					return 0, err
-				}
-			} else {
-				briefVis = c.visibility(ctx, h.ps, true, brief)
-			}
-			replyVis = c.visibility(ctx, h.ps, true, joinNonEmpty(req.Text, req.Digest.Render()))
-		}
-
-		c.mu.Lock()
-		if a, err = h.checkTransferLocked(req.Epoch); err != nil {
-			c.mu.Unlock()
-			return 0, err
-		}
-		if err := h.writableLocked(ctx, a); err != nil {
-			c.mu.Unlock()
-			return 0, err
-		}
-		if private || !c.privateLocked(h.ps, a, req.Private) {
-			break
-		}
-		// The caller turned private while the policy was asked: decide again.
-		c.mu.Unlock()
-	}
+	c.mu.Lock()
 	defer c.mu.Unlock()
+	a, err := h.checkTransferLocked(req.Epoch)
+	if err != nil {
+		return 0, err
+	}
+	if err := h.writableLocked(ctx, a); err != nil {
+		return 0, err
+	}
 	t := a.trigger.Seq
 	var batch []Entry
 	steered := a.steeredSeqs()
 	if strings.TrimSpace(req.Text) != "" || cloneDigest(req.Digest) != nil {
 		batch = append(batch, Entry{
-			Kind:       KindReply,
-			Origin:     Origin{Participant: h.ps.name},
-			Visibility: replyVis,
-			BasedOn:    t,
-			Content:    textContent(req.Text),
-			Digest:     cloneDigest(req.Digest),
-			Tainted:    req.Tainted,
-			Steered:    steered,
-			DedupKey:   "reply:" + a.id,
+			Kind:     KindReply,
+			Origin:   Origin{Participant: h.ps.name},
+			BasedOn:  t,
+			Content:  textContent(req.Text),
+			Digest:   cloneDigest(req.Digest),
+			Steered:  steered,
+			DedupKey: "reply:" + a.id,
 		})
 		steered = nil
 	}
 	b := req.Brief
 	batch = append(batch, Entry{
-		Kind:       KindOwnerChange,
-		Origin:     req.From,
-		Visibility: briefVis,
-		BasedOn:    t,
-		Steered:    steered,
-		Owner:      &OwnerChange{From: h.ps.name, To: to.name, Reason: ReasonTransfer, Brief: cloneBrief(&b)},
-		Tainted:    req.Tainted,
-		DedupKey:   "transfer:" + a.id,
+		Kind:     KindOwnerChange,
+		Origin:   req.From,
+		BasedOn:  t,
+		Steered:  steered,
+		Owner:    &OwnerChange{From: h.ps.name, To: to.name, Reason: ReasonTransfer, Brief: cloneBrief(&b)},
+		DedupKey: "transfer:" + a.id,
 	})
 	stored, err := c.appendLocked(batch, &Guard{Owner: c.owner, Epoch: c.epoch})
 	if err != nil {
@@ -222,11 +179,6 @@ func (h *coordHost) Transfer(ctx context.Context, req TransferRequest) (uint64, 
 		c.emitEntriesLocked(stored)
 	}
 	h.ps.lastSealed = oc.Seq
-	for i := range stored {
-		if stored[i].Visibility == EdgeOnly {
-			h.ps.raisePrivateLocked()
-		}
-	}
 	c.startForegroundLocked(na)
 	return oc.Seq, nil
 }
@@ -258,24 +210,21 @@ func (h *coordHost) Assign(ctx context.Context, req AssignRequest) (string, uint
 		return "", 0, fmt.Errorf("thread: task depth %d reached the limit of %d; do the work here or report back", depth, c.cfg.Limits.MaxAssignDepth)
 	}
 
-	vis, err := h.decideLocked(ctx, req.Private, []*partState{to}, joinNonEmpty(req.Text, refsText(req.Refs)))
-	if err != nil {
+	if err := h.lockForWrite(ctx); err != nil {
 		return "", 0, err
 	}
 	defer c.mu.Unlock()
 	c.nextTask++
 	id := fmt.Sprintf("t-%d", c.nextTask)
 	stored := c.commitLocked(h.ps.name, []Entry{{
-		Kind:       KindAssign,
-		Origin:     req.From,
-		To:         []string{to.name},
-		Visibility: vis,
-		BasedOn:    h.basedOnLocked(),
-		Task:       &Task{ID: id, Notify: req.Notify},
-		Content:    textContent(req.Text),
-		Refs:       slices.Clone(req.Refs),
-		Tainted:    req.Tainted,
-		DedupKey:   "task:" + c.runID + ":" + id,
+		Kind:     KindAssign,
+		Origin:   req.From,
+		To:       []string{to.name},
+		BasedOn:  h.basedOnLocked(),
+		Task:     &Task{ID: id, Notify: req.Notify},
+		Content:  textContent(req.Text),
+		Refs:     slices.Clone(req.Refs),
+		DedupKey: "task:" + c.runID + ":" + id,
 	}}, nil)
 	if len(stored) != 1 {
 		return "", 0, errors.New("thread: the task could not be recorded")
@@ -287,59 +236,6 @@ func (h *coordHost) Assign(ctx context.Context, req AssignRequest) (string, uint
 	c.tasks[tk.seq] = tk
 	c.queueTaskLocked(tk, &stored[0])
 	return id, tk.seq, nil
-}
-
-// decideLocked decides the visibility of a write and returns with the mutex
-// held, ready to commit, or with an error and the mutex released. The
-// disclosure policy runs without the mutex; when the caller turned private
-// meanwhile the decision is made again, so a write is never committed under
-// a decision made for a context that no longer holds.
-func (h *coordHost) decideLocked(ctx context.Context, extra bool, recipients []*partState, content string) (Visibility, error) {
-	c := h.c
-	for {
-		c.mu.Lock()
-		private := c.privateLocked(h.ps, h.runningLocked(), extra)
-		c.mu.Unlock()
-		vis, err := h.writeVisibility(ctx, private, recipients, content)
-		c.mu.Lock()
-		if werr := h.writableLocked(ctx, h.runningLocked()); werr != nil {
-			c.mu.Unlock()
-			return "", werr
-		}
-		if err != nil {
-			c.mu.Unlock()
-			return "", err
-		}
-		if private || !c.privateLocked(h.ps, h.runningLocked(), extra) {
-			return vis, nil
-		}
-		c.mu.Unlock()
-	}
-}
-
-// writeVisibility applies the write rule for a request; a private edge
-// writing to a cloud recipient must be cleared by the disclosure policy.
-func (h *coordHost) writeVisibility(ctx context.Context, private bool, recipients []*partState, content string) (Visibility, error) {
-	if !private {
-		return Shared, nil
-	}
-	for _, r := range recipients {
-		if r.desc.Zone == ZoneCloud {
-			if err := h.cloudSafe(ctx, content); err != nil {
-				return "", err
-			}
-			return Shared, nil
-		}
-	}
-	return h.c.visibility(ctx, h.ps, true, content), nil
-}
-
-func refsText(refs []ArtifactRef) string {
-	lines := make([]string, 0, len(refs))
-	for _, r := range refs {
-		lines = append(lines, renderRef(r))
-	}
-	return strings.Join(lines, "\n")
 }
 
 // Report publishes a result to other participants. A Notify report wakes a
@@ -369,21 +265,18 @@ func (h *coordHost) Report(ctx context.Context, req ReportRequest) (uint64, erro
 		to = append(to, name)
 		recipients = append(recipients, ps)
 	}
-	vis, err := h.decideLocked(ctx, req.Private, recipients, joinNonEmpty(req.Text, refsText(req.Refs)))
-	if err != nil {
+	if err := h.lockForWrite(ctx); err != nil {
 		return 0, err
 	}
 	defer c.mu.Unlock()
 	e := Entry{
-		Kind:       KindReport,
-		Origin:     req.From,
-		To:         to,
-		Visibility: vis,
-		BasedOn:    h.basedOnLocked(),
-		Notify:     req.Notify,
-		Content:    textContent(req.Text),
-		Refs:       slices.Clone(req.Refs),
-		Tainted:    req.Tainted,
+		Kind:    KindReport,
+		Origin:  req.From,
+		To:      to,
+		BasedOn: h.basedOnLocked(),
+		Notify:  req.Notify,
+		Content: textContent(req.Text),
+		Refs:    slices.Clone(req.Refs),
 	}
 	if req.TaskID != "" {
 		e.Task = &Task{ID: req.TaskID, Notify: req.Notify}
@@ -391,9 +284,6 @@ func (h *coordHost) Report(ctx context.Context, req ReportRequest) (uint64, erro
 	stored := c.commitLocked(h.ps.name, []Entry{e}, nil)
 	if len(stored) != 1 {
 		return 0, errors.New("thread: the report could not be recorded")
-	}
-	if vis == EdgeOnly {
-		h.ps.raisePrivateLocked()
 	}
 	if req.Notify {
 		for _, r := range recipients {
@@ -413,39 +303,31 @@ func (h *coordHost) Publish(ctx context.Context, req PublishRequest) (uint64, er
 	if len(req.Refs) == 0 {
 		return 0, errors.New("thread: publish needs at least one artifact reference")
 	}
-	vis, err := h.decideLocked(ctx, req.Private, nil, joinNonEmpty(req.Text, refsText(req.Refs)))
-	if err != nil {
+	if err := h.lockForWrite(ctx); err != nil {
 		return 0, err
 	}
 	defer c.mu.Unlock()
 	stored := c.commitLocked(h.ps.name, []Entry{{
-		Kind:       KindArtifact,
-		Origin:     req.From,
-		Visibility: vis,
-		BasedOn:    h.basedOnLocked(),
-		Refs:       slices.Clone(req.Refs),
-		Content:    textContent(req.Text),
-		Tainted:    req.Tainted,
+		Kind:    KindArtifact,
+		Origin:  req.From,
+		BasedOn: h.basedOnLocked(),
+		Refs:    slices.Clone(req.Refs),
+		Content: textContent(req.Text),
 	}}, nil)
 	if len(stored) != 1 {
 		return 0, errors.New("thread: the artifact could not be recorded")
 	}
-	if vis == EdgeOnly {
-		h.ps.raisePrivateLocked()
-	}
 	return stored[0].Seq, nil
 }
 
-// Read returns the entries the reader's zone may read. With Seqs it returns
-// exactly those entries, leaving out unknown and unreadable ones without
-// saying which.
+// Read returns entries of the log. With Seqs it returns exactly those
+// entries, leaving out unknown ones without saying which.
 func (h *coordHost) Read(ctx context.Context, reader string, q ReadQuery) ([]Entry, error) {
 	if err := h.caller(reader); err != nil {
 		return nil, err
 	}
-	z := h.ps.desc.Zone
 	if len(q.Seqs) == 0 {
-		return h.c.store.Read(ctx, q.After, Filter{Zone: z, Kinds: q.Kinds}, q.Limit)
+		return h.c.store.Read(ctx, q.After, Filter{Kinds: q.Kinds}, q.Limit)
 	}
 	var out []Entry
 	for _, seq := range q.Seqs {
@@ -453,7 +335,7 @@ func (h *coordHost) Read(ctx context.Context, reader string, q ReadQuery) ([]Ent
 		if err != nil {
 			return nil, err
 		}
-		if !ok || !z.CanRead(e.EffectiveVisibility()) || (len(q.Kinds) > 0 && !slices.Contains(q.Kinds, e.Kind)) {
+		if !ok || (len(q.Kinds) > 0 && !slices.Contains(q.Kinds, e.Kind)) {
 			continue
 		}
 		out = append(out, e)
@@ -469,7 +351,7 @@ func (h *coordHost) EventOutline(reader string, limit int) []EventSummary {
 	if h.caller(reader) != nil {
 		return nil
 	}
-	return h.c.events.Outline(h.ps.desc.Zone, h.c.cfg.CloudReadsEdge, limit)
+	return h.c.events.Outline(h.ps.desc.Zone, limit)
 }
 
 // EventSearch searches the event records the reader may read.
@@ -477,7 +359,7 @@ func (h *coordHost) EventSearch(reader, query string, limit int) []EventSummary 
 	if h.caller(reader) != nil {
 		return nil
 	}
-	return h.c.events.Search(h.ps.desc.Zone, h.c.cfg.CloudReadsEdge, query, limit)
+	return h.c.events.Search(h.ps.desc.Zone, query, limit)
 }
 
 // EventPage reads one page of an event record the reader may read.
@@ -485,23 +367,14 @@ func (h *coordHost) EventPage(reader, id string, offset, limit int) (string, int
 	if err := h.caller(reader); err != nil {
 		return "", 0, err
 	}
-	return h.c.events.Page(h.ps.desc.Zone, h.c.cfg.CloudReadsEdge, id, offset, limit)
+	return h.c.events.Page(h.ps.desc.Zone, id, offset, limit)
 }
 
-// RecordEvent stores a tool output under the caller's name and zone. The
-// record is EdgeOnly when the caller says so, or when the caller is an edge
-// participant whose context the Coordinator knows to be private.
+// RecordEvent stores a tool output under the caller's name and zone.
 func (h *coordHost) RecordEvent(r EventRecord) string { //nolint:gocritic // the Host interface takes records by value
 	r.Origin.Participant = h.ps.name
 	r.Zone = h.ps.desc.Zone
-	c := h.c
-	c.mu.Lock()
-	private := c.privateLocked(h.ps, h.runningLocked(), false)
-	c.mu.Unlock()
-	if private {
-		r.Visibility = EdgeOnly
-	}
-	return c.events.Add(r)
+	return h.c.events.Add(r)
 }
 
 // RecordUsage records a model call under the caller's name.

@@ -16,44 +16,11 @@ import (
 
 // ---------------------------------------------------------------- routing
 
-// Disclosure is what the host's disclosure policy decided about a query.
-type Disclosure string
-
-const (
-	// DiscloseShared may go to the cloud.
-	DiscloseShared Disclosure = "shared"
-	// DiscloseEdgeOnly must stay on the edge.
-	DiscloseEdgeOnly Disclosure = "edge_only"
-	// DiscloseUnclassified is resolved by Coordinator.Submit from the edge
-	// participant's taint (Participant.State) when the query is submitted.
-	// While the edge is tainted the query is DiscloseEdgeOnly in every
-	// respect: its user_input entry is edge_only, so no cloud participant
-	// imports it, reads it or receives it through Pending, and its query
-	// cycle never goes to the cloud by routing or failover, also after a
-	// restart; an edge Transfer hands it over only through a brief the
-	// DisclosurePolicy clears, and a restart resumes such a Transfer on the
-	// cloud from that brief. Otherwise the entry is shared, and routing still keeps
-	// the query off the cloud if the edge is tainted when the query is
-	// routed.
-	DiscloseUnclassified Disclosure = "unclassified"
-)
-
-// Visibility returns the visibility of a user_input entry with this
-// disclosure once it is resolved: EdgeOnly for DiscloseEdgeOnly, Shared
-// otherwise. An unclassified query submitted while the edge is tainted is
-// resolved to DiscloseEdgeOnly first (see DiscloseUnclassified).
-func (d Disclosure) Visibility() Visibility {
-	if d == DiscloseEdgeOnly {
-		return EdgeOnly
-	}
-	return Shared
-}
-
 // RouteCandidate is one participant as the router sees it.
 type RouteCandidate struct {
 	Descriptor Descriptor
 	Available  bool
-	// Lag is the number of entries it may read that it has not imported yet.
+	// Lag is the number of entries it has not imported yet.
 	Lag uint64
 }
 
@@ -61,20 +28,13 @@ type RouteCandidate struct {
 type RouteRequest struct {
 	OperationID  string // one per query; reused on retries
 	Query        string
-	Disclosure   Disclosure
 	Owner        string // current owner, "" at the start
 	Explicit     string // a participant the user named, "" if none
 	NeedsGroups  []string
 	Participants []RouteCandidate
-	EdgeTainted  bool
 	PeerSummary  string // newest summary written for the edge window, "" if none
 	SummaryStale bool
-	// Recent are the newest log entries, newest last, NOT filtered by zone:
-	// they include edge_only entries, because a classifier running on the
-	// device may need them. A Router that sends Recent, or anything built
-	// from it, off the device (to a hosted classifier, a log service or a
-	// cloud model) MUST first drop every entry whose EffectiveVisibility is
-	// not Shared, or it leaks edge-only content.
+	// Recent are the newest log entries, newest last.
 	Recent []Entry
 }
 
@@ -125,25 +85,15 @@ type Sync struct {
 	// PeerSummary, when non-nil, is a summary entry written for this
 	// participant's window. Imported messages it covers are dropped.
 	PeerSummary *Entry
-	// Index, when non-nil, replaces the thread index text.
-	Index *string
 	// Messages are projected entries, each carrying SeqMetadataKey.
 	Messages []*message.Msg
 	// Cursor is the new cursor; zero keeps it. It never moves back.
 	Cursor uint64
-	// Taint, when non-nil, sets or clears the participant's taint state.
-	Taint *bool
-	// Private, when non-nil, sets or clears the participant's privacy
-	// (ParticipantState.Private) in the same update: set when the Sync
-	// brings edge-only material into an edge participant, cleared by a
-	// clear that brings none.
-	Private *bool
 }
 
 // Empty reports whether s changes nothing.
 func (s *Sync) Empty() bool {
-	return s == nil || (!s.Reset && s.PeerSummary == nil && s.Index == nil && len(s.Messages) == 0 && s.Cursor == 0 &&
-		s.Taint == nil && s.Private == nil)
+	return s == nil || (!s.Reset && s.PeerSummary == nil && len(s.Messages) == 0 && s.Cursor == 0)
 }
 
 // ParticipantState is a participant's current view of itself.
@@ -158,15 +108,7 @@ type ParticipantState struct {
 	// CompactAt is the estimated input at which the participant compacts
 	// its context (agent.ThreadView.CompactAt), 0 when unknown.
 	CompactAt int
-	Tainted   bool
-	// Private reports whether an edge participant's context may hold
-	// edge-only material: anything edge-only it imported, read or produced
-	// since its last clear, saved with the state that holds it (see
-	// agent.WithPrivacyProbe); an activation that ends Private leaves it
-	// set. After a restart the Coordinator trusts it, so an edge participant
-	// must report it from its restored checkpoint.
-	Private bool
-	Busy    bool // an activation is running
+	Busy      bool // an activation is running
 }
 
 // Activation starts one reply of a participant.
@@ -202,9 +144,7 @@ type ActivationEnd struct {
 	// the activation started (or since the last Transfer sealed it), joined.
 	Text      string
 	Digest    *ToolDigest
-	ToolCalls int  // tool calls that started executing
-	Tainted   bool // the activation read untrusted content
-	Private   bool // the activation read edge-only content (edge participants)
+	ToolCalls int // tool calls that started executing
 }
 
 // Participant wraps one agent (or a master agent with sub-agents) for the
@@ -292,10 +232,8 @@ type TransferRequest struct {
 	Brief Brief
 	// Text and Digest are what the caller showed since the activation started;
 	// they are sealed as its reply in the same append as the owner change.
-	Text    string
-	Digest  *ToolDigest
-	Tainted bool
-	Private bool
+	Text   string
+	Digest *ToolDigest
 	// EventsBefore is the number of ActivationEvent items (with Event set)
 	// the participant had sent on the activation's channel before this call.
 	// The Coordinator still forwards those to the user after the foreground
@@ -309,36 +247,30 @@ type TransferRequest struct {
 
 // AssignRequest starts a background task on another participant.
 type AssignRequest struct {
-	From    Origin
-	Epoch   uint64
-	Depth   int // depth of the calling activation
-	To      string
-	Text    string
-	Notify  bool
-	Refs    []ArtifactRef
-	Tainted bool
-	Private bool
+	From   Origin
+	Epoch  uint64
+	Depth  int // depth of the calling activation
+	To     string
+	Text   string
+	Notify bool
+	Refs   []ArtifactRef
 }
 
 // ReportRequest publishes a result to other participants.
 type ReportRequest struct {
-	From    Origin
-	Text    string
-	To      []string
-	TaskID  string
-	Notify  bool
-	Refs    []ArtifactRef
-	Tainted bool
-	Private bool
+	From   Origin
+	Text   string
+	To     []string
+	TaskID string
+	Notify bool
+	Refs   []ArtifactRef
 }
 
 // PublishRequest records an artifact.
 type PublishRequest struct {
-	From    Origin
-	Refs    []ArtifactRef
-	Text    string
-	Tainted bool
-	Private bool
+	From Origin
+	Refs []ArtifactRef
+	Text string
 }
 
 // ReadQuery selects entries for thread_read.
@@ -357,17 +289,12 @@ type ReadQuery struct {
 var ErrInterrupted = errors.New("thread: the calling activation was interrupted")
 
 // Host is what a participant and its tools see of the Coordinator. Every
-// method is safe for concurrent use. Reads are filtered by the reader's zone.
+// method is safe for concurrent use.
 //
 // Writes check, in the same step as their append, that the Coordinator is
 // open (ErrClosed otherwise), and that neither the caller's running
 // activation nor ctx was canceled (ErrInterrupted otherwise). A write made
 // while the caller has no running activation checks only ctx.
-//
-// RecordEvent keeps the record's Visibility, and stores it as EdgeOnly when
-// the caller is an edge participant whose context the Coordinator knows to
-// hold edge-only material (the effective visibility is the stricter of the
-// two).
 type Host interface {
 	Transfer(ctx context.Context, req TransferRequest) (uint64, error)
 	Assign(ctx context.Context, req AssignRequest) (taskID string, seq uint64, err error)

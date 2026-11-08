@@ -24,13 +24,6 @@ type AgentConfig struct {
 	// and with a PermissionContext when a writing thread tool is installed.
 	// The participant owns its reply lifecycle from then on.
 	Agent *agent.UnifiedAgent
-	// TaintingTools are tool names whose results come from untrusted sources
-	// (web fetch, web search, email). After one runs, the activation is
-	// tainted.
-	TaintingTools []string
-	// PrivateTools are tool names whose results are edge-only data (device
-	// sensors, local files the user marked private). Edge participants only.
-	PrivateTools []string
 	// CaptureOutputs records each tool result into the host's event list.
 	// The default is false: stage 0 measured no gain from the event list, so
 	// it is opt-in (set this on the cloud participant and add event_read to
@@ -56,11 +49,6 @@ type PrepareOptions struct {
 	// event_read (opt-in, see AgentConfig.CaptureOutputs) for the cloud zone,
 	// and also but publish_artifact for the edge.
 	Tools []string
-	// TaintGate lists tool names or toolkit groups gated while the agent is
-	// tainted; it replaces the default, which gates transfer, assign_task,
-	// report and publish_artifact (an injected prompt must not be able to
-	// move data out). The gate needs the agent's permission engine.
-	TaintGate []string
 	// LoopHooks are the host's own loop hooks. agent.WithLoopHooks replaces
 	// earlier hooks, so pass them here instead of with a separate option.
 	LoopHooks []loop.Hook
@@ -87,8 +75,7 @@ func Prepare(d thread.Descriptor, opts PrepareOptions) (*Prepared, error) { //no
 
 // Options returns the agent options: boundary input (WithBoundaryInput), the
 // participant's loop hook with PrepareOptions.LoopHooks (WithLoopHooks),
-// WithExclusiveTools("transfer"), WithTaintGate and, for the cloud zone,
-// WithForkCapture. Apply them after any option they would otherwise replace.
+// WithExclusiveTools("transfer") and, for the cloud zone, WithForkCapture. Apply them after any option they would otherwise replace.
 func (p *Prepared) Options() []agent.AgentOption { return p.c.options() }
 
 // Tools returns the thread tools to install in the agent's toolkit.
@@ -106,7 +93,7 @@ func (p *Prepared) Participant(cfg AgentConfig) (*AgentParticipant, error) { //n
 	}
 	if cfg.Agent.PermissionEngine() == nil && p.c.hasWriteTools() {
 		return nil, fmt.Errorf("participant %s: the agent needs a PermissionContext: the writing thread tools "+
-			"are answered through its external-result channel and the taint gate runs in its permission engine", p.c.desc.Name)
+			"are answered through its external-result channel", p.c.desc.Name)
 	}
 	if err := cfg.Descriptor.Validate(); err != nil {
 		return nil, err
@@ -123,10 +110,7 @@ func (p *Prepared) Participant(cfg AgentConfig) (*AgentParticipant, error) { //n
 
 // NewAgentParticipant wraps an agent built without Prepare: it has no thread
 // tools and no boundary input, so entries that arrive during an activation
-// wait for the next one, and taint from TaintingTools reaches the agent when
-// the activation ends. On the edge it also has no privacy probe: privacy
-// from PrivateTools or a private trigger is saved when the activation ends,
-// so a checkpoint the agent saves during the reply may lack it.
+// wait for the next one.
 func NewAgentParticipant(cfg AgentConfig) (*AgentParticipant, error) { //nolint:gocritic // the value parameter keeps the documented API
 	c, err := newCore(cfg.Descriptor, PrepareOptions{}, false)
 	if err != nil {
@@ -139,7 +123,7 @@ func newAgentParticipant(c *core, cfg *AgentConfig) (*AgentParticipant, error) {
 	if cfg.Agent == nil {
 		return nil, errors.New("participant: AgentConfig.Agent is required")
 	}
-	c.configure(cfg.TaintingTools, cfg.PrivateTools, cfg.CaptureOutputs, cfg.MaxEventOutput)
+	c.configure(cfg.CaptureOutputs, cfg.MaxEventOutput)
 	return &AgentParticipant{c: c, agent: cfg.Agent, keepToolChoice: cfg.KeepForkToolChoice, forkGuard: cfg.ForkGuard}, nil
 }
 
@@ -173,13 +157,12 @@ func (p *AgentParticipant) Release(h thread.Host) { p.c.release(h) }
 
 // State reports the agent's thread view plus whether an activation runs. The
 // agent is the host's: when the host restores it from a checkpoint before
-// binding the participant, the view already holds the restored cursor,
-// taint and privacy.
+// binding the participant, the view already holds the restored cursor.
 func (p *AgentParticipant) State() thread.ParticipantState {
 	busy := p.c.busy()
 	v := p.agent.ThreadView()
 	return thread.ParticipantState{Cursor: v.Cursor, InputTokens: v.InputTokens, Window: v.Window, SummaryTokens: v.SummaryTokens,
-		CompactAt: v.CompactAt, Tainted: v.Tainted, Private: v.Private, Busy: busy}
+		CompactAt: v.CompactAt, Busy: busy}
 }
 
 // Sync applies s between activations; it refuses while busy.
@@ -222,11 +205,6 @@ func (p *AgentParticipant) Activate(ctx context.Context, act thread.Activation) 
 		return nil, err
 	}
 	if !act.Sync.Empty() {
-		// Marked before the update is applied: the checkpoint that holds it
-		// must hold the flag too.
-		if p.c.importsEdgeOnly(ctx, host, act.Sync) {
-			a.markPrivate()
-		}
 		u, err := toUpdate(act.Sync)
 		if err == nil {
 			err = p.agent.ApplyThreadUpdate(ctx, u)
@@ -246,14 +224,12 @@ func (p *AgentParticipant) Activate(ctx context.Context, act thread.Activation) 
 	replyCtx, cancel := context.WithCancel(ctx)
 	replyCtx, scope := runctx.New(replyCtx)
 	a.ctx = replyCtx
-	stop := context.AfterFunc(replyCtx, a.close)
 	rctx := replyCtx
 	if act.Trigger.Seq > 0 {
 		rctx = agent.WithThreadInput(replyCtx, act.Trigger.Seq)
 	}
 	stream, err := p.agent.ReplyStream(rctx, act.Input)
 	if err != nil {
-		stop()
 		cancel()
 		scope.Close()
 		release()
@@ -289,8 +265,6 @@ func (p *AgentParticipant) Activate(ctx context.Context, act thread.Activation) 
 		cancel()
 		scope.Close()
 		release()
-		stop()
-		a.close()
 		end := t.end(ctx.Err(), nil)
 		p.settle(ctx, t, end)
 		p.c.endActivation()
@@ -300,26 +274,14 @@ func (p *AgentParticipant) Activate(ctx context.Context, act thread.Activation) 
 }
 
 // settle brings the idle agent in line with what the activation did, before
-// the next activation can start: the taint it has not been told about (no
-// boundary ran after the untrusted read), an edge run's privacy (the probe
-// marks only the checkpoints an agent with a StateSaver writes; an agent
-// built without Prepare has no probe), and a note for each writing call
-// whose answer it did not record (tracker.notes). It always saves the agent's
+// the next activation can start: a note for each writing call whose answer
+// it did not record (tracker.notes). It always saves the agent's
 // state, even with nothing to apply: the agent does not checkpoint after a
 // final answer, and an agent the host restores later must hold the whole
 // reply. ApplyThreadUpdate saves through the agent's StateSaver (a no-op
 // without one); a failure is reported in end.
 func (p *AgentParticipant) settle(ctx context.Context, t *tracker, end *thread.ActivationEnd) {
 	u := agent.ThreadUpdate{Messages: t.notes()}
-	view := p.agent.ThreadView()
-	if end.Tainted && !view.Tainted {
-		v := true
-		u.Taint = &v
-	}
-	if _, private := t.act.flags(); private && !view.Private && p.c.desc.Zone == thread.ZoneEdge {
-		v := true
-		u.Private = &v
-	}
 	if err := p.agent.ApplyThreadUpdate(context.WithoutCancel(ctx), u); err != nil {
 		reportSettle(p.c.desc.Name, end, fmt.Errorf("participant %s: update the agent after the reply: %w", p.c.desc.Name, err))
 	}

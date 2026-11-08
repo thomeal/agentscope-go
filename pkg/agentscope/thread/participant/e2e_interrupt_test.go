@@ -11,38 +11,12 @@ import (
 
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/agent"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/event"
-	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/model"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/thread"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/thread/participant"
 )
 
 // This file covers the end of an interrupted activation, the user's stream
-// around a transfer, the privacy of edge tool outputs and restarts, over the
-// session of e2e_test.go.
-
-// blockingPolicy is the keyword policy, except that it holds any text with
-// marker until release closes: a disclosure check the test can block.
-type blockingPolicy struct {
-	marker  string
-	entered chan struct{}
-	release chan struct{}
-	enter   sync.Once
-	open    sync.Once
-}
-
-func newBlockingPolicy(marker string) *blockingPolicy {
-	return &blockingPolicy{marker: marker, entered: make(chan struct{}), release: make(chan struct{})}
-}
-
-func (p *blockingPolicy) Classify(ctx context.Context, text string) (thread.Visibility, error) {
-	if strings.Contains(text, p.marker) {
-		p.enter.Do(func() { close(p.entered) })
-		<-p.release
-	}
-	return canaryPolicy{}.Classify(ctx, text)
-}
-
-func (p *blockingPolicy) unblock() { p.open.Do(func() { close(p.release) }) }
+// around a transfer and restarts, over the session of e2e_test.go.
 
 // interrupted checks that the activation answering log's query ended
 // interrupted: one interrupted marker (an unknown_effects marker may follow).
@@ -84,22 +58,39 @@ func checkNotDone(t *testing.T, tool string) turn {
 	}, say("EDGE: nothing was sent."))
 }
 
-// TestE2EInterruptedTransferIsReportedNotDone interrupts a private edge
-// while the Coordinator's disclosure check of its transfer brief blocks. The
-// Coordinator refuses the transfer as interrupted, nothing is written, and
-// the edge's next request says the transfer was not done.
+// blockedEdge returns an edge wrapper whose first transfer or assign waits,
+// after the participant sent it and before the Coordinator commits it, until
+// the returned release runs; entered closes when it waits.
+func blockedEdge() (edge *hookedEdge, entered <-chan struct{}, release func()) {
+	in, out := make(chan struct{}), make(chan struct{})
+	var enter, open sync.Once
+	edge = &hookedEdge{beforeWrite: func() {
+		enter.Do(func() {
+			close(in)
+			<-out
+		})
+	}}
+	return edge, in, func() { open.Do(func() { close(out) }) }
+}
+
+// TestE2EInterruptedTransferIsReportedNotDone interrupts the edge while its
+// transfer waits on the way to the Coordinator. The Coordinator refuses the
+// transfer as interrupted, nothing is written, and the edge's next request
+// says the transfer was not done.
 func TestE2EInterruptedTransferIsReportedNotDone(t *testing.T) {
-	policy := newBlockingPolicy("BLOCK-ME")
-	defer policy.unblock()
-	s := newSession(t, &sessionOptions{disclosure: policy})
+	edge, entered, release := blockedEdge()
+	defer release()
+	s := newSession(t, &sessionOptions{wrapEdge: func(p *participant.AgentParticipant) thread.Participant {
+		edge.AgentParticipant = p
+		return edge
+	}})
 	s.edge.script(
-		act("", toolCall("door_lock", map[string]any{"code": canary})),
-		act("", toolCall(participant.ToolTransfer, map[string]any{"to": "cloud", "goal": "BLOCK-ME plan the trip", "remaining": []any{"plan it"}})),
+		act("", toolCall(participant.ToolTransfer, map[string]any{"to": "cloud", "goal": "plan the trip", "remaining": []any{"plan it"}})),
 	)
-	q := s.submit(&thread.Query{Text: "Set the door code, then let the cloud plan my trip.", Disclosure: thread.DiscloseShared, Explicit: "edge"})
-	waitClosed(t, policy.entered, "the disclosure check of the transfer brief")
+	q := s.submit(&thread.Query{Text: "Let the cloud plan my trip.", Explicit: "edge"})
+	waitClosed(t, entered, "the transfer to reach the host")
 	s.c.Interrupt()
-	policy.unblock()
+	release()
 	s.settle()
 
 	log := s.since(q)
@@ -112,25 +103,26 @@ func TestE2EInterruptedTransferIsReportedNotDone(t *testing.T) {
 		t.Fatalf("owner = %s", owner)
 	}
 	s.edge.script(checkNotDone(t, participant.ToolTransfer))
-	s.submit(&thread.Query{Text: "Did the cloud get it?", Disclosure: thread.DiscloseShared, Explicit: "edge"})
+	s.submit(&thread.Query{Text: "Did the cloud get it?", Explicit: "edge"})
 	s.settle()
 }
 
 // TestE2EInterruptedAssignIsReportedNotDone is the same for assign_task: the
-// disclosure check of the task text blocks, the Coordinator refuses the task
-// as interrupted, and no task starts.
+// Coordinator refuses the task as interrupted, and no task starts.
 func TestE2EInterruptedAssignIsReportedNotDone(t *testing.T) {
-	policy := newBlockingPolicy("BLOCK-ME")
-	defer policy.unblock()
-	s := newSession(t, &sessionOptions{disclosure: policy})
+	edge, entered, release := blockedEdge()
+	defer release()
+	s := newSession(t, &sessionOptions{wrapEdge: func(p *participant.AgentParticipant) thread.Participant {
+		edge.AgentParticipant = p
+		return edge
+	}})
 	s.edge.script(
-		act("", toolCall("door_lock", map[string]any{"code": canary})),
-		act("", toolCall(participant.ToolAssignTask, map[string]any{"to": "cloud", "task": "BLOCK-ME look up the weather"})),
+		act("", toolCall(participant.ToolAssignTask, map[string]any{"to": "cloud", "task": "look up the weather"})),
 	)
-	q := s.submit(&thread.Query{Text: "Set the door code, then have the cloud check the weather.", Disclosure: thread.DiscloseShared, Explicit: "edge"})
-	waitClosed(t, policy.entered, "the disclosure check of the task")
+	q := s.submit(&thread.Query{Text: "Have the cloud check the weather.", Explicit: "edge"})
+	waitClosed(t, entered, "the task to reach the host")
 	s.c.Interrupt()
-	policy.unblock()
+	release()
 	s.settle()
 
 	log := s.since(q)
@@ -143,14 +135,15 @@ func TestE2EInterruptedAssignIsReportedNotDone(t *testing.T) {
 		t.Fatal("no task may reach the cloud")
 	}
 	s.edge.script(checkNotDone(t, participant.ToolAssignTask))
-	s.submit(&thread.Query{Text: "Is the weather check running?", Disclosure: thread.DiscloseShared, Explicit: "edge"})
+	s.submit(&thread.Query{Text: "Is the weather check running?", Explicit: "edge"})
 	s.settle()
 }
 
-// hookedEdge wraps the edge so a hook runs right after each Assign the
-// Coordinator committed for it.
+// hookedEdge wraps the edge so hooks run before each Transfer and Assign it
+// makes, and right after each Assign the Coordinator committed for it.
 type hookedEdge struct {
 	*participant.AgentParticipant
+	beforeWrite func()
 	afterAssign func(ctx context.Context, seq uint64)
 	host        *hookedHost
 }
@@ -160,7 +153,17 @@ type hookedHost struct {
 	e *hookedEdge
 }
 
+func (h *hookedHost) Transfer(ctx context.Context, req thread.TransferRequest) (uint64, error) { //nolint:gocritic // the thread.Host contract
+	if h.e.beforeWrite != nil {
+		h.e.beforeWrite()
+	}
+	return h.Host.Transfer(ctx, req)
+}
+
 func (h *hookedHost) Assign(ctx context.Context, req thread.AssignRequest) (string, uint64, error) { //nolint:gocritic // the thread.Host contract
+	if h.e.beforeWrite != nil {
+		h.e.beforeWrite()
+	}
 	id, seq, err := h.Host.Assign(ctx, req)
 	if err == nil && h.e.afterAssign != nil {
 		h.e.afterAssign(ctx, seq)
@@ -201,7 +204,7 @@ func TestE2ECommittedAssignNoteAfterInterrupt(t *testing.T) {
 	}})
 	s.edge.script(act("", toolCall(participant.ToolAssignTask, map[string]any{"to": "cloud", "task": "Look up the weather in Lisbon."})))
 	s.master.script(say("TASK: sunny."))
-	q := s.submit(&thread.Query{Text: "Have the cloud check the weather.", Disclosure: thread.DiscloseShared, Explicit: "edge"})
+	q := s.submit(&thread.Query{Text: "Have the cloud check the weather.", Explicit: "edge"})
 	s.settle()
 
 	log := s.since(q)
@@ -218,7 +221,7 @@ func TestE2ECommittedAssignNoteAfterInterrupt(t *testing.T) {
 			t.Errorf("the next request must name the committed task %q:\n%s", want, text)
 		}
 	}, say("EDGE: the cloud is on it.")))
-	s.submit(&thread.Query{Text: "Is the weather check running?", Disclosure: thread.DiscloseShared, Explicit: "edge"})
+	s.submit(&thread.Query{Text: "Is the weather check running?", Explicit: "edge"})
 	s.settle()
 	if n := len(find(s.log(), thread.KindAssign, "")); n != 1 {
 		t.Fatalf("the task must not be assigned again: %d assigns", n)
@@ -238,7 +241,7 @@ func TestE2ETextBeforeTransferReachesTheUser(t *testing.T) {
 	s.master.script(act("SHOWN-BEFORE: the lamp is a device task.", toolCall(participant.ToolTransfer, map[string]any{
 		"to": "edge", "goal": "Turn on the lamp", "remaining": []any{"switch the lamp on"}})))
 	s.edge.script(say("EDGE: the lamp is on."))
-	q := s.submit(&thread.Query{Text: "Turn on the lamp.", Disclosure: thread.DiscloseShared, Explicit: "cloud"})
+	q := s.submit(&thread.Query{Text: "Turn on the lamp.", Explicit: "cloud"})
 	deadline := time.Now().Add(20 * time.Second)
 	for len(find(s.since(q), thread.KindOwnerChange, "cloud")) == 0 {
 		if time.Now().After(deadline) {
@@ -271,52 +274,6 @@ func TestE2ETextBeforeTransferReachesTheUser(t *testing.T) {
 	}
 }
 
-// TestE2EPrivateEdgeOutputsStayOnTheEdge lets the cloud read edge tool
-// outputs. The edge's private tool output, and every output after it in the
-// same activation, is edge-only: the cloud's event_read never returns them.
-// (An output captured while the agent already ran ahead into a private tool
-// is edge-only too, so the shared output comes from an earlier activation.)
-func TestE2EPrivateEdgeOutputsStayOnTheEdge(t *testing.T) {
-	s := newSession(t, &sessionOptions{cloudReadsEdge: true})
-	s.edge.script(
-		act("", toolCall("device_control", map[string]any{"device": "hall light", "state": "on"})),
-		say("The hall light is on."),
-	)
-	s.submit(&thread.Query{Text: "Turn the hall light on.", Disclosure: thread.DiscloseShared, Explicit: "edge"})
-	s.settle()
-	s.edge.script(
-		act("", toolCall("door_lock", map[string]any{"code": canary})),
-		act("", toolCall("device_control", map[string]any{"device": "bedroom fan", "state": "off"})),
-		say("Done."),
-	)
-	s.submit(&thread.Query{Text: "Set my door code, then turn the fan off.", Disclosure: thread.DiscloseShared, Explicit: "edge"})
-	s.settle()
-	if got := s.evList.Outline(thread.ZoneCloud, true, 0); len(got) != 1 || !strings.Contains(got[0].FirstLine, "hall light") {
-		t.Fatalf("the cloud may read only the output before the private one: %+v", got)
-	}
-
-	s.master.script(
-		act("", toolCall(participant.ToolEventRead, map[string]any{"action": "outline"})),
-		inspect(func(c *wireCall) {
-			if !strings.Contains(c.text(), "hall light is now on") {
-				t.Errorf("the outline misses the shared output:\n%s", c.text())
-			}
-		}, act("", toolCall(participant.ToolEventRead, map[string]any{"action": "search", "query": "door"}))),
-		act("", toolCall(participant.ToolEventRead, map[string]any{"action": "page", "id": "ev-2"})),
-		act("", toolCall(participant.ToolEventRead, map[string]any{"action": "page", "id": "ev-3"})),
-		say("CLOUD: the hall light is on."),
-	)
-	s.submit(&thread.Query{Text: "What did the devices do?", Disclosure: thread.DiscloseShared, Explicit: "cloud"})
-	s.settle()
-	for i, c := range s.master.requests("") {
-		for _, secret := range []string{canary, "front door code", "bedroom fan is now off"} {
-			if strings.Contains(c.raw, secret) {
-				t.Fatalf("master request %d holds %q:\n%s", i, secret, c.text())
-			}
-		}
-	}
-}
-
 // TestE2EAgentParticipantRestart restarts a session whose edge agent the
 // host restores from its checkpoint. The rebuilt participant reports the
 // restored cursor, and the edge's next request holds the earlier question
@@ -329,7 +286,7 @@ func TestE2EAgentParticipantRestart(t *testing.T) {
 	}
 	s := newSession(t, &sessionOptions{store: first, persistEdge: true})
 	s.edge.script(say("EDGE-ANSWER-1: the lamp is on."))
-	q := s.submit(&thread.Query{Text: "Q-EDGE-1: turn on the lamp.", Disclosure: thread.DiscloseShared, Explicit: "edge"})
+	q := s.submit(&thread.Query{Text: "Q-EDGE-1: turn on the lamp.", Explicit: "edge"})
 	s.settle()
 	if st := s.edgeP.State(); st.Cursor < q {
 		t.Fatalf("edge state after the first query = %+v", st)
@@ -359,161 +316,6 @@ func TestE2EAgentParticipantRestart(t *testing.T) {
 			}
 		}
 	}, say("EDGE-ANSWER-2: it is still on.")))
-	s.submit(&thread.Query{Text: "Q-EDGE-2: is the lamp still on?", Disclosure: thread.DiscloseShared, Explicit: "edge"})
+	s.submit(&thread.Query{Text: "Q-EDGE-2: is the lamp still on?", Explicit: "edge"})
 	s.settle()
-}
-
-// askedPolicy is the keyword policy, recording every text it is asked
-// about: the Coordinator asks only about what a private edge writes.
-type askedPolicy struct {
-	mu    sync.Mutex
-	texts []string
-}
-
-func (p *askedPolicy) Classify(ctx context.Context, text string) (thread.Visibility, error) {
-	p.mu.Lock()
-	p.texts = append(p.texts, text)
-	p.mu.Unlock()
-	return canaryPolicy{}.Classify(ctx, text)
-}
-
-func (p *askedPolicy) asked(text string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, x := range p.texts {
-		if strings.Contains(x, text) {
-			return true
-		}
-	}
-	return false
-}
-
-// TestE2EPrivateRunSurvivesARestart: the edge answers a shared request with
-// a private tool (door_lock). The tool step's checkpoint already holds the
-// privacy flag next to the result, before the run ends; after a restart the
-// restored edge reports it, and the Coordinator treats the edge as private:
-// its next reply goes to the disclosure policy. Without the private tool
-// nothing of that happens.
-func TestE2EPrivateRunSurvivesARestart(t *testing.T) {
-	for _, private := range []bool{true, false} {
-		t.Run(fmt.Sprintf("private=%v", private), func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "thread.jsonl")
-			first, err := thread.OpenFileStore(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			policy := &askedPolicy{}
-			s := newSession(t, &sessionOptions{store: first, persistEdge: true, disclosure: policy})
-			call := toolCall("device_control", map[string]any{"device": "lamp", "state": "on"})
-			if private {
-				call = toolCall("door_lock", map[string]any{"code": "1234"})
-			}
-			s.edge.script(
-				act("", call),
-				inspect(func(*wireCall) {
-					st, err := agent.LoadCheckpoint(s.ctx, s.saver, "edge")
-					if err != nil || st.Private != private {
-						t.Errorf("the tool step's checkpoint: private %v, want %v (%v)", st != nil && st.Private, private, err)
-					}
-				}, say("EDGE-ANSWER-1: done.")),
-			)
-			s.submit(&thread.Query{Text: "Q-EDGE-1: do it.", Disclosure: thread.DiscloseShared, Explicit: "edge"})
-			s.settle()
-			if err := s.c.Close(); err != nil {
-				t.Fatal(err)
-			}
-			if err := first.Close(); err != nil {
-				t.Fatal(err)
-			}
-
-			second, err := thread.OpenFileStore(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = second.Close() })
-			s.rebuild(second)
-			if st := s.edgeP.State(); st.Private != private {
-				t.Fatalf("the restored edge reports private %v, want %v", st.Private, private)
-			}
-			s.edge.script(say("EDGE-ANSWER-2: still done."))
-			s.submit(&thread.Query{Text: "Q-EDGE-2: is it done?", Disclosure: thread.DiscloseShared, Explicit: "edge"})
-			s.settle()
-			if got := policy.asked("EDGE-ANSWER-2"); got != private {
-				t.Fatalf("the policy was asked about the reply after the restart: %v, want %v", got, private)
-			}
-		})
-	}
-}
-
-// TestE2ETransferredEdgeOnlyRequestResumesOnTheCloud: the edge hands an
-// edge-only request to the cloud through a brief the policy clears, and the
-// process stops while the master answers it. After the restart the master
-// resumes from the brief: its request holds the brief and a restart note
-// pointing at it, never the request, and the edge does not run again.
-func TestE2ETransferredEdgeOnlyRequestResumesOnTheCloud(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "thread.jsonl")
-	first, err := thread.OpenFileStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := newSession(t, &sessionOptions{store: first})
-	const goal = "BRIEF-GOAL: book the garage service for Friday"
-	s.edge.script(act("", toolCall(participant.ToolTransfer, map[string]any{"to": "cloud", "goal": goal, "remaining": []any{"pick a slot"}})))
-	entered := make(chan struct{})
-	s.master.script(func(ctx context.Context, _ *wireCall) (*model.ChatResponse, error) {
-		close(entered)
-		<-ctx.Done()
-		return nil, ctx.Err()
-	})
-	q := s.submit(&thread.Query{Text: "My door code is " + canary + "; have the cloud book the garage service.",
-		Disclosure: thread.DiscloseEdgeOnly, Explicit: "edge"})
-	waitClosed(t, entered, "the master's call on the transferred request")
-	if err := first.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.c.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	second, err := thread.OpenFileStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = second.Close() })
-	s.store = second
-	transfer := one(t, find(s.since(q), thread.KindOwnerChange, "edge"), "transfer")
-	if transfer.Owner.Reason != thread.ReasonTransfer || transfer.Owner.To != "cloud" || transfer.Visibility != thread.Shared {
-		t.Fatalf("transfer:%s", describe([]thread.Entry{transfer}))
-	}
-	edgeCalls := s.edge.count("")
-	s.master.script(inspect(func(c *wireCall) {
-		text := c.text()
-		note := fmt.Sprintf("[The session restarted while you were continuing the request handed to you in #%d", transfer.Seq)
-		if !strings.Contains(text, note) || !strings.Contains(text, "check the actual state before you redo anything") {
-			t.Errorf("the resumed request misses the restart note:\n%s", text)
-		}
-		if !strings.Contains(text, goal) {
-			t.Errorf("the resumed request misses the brief:\n%s", text)
-		}
-		if strings.Contains(text, canary) || strings.Contains(text, "door code") {
-			t.Errorf("the resumed request holds the edge-only request:\n%s", text)
-		}
-	}, say("CLOUD: the garage service is booked for Friday at 9:00.")))
-	s.rebuild(second)
-	s.settle()
-
-	rec := one(t, find(s.since(transfer.Seq), thread.KindMarker, ""), "restarted marker")
-	if rec.Marker.Kind != thread.MarkerRestarted || rec.BasedOn != transfer.Seq || rec.Visibility != thread.Shared {
-		t.Fatalf("restarted marker:%s", describe([]thread.Entry{rec}))
-	}
-	resumed := one(t, find(s.since(transfer.Seq), thread.KindReply, "cloud"), "resumed reply")
-	if resumed.BasedOn != rec.Seq {
-		t.Fatalf("resumed reply:%s", describe([]thread.Entry{resumed}))
-	}
-	if owner, _ := s.c.Owner(); owner != "cloud" {
-		t.Fatalf("owner after recovery = %s", owner)
-	}
-	if n := s.edge.count(""); n != edgeCalls {
-		t.Fatalf("the edge made %d calls after the restart", n-edgeCalls)
-	}
 }

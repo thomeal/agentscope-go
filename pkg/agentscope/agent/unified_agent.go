@@ -149,14 +149,12 @@ type UnifiedAgent struct {
 	toolConcurrencyLimit int
 
 	// Thread seams (EXPERIMENTAL, all opt-in and inert when unset; see
-	// thread_state.go, fork.go, handoff.go and taint_gate.go).
+	// thread_state.go, fork.go and handoff.go).
 	boundaryInput  BoundaryInput
 	forkCaptureOn  bool
 	lastCapture    *forkCapture // last captured model request; guarded by mu
 	handedOff      atomic.Bool
 	exclusiveTools map[string]bool
-	taintGate      []string
-	privacyProbe   func() bool
 }
 
 // ReactConfig controls the ReAct reasoning-acting loop.
@@ -219,18 +217,8 @@ type AgentState struct {
 	// agent's window (thread package). It is injected after the agent's own
 	// summary on every call and is never rewritten by local compression.
 	PeerSummary *PeerSummary `json:"peer_summary,omitempty"`
-	// ThreadIndex is a short deterministic index of entries this agent may read
-	// but that no summary covers (edge-only entries). Injected with PeerSummary.
-	ThreadIndex string `json:"thread_index,omitempty"`
 	// ThreadCursor is the last thread entry this agent has imported.
 	ThreadCursor uint64 `json:"thread_cursor,omitempty"`
-	// Tainted is set once the agent has read untrusted content (see the taint gate).
-	Tainted bool `json:"tainted,omitempty"`
-	// Private is set once the agent's state may hold data that must stay on
-	// the device (see WithPrivacyProbe and ThreadUpdate.Private). It is
-	// saved with the state that holds that data, so a host restoring a
-	// checkpoint learns whether the restored context is private.
-	Private bool `json:"private,omitempty"`
 }
 
 // ToolStateContext captures which tool groups are active for serialization.
@@ -1411,9 +1399,6 @@ func (a *UnifiedAgent) executeToolCallWithPermission(
 			return a.emitToolResult(ctx, ch, replyID, tc, message.ToolResultError,
 				fmt.Sprintf("permission check error: %v", permErr))
 		}
-		// WithTaintGate: once tainted, an allowed call to a gated tool must
-		// be confirmed by the user (Deny stays Deny).
-		a.applyTaintGate(t, &decision)
 
 		switch decision.Behavior {
 		case permission.BehaviorDeny:
@@ -1981,7 +1966,7 @@ func (a *UnifiedAgent) modelInputLocked(prompt string) []*message.Msg {
 	}
 	// Thread state (peer summary and index) follows the agent's own summary;
 	// nothing is added when the thread slots are empty.
-	msgs = append(msgs, threadPromptMsgs(a.name, a.state.PeerSummary, a.state.ThreadIndex)...)
+	msgs = append(msgs, threadPromptMsgs(a.name, a.state.PeerSummary)...)
 	// The plan lives outside Context precisely so it survives compression;
 	// re-inject it on every call or the model loses its tracker after one.
 	if len(a.state.Plan) > 0 {
@@ -2160,7 +2145,6 @@ func (a *UnifiedAgent) wouldRequireHITL(tc *message.ToolCallBlock) bool {
 	if err != nil {
 		return true
 	}
-	a.applyTaintGate(t, &decision) // a gated call waits for confirmation too
 	// Ask/Passthrough both block waiting for a user confirmation.
 	return decision.Behavior == permission.BehaviorAsk || decision.Behavior == permission.BehaviorPassthrough
 }

@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,7 +36,7 @@ func edgeEraStore(t *testing.T) Store {
 	cloud.BasedOn = 12
 	mustAppend(t, s, &Guard{Owner: "cloud", Epoch: 2}, cloud)
 	mustAppend(t, s, nil, Entry{
-		Kind: KindSummary, Origin: Origin{Participant: "cloud"}, Visibility: Shared,
+		Kind: KindSummary, Origin: Origin{Participant: "cloud"},
 		Summary:  &SummaryMeta{Target: "edge", Budget: 200},
 		Coverage: &Coverage{Through: 13, Excluded: []uint64{3, 4, 5, 6, 7, 8, 9, 10}},
 		Content:  textBlocks("SUMMARY: the cloud's part"),
@@ -84,22 +85,23 @@ func TestCoordinatorClearIsOneSync(t *testing.T) {
 	}
 }
 
-// TestCoordinatorParkedInputsDoNotBlockSubmit: edge-only queries that found no
-// owner while the edge was down wait parked; they must not fill
+// TestCoordinatorParkedInputsDoNotBlockSubmit: queries that found no owner
+// while every participant was down wait parked; they must not fill
 // MaxPendingInputs and refuse every later query, and at most
 // MaxPendingInputs of them are kept.
 func TestCoordinatorParkedInputsDoNotBlockSubmit(t *testing.T) {
 	edge, cloud := edgeCloud()
+	var cloudUp atomic.Bool
 	env := newCoEnv(t, nil, func(cfg *Config) {
 		cfg.Limits.MaxPendingInputs = 3
-		cfg.Available = func(name string) bool { return name != "edge" }
+		cfg.Available = func(name string) bool { return name == "cloud" && cloudUp.Load() }
 	}, edge, cloud)
-	var private []uint64
+	var parked []uint64
 	for i := 0; i < 5; i++ {
-		private = append(private, env.submit(Query{Text: "private " + strconv.Itoa(i), Disclosure: DiscloseEdgeOnly}))
+		parked = append(parked, env.submit(Query{Text: "early " + strconv.Itoa(i)}))
 		env.idle()
 	}
-	if m := findEntries(env.log(), KindMarker, MarkerNoOwner); len(m) != len(private) {
+	if m := findEntries(env.log(), KindMarker, MarkerNoOwner); len(m) != len(parked) {
 		t.Fatalf("no_owner markers = %d", len(m))
 	}
 	env.c.mu.Lock()
@@ -111,17 +113,15 @@ func TestCoordinatorParkedInputsDoNotBlockSubmit(t *testing.T) {
 		kept = append(kept, r.entry.Seq)
 	}
 	env.c.mu.Unlock()
-	if want := private[2:]; !slices.Equal(kept, want) {
+	if want := parked[2:]; !slices.Equal(kept, want) {
 		t.Fatalf("parked inputs = %v, want the newest three %v", kept, want)
 	}
 
-	env.say("a shared question")
+	cloudUp.Store(true)
+	env.say("a later question")
 	env.idle()
 	if n := len(cloud.activations()); n != 1 {
-		t.Fatalf("the shared query must reach the cloud: %d activations", n)
-	}
-	if containsText(cloud.seenTexts(), "private") {
-		t.Fatal("a parked edge-only input reached the cloud")
+		t.Fatalf("the later query must reach the cloud: %d activations", n)
 	}
 }
 
@@ -131,7 +131,7 @@ func TestCoordinatorParkedInputsDoNotBlockSubmit(t *testing.T) {
 func TestCoordinatorEntriesWaitBehindAnOpenBacklog(t *testing.T) {
 	edge, cloud := edgeCloud()
 	env := newCoEnv(t, nil, nil, edge, cloud)
-	reply := Entry{Seq: 10, Kind: KindReply, Origin: Origin{Participant: "edge"}, Visibility: Shared, Content: textBlocks("before the transfer")}
+	reply := Entry{Seq: 10, Kind: KindReply, Origin: Origin{Participant: "edge"}, Content: textBlocks("before the transfer")}
 	later := markerEntry(MarkerNoOwner, 9, "committed while the backlog is open")
 	later.Seq = 11
 	c := env.c
@@ -242,53 +242,6 @@ func readAll(t *testing.T, s Store) []Entry {
 		t.Fatal(err)
 	}
 	return got
-}
-
-// TestCoordinatorRecoveryKeepsTheDisclosure: a request restored after a
-// restart keeps the disclosure Submit resolved; an entry without one falls
-// back to its visibility. A parked request keeps it too.
-func TestCoordinatorRecoveryKeepsTheDisclosure(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		in   Entry
-		want Disclosure
-	}{
-		{"unclassified", Entry{Kind: KindUserInput, Visibility: Shared, Disclosure: DiscloseUnclassified}, DiscloseUnclassified},
-		{"shared", Entry{Kind: KindUserInput, Visibility: Shared, Disclosure: DiscloseShared}, DiscloseShared},
-		{"no disclosure", Entry{Kind: KindUserInput, Visibility: Shared}, DiscloseShared},
-		{"edge only", Entry{Kind: KindUserInput, Visibility: EdgeOnly, Disclosure: DiscloseEdgeOnly}, DiscloseEdgeOnly},
-		{"contradicting", Entry{Kind: KindUserInput, Visibility: EdgeOnly, Disclosure: DiscloseShared}, DiscloseEdgeOnly},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			tc.in.Content = textBlocks("a question")
-			if got := recoveredQuery(&tc.in).Disclosure; got != tc.want {
-				t.Fatalf("restored disclosure = %q, want %q", got, tc.want)
-			}
-			// Restarted twice already: the request is parked, not resumed.
-			store := NewMemoryStore(WithClock(fixedClock()))
-			mustAppend(t, store, nil, tc.in)
-			for _, key := range []string{"requeue:1", "requeue:1:again"} {
-				mk := markerEntry(MarkerRestarted, 1, "restarted")
-				mk.DedupKey = key
-				mustAppend(t, store, nil, mk)
-			}
-			edge, cloud := edgeCloud()
-			env := newCoEnv(t, store, nil, edge, cloud)
-			env.c.mu.Lock()
-			defer env.c.mu.Unlock()
-			if len(env.c.inputs) != 1 || env.c.inputs[0].q.Disclosure != tc.want || !env.c.inputs[0].parked {
-				t.Fatalf("restored inputs = %+v, want disclosure %q", env.c.inputs, tc.want)
-			}
-		})
-	}
-	// Submit records the resolved disclosure.
-	edge, cloud := edgeCloud()
-	env := newCoEnv(t, nil, nil, edge, cloud)
-	seq := env.submit(Query{Text: "hello"})
-	env.idle()
-	if e, _, _ := env.store.Get(context.Background(), seq); e.Disclosure != DiscloseUnclassified {
-		t.Fatalf("stored disclosure = %q", e.Disclosure)
-	}
 }
 
 // TestCoordinatorFailedClearIsRepeated: a clear whose activation fails is

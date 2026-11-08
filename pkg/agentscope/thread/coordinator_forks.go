@@ -27,7 +27,6 @@ type forkJob struct {
 	target   *partState
 	budget   int
 	coverage Coverage
-	tainted  bool
 	peerSpec ForkSpec
 
 	own     bool
@@ -109,7 +108,7 @@ func (c *Coordinator) planForks(a *activation) *forkJob {
 		}
 		return nil
 	}
-	job := &forkJob{ps: ps, snap: snap, growth: growth, through: through, tainted: st.Tainted}
+	job := &forkJob{ps: ps, snap: snap, growth: growth, through: through}
 	if needPeer {
 		if err := c.planPeer(job, target, through); err != nil {
 			agentscope.Log().WithError(err).WithField("participant", ps.name).Warn("thread: plan peer summary")
@@ -160,10 +159,10 @@ func nearCompaction(st *ParticipantState, every int) bool {
 }
 
 // planPeer fills the peer fork of job: its coverage, recorded before the
-// fork, and its spec. The coverage excludes edge-only entries and the
-// entries of others past the snapshot's cursor: the writer imports what it
-// lacks in full (its imports are not budgeted), so everything else up to
-// its cursor is in the snapshot.
+// fork, and its spec. The coverage excludes the entries of others past the
+// snapshot's cursor: the writer imports what it lacks in full (its imports
+// are not budgeted), so everything else up to its cursor is in the
+// snapshot.
 func (c *Coordinator) planPeer(job *forkJob, target *partState, through uint64) error {
 	pol := &c.cfg.Summaries
 	entries, err := c.store.Read(c.ctx, 0, Filter{}, int(through))
@@ -174,7 +173,7 @@ func (c *Coordinator) planPeer(job *forkJob, target *partState, through uint64) 
 	cov := Coverage{Through: through}
 	for i := range entries {
 		e := &entries[i]
-		if e.EffectiveVisibility() == EdgeOnly || (e.Seq > cursor && e.Origin.Participant != job.ps.name) {
+		if e.Seq > cursor && e.Origin.Participant != job.ps.name {
 			cov.Excluded = append(cov.Excluded, e.Seq)
 		}
 	}
@@ -189,7 +188,7 @@ func (c *Coordinator) planPeer(job *forkJob, target *partState, through uint64) 
 	}
 	prompt := strings.NewReplacer("{target}", target.name, "{window}", window, "{budget}", strconv.Itoa(budget)).Replace(pol.PeerPrompt)
 	var appendix string
-	if prev := c.newestSummary(c.ctx, target.name); prev != nil && prev.EffectiveVisibility() == Shared {
+	if prev := c.newestSummary(c.ctx, target.name); prev != nil {
 		appendix = "Previous summary for " + target.name + ", update it:\n" + prev.Text()
 	}
 	job.peer = true
@@ -253,7 +252,7 @@ func (c *Coordinator) handoverLoad(target *partState, prev *Entry) (int, bool) {
 		agentscope.Log().WithError(err).WithField("participant", target.name).Warn("thread: read entries for the peer summary rule")
 		return 0, false
 	}
-	proj := Project(entries, &ProjectionSpec{Participant: target.name, Zone: target.desc.Zone, After: after, IncludeOwn: true})
+	proj := Project(entries, &ProjectionSpec{Participant: target.name, After: after, IncludeOwn: true})
 	return n + countTokens(proj.Messages), true
 }
 
@@ -334,14 +333,12 @@ func (c *Coordinator) finishPeer(job *forkJob, out *ForkOutput, err error) {
 	}
 	cov := job.coverage
 	e := Entry{
-		Kind:       KindSummary,
-		Origin:     Origin{Participant: ps.name},
-		Visibility: Shared,
-		Summary:    &SummaryMeta{Target: job.target.name, Budget: job.budget, Lossy: out.Rejected},
-		Coverage:   &cov,
-		Tainted:    job.tainted,
-		Content:    textContent(text),
-		DedupKey:   "peer:" + job.id,
+		Kind:     KindSummary,
+		Origin:   Origin{Participant: ps.name},
+		Summary:  &SummaryMeta{Target: job.target.name, Budget: job.budget, Lossy: out.Rejected},
+		Coverage: &cov,
+		Content:  textContent(text),
+		DedupKey: "peer:" + job.id,
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -4,9 +4,9 @@
 // routing classifier is the offline fake and nothing touches the network, so
 // the session and its output are the same on every run.
 //
-// The session shows a shared query answered in the cloud with a sub-agent, a
-// transfer of the foreground to the edge, an edge-only query that stays on
-// the device, and a background task whose report wakes the edge. It ends by
+// The session shows a query answered in the cloud with a sub-agent, a
+// transfer of the foreground to the edge, a query the user names for the
+// edge, and a background task whose report wakes the edge. It ends by
 // printing the log, the owner and the ledger totals.
 package main
 
@@ -38,8 +38,7 @@ import (
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/tool"
 )
 
-// doorCode is the private detail of the edge-only query. The toy disclosure
-// policy below keeps any text holding it on the device.
+// doorCode is the code the user has the edge set on the front door lock.
 const doorCode = "4711"
 
 var (
@@ -71,11 +70,11 @@ func run(ctx context.Context, w io.Writer) error {
 		q    thread.Query
 		note string
 	}{
-		{thread.Query{Text: "Plan a weekend in Lisbon.", Disclosure: thread.DiscloseShared}, "shared"},
-		{thread.Query{Text: "Turn on the living room lamp.", Disclosure: thread.DiscloseShared}, "shared"},
-		{thread.Query{Text: "My door code is " + doorCode + ". Set it on the front door lock.", Disclosure: thread.DiscloseEdgeOnly}, "edge_only"},
+		{thread.Query{Text: "Plan a weekend in Lisbon."}, "routed"},
+		{thread.Query{Text: "Turn on the living room lamp."}, "routed"},
+		{thread.Query{Text: "Set the front door code to " + doorCode + ".", Explicit: "edge"}, "for the edge"},
 		{thread.Query{Text: "Dim the lights and have the cloud look up the Oceanarium opening hours.",
-			Disclosure: thread.DiscloseShared, NeedsGroups: []string{"device"}}, "shared, needs the device"},
+			NeedsGroups: []string{"device"}}, "needs the device"},
 	}
 	for i := range steps {
 		st := &steps[i]
@@ -134,7 +133,7 @@ func newSession(ctx context.Context) (*session, error) {
 			// summary the cloud writes for this window.
 			agent.WithContextConfig(&agent.ContextConfig{ContextSize: edgeDesc.Window, ThreadSummaryTokens: 1500}),
 		}, prep.Options()...)...)
-	edgeP, err := prep.Participant(participant.AgentConfig{Descriptor: edgeDesc, Agent: edgeAgent, PrivateTools: []string{"door_lock"}})
+	edgeP, err := prep.Participant(participant.AgentConfig{Descriptor: edgeDesc, Agent: edgeAgent})
 	if err != nil {
 		return nil, err
 	}
@@ -182,8 +181,8 @@ func newSession(ctx context.Context) (*session, error) {
 	}
 
 	// Hybrid routing with the offline classifier: it always prefers the
-	// cloud, so only hard rules (edge-only text, a needed tool group) keep a
-	// query on the device.
+	// cloud, so only the user's explicit choice or a needed tool group keeps
+	// a query on the device.
 	router, err := route.New(route.Config{
 		Mode: route.Hybrid, Edge: "edge", Cloud: "cloud",
 		Classifier: classifier.NewFake(&classifier.FakeConfig{Response: classifier.Response{
@@ -200,7 +199,6 @@ func newSession(ctx context.Context) (*session, error) {
 		Store:        s.store,
 		Participants: []thread.Participant{edgeP, cloudP},
 		Router:       router,
-		Disclosure:   codePolicy{},
 		// Peer summaries are written only when the cloud hands the
 		// foreground to the edge, which keeps the log short: the window
 		// share rule is off and the growth rule never fires.
@@ -256,7 +254,7 @@ func (s *session) report(ctx context.Context, w io.Writer) error {
 	fmt.Fprintln(w, "\nLog:")
 	for i := range entries {
 		e := &entries[i]
-		fmt.Fprintf(w, "  #%-2d %-12s %-11s %-9s %s\n", e.Seq, e.Kind, e.Origin, e.EffectiveVisibility(), short(e))
+		fmt.Fprintf(w, "  #%-2d %-12s %-11s %s\n", e.Seq, e.Kind, e.Origin, short(e))
 	}
 	owner, epoch := s.c.Owner()
 	fmt.Fprintf(w, "\nOwner: %s (epoch %d)\n", owner, epoch)
@@ -315,18 +313,6 @@ func short(e *thread.Entry) string {
 		text = string([]rune(text)[:71]) + "…"
 	}
 	return text
-}
-
-// codePolicy is a toy disclosure policy: text holding the door code stays on
-// the device; anything else may be shared. A real policy would use a local
-// classifier.
-type codePolicy struct{}
-
-func (codePolicy) Classify(_ context.Context, text string) (thread.Visibility, error) {
-	if strings.Contains(text, doorCode) {
-		return thread.EdgeOnly, nil
-	}
-	return thread.Shared, nil
 }
 
 func schema(props string, required ...string) json.RawMessage {

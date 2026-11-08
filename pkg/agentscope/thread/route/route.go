@@ -4,9 +4,8 @@
 // EXPERIMENTAL: every exported identifier in this package may change without
 // notice.
 //
-// The decision is deterministic code. Availability and the query's disclosure
-// come first, then an explicit choice by the user, hard tool needs and host
-// rules. Only when all of them leave the decision open does the router ask a
+// The decision is deterministic code. Availability comes first, then an
+// explicit choice by the user, hard tool needs and host rules. Only when all of them leave the decision open does the router ask a
 // classifier (hosted Jev, a local Piccolo server through the Jev adapter,
 // OpenAI Decisions or the offline fake), and it uses the answer only when the
 // classifier is confident enough. A classifier failure never blocks the
@@ -18,8 +17,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net"
-	"net/url"
 	"reflect"
 	"slices"
 	"strconv"
@@ -77,12 +74,6 @@ type Config struct {
 	// Classifier is asked when the rules leave the decision open. Nil means
 	// rules and defaults only.
 	Classifier classifier.DispatchClassifier
-	// Hosted says the classifier runs off the device, such as hosted Jev.
-	// Its state then carries only shared content. When Hosted is false, New
-	// requires the classifier's endpoint to be on this device: an http or
-	// https URL whose host is a loopback address or localhost, or the offline
-	// fake. Any other endpoint, including an empty one, is refused.
-	Hosted bool
 	// Threshold is the minimum confidence for a classifier answer to be
 	// used, in (0, 1]. Zero means DefaultThreshold.
 	Threshold float64
@@ -129,8 +120,8 @@ var (
 )
 
 // New validates cfg and returns a Router. It checks the participant names,
-// the mode, the threshold, the budget, the limits, the rules and, for a
-// classifier that is not hosted, that its endpoint is on this device.
+// the mode, the threshold, the budget, the limits, the rules and the
+// classifier.
 func New(cfg Config) (*Router, error) { //nolint:gocritic // value parameter keeps the documented API
 	c, err := normalize(cfg)
 	if err != nil {
@@ -186,12 +177,6 @@ func normalize(cfg Config) (Config, error) { //nolint:gocritic // a copy is what
 		if isNil(cfg.Classifier) {
 			return Config{}, configError("the classifier is a nil pointer")
 		}
-		if !cfg.Hosted {
-			endpoint, _ := cfg.Classifier.Target()
-			if err := checkOnDevice(endpoint); err != nil {
-				return Config{}, err
-			}
-		}
 	}
 	if cfg.Count == nil {
 		cfg.Count = defaultCount
@@ -208,39 +193,6 @@ func isNil(v any) bool {
 	return false
 }
 
-// checkOnDevice accepts only an endpoint known to be on this device: an http
-// or https URL whose host is a loopback address or the name localhost, or the
-// offline fake (scheme fake). Everything else is refused, because it may be
-// off the device, where edge-only content must not go: an empty or unparsable
-// endpoint, a host name without a scheme, a resolver URL such as dns:///name
-// and any other scheme. (No classifier adapter uses unix socket URLs, so they
-// are refused too.) Such a classifier must be configured as Hosted.
-func checkOnDevice(endpoint string) error {
-	const hint = "; set Hosted so its state carries only shared content"
-	if endpoint == "" {
-		return configError("the classifier reports no endpoint, so it cannot be shown to be on this device%s", hint)
-	}
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		return configError("cannot tell whether the classifier endpoint %q is on this device%s", endpoint, hint)
-	}
-	switch u.Scheme {
-	case "fake":
-		return nil
-	case "http", "https":
-	default:
-		return configError("the classifier endpoint %q is not an http or https URL with a loopback host%s", endpoint, hint)
-	}
-	host := u.Hostname()
-	if strings.EqualFold(host, "localhost") {
-		return nil
-	}
-	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
-		return nil
-	}
-	return configError("the classifier endpoint host %q is not on this device%s", host, hint)
-}
-
 func defaultCount(s string) int { return (utf8.RuneCountInString(s) + 3) / 4 }
 
 // Route implements thread.Router. It returns Decide's decision and error.
@@ -253,10 +205,8 @@ func (r *Router) Route(ctx context.Context, in thread.RouteRequest) (thread.Rout
 // response when the classifier was called (nil otherwise), so the caller can
 // log and account for it. The first step that decides wins:
 //
-//  1. Availability and disclosure: the candidates are the available
-//     participants, without the cloud when the query is edge-only or when it
-//     is unclassified and the edge is tainted. No candidate is an error
-//     wrapping thread.ErrNoCandidate. One candidate wins (Source hard), unless
+//  1. Availability: the candidates are the available participants. No
+//     candidate is an error wrapping thread.ErrNoCandidate. One candidate wins (Source hard), unless
 //     the request named another participant, which is an error.
 //  2. Explicit: a named candidate wins. Naming a participant that is not a
 //     candidate is an error wrapping thread.ErrNotAllowed; naming one that is
@@ -276,8 +226,7 @@ func (r *Router) Decide(ctx context.Context, in thread.RouteRequest) (thread.Rou
 	if err := ctx.Err(); err != nil {
 		return thread.RouteDecision{}, nil, fmt.Errorf("route: %w", err)
 	}
-	disclosure := normalizeDisclosure(in.Disclosure)
-	set, err := r.candidates(&in, disclosure)
+	set, err := candidates(&in)
 	if err != nil {
 		return thread.RouteDecision{}, nil, err
 	}
@@ -291,9 +240,6 @@ func (r *Router) Decide(ctx context.Context, in thread.RouteRequest) (thread.Rou
 	}
 	if len(set.cands) == 1 {
 		reason := set.cands[0].Descriptor.Name + " is the only candidate"
-		if set.why != "" && len(set.removed) > 0 {
-			reason += "; withheld " + strings.Join(set.removed, ", ") + " because " + set.why
-		}
 		return r.decided(set.cands[0].Descriptor.Name, thread.RouteHard, reason), nil, nil
 	}
 	if in.Explicit != "" {
@@ -315,23 +261,19 @@ func (r *Router) Decide(ctx context.Context, in thread.RouteRequest) (thread.Rou
 	}
 	var resp *classifier.Response
 	if r.cfg.Classifier != nil {
-		if r.cfg.Hosted && disclosure == thread.DiscloseEdgeOnly {
-			notes = append(notes, "the hosted classifier is not asked about an edge-only query")
-		} else {
-			out := r.classify(ctx, &in, disclosure, set)
-			resp = out.resp
-			notes = append(notes, out.notes...)
-			if out.err != nil {
-				d := thread.RouteDecision{Reason: strings.Join(notes, "; ")}
-				d.ClassifierCalls, d.ClassifierUsage, d.UsageKnown = ClassifierUsage(resp)
-				return d, resp, out.err
-			}
-			if out.target != "" {
-				d := r.decided(out.target, thread.RouteClassifier, joinReason(out.reason, notes))
-				d.Confidence = out.confidence
-				d.ClassifierCalls, d.ClassifierUsage, d.UsageKnown = ClassifierUsage(resp)
-				return d, resp, nil
-			}
+		out := r.classify(ctx, &in, set)
+		resp = out.resp
+		notes = append(notes, out.notes...)
+		if out.err != nil {
+			d := thread.RouteDecision{Reason: strings.Join(notes, "; ")}
+			d.ClassifierCalls, d.ClassifierUsage, d.UsageKnown = ClassifierUsage(resp)
+			return d, resp, out.err
+		}
+		if out.target != "" {
+			d := r.decided(out.target, thread.RouteClassifier, joinReason(out.reason, notes))
+			d.Confidence = out.confidence
+			d.ClassifierCalls, d.ClassifierUsage, d.UsageKnown = ClassifierUsage(resp)
+			return d, resp, nil
 		}
 	}
 	target, why := r.fallback(&in, set)
@@ -353,43 +295,21 @@ func (r *Router) decided(target string, source thread.RouteSource, reason string
 	return d
 }
 
-// normalizeDisclosure treats an empty disclosure as unclassified and an
-// unknown one as edge-only, so an unexpected value never widens disclosure.
-func normalizeDisclosure(d thread.Disclosure) thread.Disclosure {
-	switch d {
-	case "":
-		return thread.DiscloseUnclassified
-	case thread.DiscloseShared, thread.DiscloseEdgeOnly, thread.DiscloseUnclassified:
-		return d
-	default:
-		return thread.DiscloseEdgeOnly
-	}
-}
-
 type status int
 
 const (
 	statusCandidate status = iota + 1
 	statusUnavailable
-	statusWithheld
 )
 
 // candidateSet is the outcome of step 1.
 type candidateSet struct {
-	cands   []thread.RouteCandidate // in request order
-	status  map[string]status
-	removed []string // withheld by disclosure, in request order
-	why     string   // why the cloud side is withheld, "" when it is not
+	cands  []thread.RouteCandidate // in request order
+	status map[string]status
 }
 
-func (r *Router) candidates(in *thread.RouteRequest, disclosure thread.Disclosure) (*candidateSet, error) {
+func candidates(in *thread.RouteRequest) (*candidateSet, error) {
 	set := &candidateSet{status: make(map[string]status, len(in.Participants))}
-	switch {
-	case disclosure == thread.DiscloseEdgeOnly:
-		set.why = "the query is edge-only"
-	case disclosure == thread.DiscloseUnclassified && in.EdgeTainted:
-		set.why = "the edge read untrusted content and the query is unclassified"
-	}
 	for i := range in.Participants {
 		p := &in.Participants[i]
 		name := p.Descriptor.Name
@@ -399,16 +319,12 @@ func (r *Router) candidates(in *thread.RouteRequest, disclosure thread.Disclosur
 		if _, dup := set.status[name]; dup {
 			return nil, fmt.Errorf("%w: participant %q is listed twice", ErrBadRequest, name)
 		}
-		switch {
-		case !p.Available:
+		if !p.Available {
 			set.status[name] = statusUnavailable
-		case set.why != "" && (p.Descriptor.Zone != thread.ZoneEdge || name == r.cfg.Cloud):
-			set.status[name] = statusWithheld
-			set.removed = append(set.removed, name)
-		default:
-			set.status[name] = statusCandidate
-			set.cands = append(set.cands, *p)
+			continue
 		}
+		set.status[name] = statusCandidate
+		set.cands = append(set.cands, *p)
 	}
 	return set, nil
 }
@@ -439,9 +355,6 @@ func (s *candidateSet) describe() string {
 	if len(unavailable) > 0 {
 		parts = append(parts, "unavailable: "+strings.Join(unavailable, ", "))
 	}
-	if len(s.removed) > 0 {
-		parts = append(parts, "withheld because "+s.why+": "+strings.Join(s.removed, ", "))
-	}
 	return strings.Join(parts, "; ")
 }
 
@@ -451,8 +364,6 @@ func (s *candidateSet) checkExplicit(name string) error {
 		return nil
 	case statusUnavailable:
 		return fmt.Errorf("%w: %q is not available", thread.ErrNotAllowed, name)
-	case statusWithheld:
-		return fmt.Errorf("%w: %q is withheld because %s", thread.ErrNotAllowed, name, s.why)
 	default:
 		return fmt.Errorf("%w: %q", ErrUnknownParticipant, name)
 	}
@@ -515,9 +426,7 @@ func (r *Router) fallback(in *thread.RouteRequest, set *candidateSet) (target, w
 
 // instructions returns the Choice question's instructions for the mode. The
 // hybrid question is stage 0's, word for word apart from the participant
-// names. None of them warns about the state's content: the disclosure rules
-// run before the classifier is asked, so a state that steers it can cost
-// money or quality but cannot send an edge-only query to the cloud.
+// names.
 func instructions(mode Mode, edge, cloud string) string {
 	var b strings.Builder
 	if mode != Hybrid {
@@ -582,8 +491,8 @@ type classifyOutcome struct {
 	err        error // only cancellation of ctx
 }
 
-func (r *Router) classify(ctx context.Context, in *thread.RouteRequest, disclosure thread.Disclosure, set *candidateSet) classifyOutcome {
-	raw, stats, err := buildState(&r.cfg, in, disclosure)
+func (r *Router) classify(ctx context.Context, in *thread.RouteRequest, set *candidateSet) classifyOutcome {
+	raw, stats, err := buildState(&r.cfg, in)
 	if err != nil {
 		return classifyOutcome{notes: []string{"the classifier was not asked: " + err.Error()}}
 	}

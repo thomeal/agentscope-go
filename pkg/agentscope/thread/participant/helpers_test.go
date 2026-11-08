@@ -126,14 +126,13 @@ func (h *fakeHost) zoneOf(name string) thread.Zone {
 	return thread.ZoneCloud
 }
 
-func (h *fakeHost) Read(_ context.Context, reader string, q thread.ReadQuery) ([]thread.Entry, error) {
+func (h *fakeHost) Read(_ context.Context, _ string, q thread.ReadQuery) ([]thread.Entry, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.reads = append(h.reads, q)
 	if h.readErr != nil {
 		return nil, h.readErr
 	}
-	zone := h.zoneOf(reader)
 	var out []thread.Entry
 	for i := range h.entries {
 		e := h.entries[i]
@@ -147,9 +146,6 @@ func (h *fakeHost) Read(_ context.Context, reader string, q thread.ReadQuery) ([
 		if len(q.Kinds) > 0 && !slices.Contains(q.Kinds, e.Kind) {
 			continue
 		}
-		if !zone.CanRead(e.EffectiveVisibility()) {
-			continue
-		}
 		out = append(out, e)
 		if q.Limit > 0 && len(out) == q.Limit {
 			break
@@ -159,15 +155,15 @@ func (h *fakeHost) Read(_ context.Context, reader string, q thread.ReadQuery) ([
 }
 
 func (h *fakeHost) EventOutline(reader string, limit int) []thread.EventSummary {
-	return h.events.Outline(h.zoneOf(reader), true, limit)
+	return h.events.Outline(h.zoneOf(reader), limit)
 }
 
 func (h *fakeHost) EventSearch(reader, query string, limit int) []thread.EventSummary {
-	return h.events.Search(h.zoneOf(reader), true, query, limit)
+	return h.events.Search(h.zoneOf(reader), query, limit)
 }
 
 func (h *fakeHost) EventPage(reader, id string, offset, limit int) (string, int, error) {
-	return h.events.Page(h.zoneOf(reader), true, id, offset, limit)
+	return h.events.Page(h.zoneOf(reader), id, offset, limit)
 }
 
 func (h *fakeHost) RecordEvent(r thread.EventRecord) string { //nolint:gocritic // the thread.Host contract
@@ -418,7 +414,7 @@ func newFixture(t *testing.T, o fixtureOptions) *fixture { //nolint:gocritic // 
 
 // trigger returns a shared user_input entry.
 func trigger(seq uint64, text string) thread.Entry {
-	return thread.Entry{Seq: seq, Kind: thread.KindUserInput, Visibility: thread.Shared,
+	return thread.Entry{Seq: seq, Kind: thread.KindUserInput,
 		Content: []message.ContentBlock{message.TextBlock{Type: "text", Text: text}}}
 }
 
@@ -503,7 +499,7 @@ func eventsOf[T event.Event](items []thread.ActivationEvent) []T {
 }
 
 func entryText(seq uint64, kind thread.Kind, text string) thread.Entry {
-	return thread.Entry{Seq: seq, Kind: kind, Visibility: thread.Shared, Origin: thread.Origin{Participant: "edge"},
+	return thread.Entry{Seq: seq, Kind: kind, Origin: thread.Origin{Participant: "edge"},
 		Content: []message.ContentBlock{message.TextBlock{Type: "text", Text: text}}}
 }
 

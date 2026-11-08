@@ -19,64 +19,8 @@ import (
 // These tests reproduce the probes of an independent review of the
 // Coordinator, one per finding.
 
-func edgePrivate(env *coEnv, name string) bool {
-	env.c.mu.Lock()
-	defer env.c.mu.Unlock()
-	return env.c.parts[name].private
-}
-
-// A chunked import whose later chunk fails has already put edge-only content
-// into the edge's context: the edge must stay private, so its next reply is
-// not shared with the cloud.
-func TestCoordinatorFailedChunkKeepsEdgePrivate(t *testing.T) {
-	store := NewMemoryStore(WithClock(fixedClock()))
-	mustAppend(t, store, nil, Entry{Kind: KindArtifact, Visibility: EdgeOnly, Content: textBlocks("SECRET-1 " + strings.Repeat("s", 120))})
-	for range 4 {
-		mustAppend(t, store, nil, Entry{Kind: KindArtifact, Visibility: Shared, Content: textBlocks(strings.Repeat("a", 120))})
-	}
-	edge := smallEdge()
-	_, cloud := edgeCloud()
-	var once sync.Once
-	edge.onCompact = func() {
-		once.Do(func() {
-			edge.mu.Lock()
-			edge.syncErr = errors.New("checkpoint save failed")
-			edge.mu.Unlock()
-		})
-	}
-	env := newCoEnv(t, store, nil, edge, cloud)
-	env.submit(Query{Text: "go", Explicit: "edge"})
-	env.idle()
-	if n := len(edge.activations()); n != 0 {
-		t.Fatalf("edge ran %d times; its import was meant to fail", n)
-	}
-	if !containsText(allImported(edge), "SECRET-1") {
-		t.Fatal("the first chunk with the edge-only entry was not applied")
-	}
-	if !edgePrivate(env, "edge") {
-		t.Fatal("the edge holds edge-only content from an applied chunk but is not private")
-	}
-
-	edge.mu.Lock()
-	edge.syncErr = nil
-	edge.mu.Unlock()
-	edge.push(replyWith("SECRET-1 is the code"))
-	env.submit(Query{Text: "again", Explicit: "edge"})
-	env.idle()
-	reps := findEntries(env.log(), KindReply, "")
-	last := reps[len(reps)-1]
-	if last.Origin.Participant != "edge" || last.Visibility != EdgeOnly {
-		t.Fatalf("the edge's reply is %+v; it must be edge-only", last)
-	}
-	env.submit(Query{Text: "and now", Explicit: "cloud"})
-	env.idle()
-	if containsText(cloud.seenTexts(), "SECRET-1") {
-		t.Fatal("edge-only text reached the cloud")
-	}
-}
-
 // A clear is recorded only once its reset is applied: when Activate fails,
-// the edge keeps its privacy and the clear is tried again next time.
+// the edge's view stays as it was and the clear is tried again next time.
 func TestCoordinatorClearCommitsOnlyWhenApplied(t *testing.T) {
 	store := NewMemoryStore(WithClock(fixedClock()))
 	mustAppend(t, store, nil, userInput("plan"))
@@ -85,24 +29,21 @@ func TestCoordinatorClearCommitsOnlyWhenApplied(t *testing.T) {
 	rep.Origin.Path = ""
 	mustAppend(t, store, &Guard{Owner: "cloud", Epoch: 1}, rep)
 	mustAppend(t, store, nil, Entry{
-		Kind: KindSummary, Origin: Origin{Participant: "cloud"}, Visibility: Shared,
+		Kind: KindSummary, Origin: Origin{Participant: "cloud"},
 		Summary: &SummaryMeta{Target: "edge"}, Coverage: &Coverage{Through: 3}, Content: textBlocks("SUMMARY"),
 	}) // #4
 	edge, cloud := edgeCloud()
 	edge.activateErr = errors.New("model not loaded")
 	env := newCoEnv(t, store, nil, edge, cloud)
-	env.c.mu.Lock()
-	env.c.parts["edge"].raisePrivateLocked()
-	env.c.mu.Unlock()
 
 	env.submit(Query{Text: "continue", Explicit: "edge"})
 	env.idle()
 	env.c.mu.Lock()
 	ps := env.c.parts["edge"]
-	private, held, from := ps.private, ps.heldCoverage, ps.resetFrom
+	held, from := ps.heldCoverage, ps.resetFrom
 	env.c.mu.Unlock()
-	if !private || held != nil || from != 0 {
-		t.Fatalf("after a failed Activate: private %v held %+v resetFrom %d; nothing may change", private, held, from)
+	if held != nil || from != 0 {
+		t.Fatalf("after a failed Activate: held %+v resetFrom %d; nothing may change", held, from)
 	}
 
 	edge.mu.Lock()
@@ -115,111 +56,11 @@ func TestCoordinatorClearCommitsOnlyWhenApplied(t *testing.T) {
 		t.Fatalf("the clear was not applied: %+v", acts)
 	}
 	env.c.mu.Lock()
-	private, held, from = ps.private, ps.heldCoverage, ps.resetFrom
+	held, from = ps.heldCoverage, ps.resetFrom
 	env.c.mu.Unlock()
-	if private || held == nil || held.Through != 3 || from != 4 {
-		t.Fatalf("after the clear: private %v held %+v resetFrom %d", private, held, from)
+	if held == nil || held.Through != 3 || from != 4 {
+		t.Fatalf("after the clear: held %+v resetFrom %d", held, from)
 	}
-}
-
-// A clear that imports nothing edge-only lowers the edge's privacy only
-// when the edge itself does: a private edge that keeps a plan across the
-// clear (it may name what a private run read) stays private, and the
-// clear's Sync says to clear the flag either way. A plan never makes an
-// edge that was not private private.
-func TestCoordinatorClearKeepsAPrivatePlan(t *testing.T) {
-	for _, plan := range []bool{false, true} {
-		t.Run(fmt.Sprintf("plan=%v", plan), func(t *testing.T) {
-			store := NewMemoryStore(WithClock(fixedClock()))
-			mustAppend(t, store, nil, userInput("plan"))
-			mustAppend(t, store, &Guard{}, ownerChange("", "cloud"))
-			rep := replyFrom("cloud", "the plan")
-			mustAppend(t, store, &Guard{Owner: "cloud", Epoch: 1}, rep)
-			mustAppend(t, store, nil, Entry{
-				Kind: KindSummary, Origin: Origin{Participant: "cloud"}, Visibility: Shared,
-				Summary: &SummaryMeta{Target: "edge"}, Coverage: &Coverage{Through: 3}, Content: textBlocks("SUMMARY"),
-			}) // #4
-			edge, cloud := edgeCloud()
-			edge.planHeld = plan
-			edge.setState(func(s *ParticipantState) { s.Private = true })
-			env := newCoEnv(t, store, nil, edge, cloud)
-			env.c.mu.Lock()
-			env.c.parts["edge"].raisePrivateLocked()
-			env.c.mu.Unlock()
-
-			env.submit(Query{Text: "continue", Explicit: "edge"})
-			env.idle()
-			acts := edge.activations()
-			if len(acts) != 1 || acts[0].Sync == nil || !acts[0].Sync.Reset || acts[0].Sync.Private == nil || *acts[0].Sync.Private {
-				t.Fatalf("the clear did not say to clear the flag: %+v", acts)
-			}
-			if got := edgePrivate(env, "edge"); got != plan {
-				t.Fatalf("private after the clear = %v, want %v", got, plan)
-			}
-			if got := edge.State().Private; got != plan {
-				t.Fatalf("the edge's own flag = %v, want %v", got, plan)
-			}
-		})
-	}
-	t.Run("plan, never private", func(t *testing.T) {
-		store := NewMemoryStore(WithClock(fixedClock()))
-		mustAppend(t, store, nil, userInput("plan"))
-		mustAppend(t, store, &Guard{}, ownerChange("", "cloud"))
-		mustAppend(t, store, &Guard{Owner: "cloud", Epoch: 1}, replyFrom("cloud", "the plan"))
-		mustAppend(t, store, nil, Entry{
-			Kind: KindSummary, Origin: Origin{Participant: "cloud"}, Visibility: Shared,
-			Summary: &SummaryMeta{Target: "edge"}, Coverage: &Coverage{Through: 3}, Content: textBlocks("SUMMARY"),
-		}) // #4
-		edge, cloud := edgeCloud()
-		edge.planHeld = true
-		env := newCoEnv(t, store, nil, edge, cloud)
-		env.submit(Query{Text: "continue", Explicit: "edge"})
-		env.idle()
-		if acts := edge.activations(); len(acts) != 1 || acts[0].Sync == nil || !acts[0].Sync.Reset {
-			t.Fatalf("no clear: %+v", acts)
-		}
-		if edgePrivate(env, "edge") || edge.State().Private {
-			t.Fatal("a clear made an edge that was never private private")
-		}
-		var replies []Entry
-		for _, e := range findEntries(env.log(), KindReply, "") {
-			if e.Origin.Participant == "edge" {
-				replies = append(replies, e)
-			}
-		}
-		if len(replies) != 1 || replies[0].Visibility != Shared {
-			t.Fatalf("edge replies = %+v", replies)
-		}
-	})
-}
-
-// An edge-only input that arrived while the cloud answered is never dropped
-// by the cycle of a newer shared input: it starts its own cycle on the edge.
-func TestCoordinatorEdgeOnlyInputNotDropped(t *testing.T) {
-	edge, cloud := edgeCloud()
-	cloud.started = make(chan Activation, 8)
-	release := make(chan struct{})
-	cloud.push(gate(release, replyWith("plan ready")))
-	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = zoneRouter() }, edge, cloud)
-	env.say("plan")
-	waitStarted(t, cloud)
-	secret := env.submit(Query{Text: "my PIN is 4242", Disclosure: DiscloseEdgeOnly})
-	more := env.submit(Query{Text: "and the hotel?", Disclosure: DiscloseShared})
-	close(release)
-	env.idle()
-
-	ca := cloud.activations()
-	if len(ca) != 2 || ca[1].Trigger.Seq != more {
-		t.Fatalf("cloud activations = %+v", ca)
-	}
-	ea := edge.activations()
-	if len(ea) != 1 || ea[0].Trigger.Seq != secret || ea[0].Input != "my PIN is 4242" {
-		t.Fatalf("the edge-only input was not answered on the edge: %+v", ea)
-	}
-	if containsText(cloud.seenTexts(), "4242") {
-		t.Fatal("edge-only input reached the cloud")
-	}
-	checkNotStranded(t, env, map[string]*fakePart{"edge": edge, "cloud": cloud})
 }
 
 // Interrupting the routing of a query also ends the older inputs it would
@@ -262,42 +103,13 @@ func TestCoordinatorInterruptRoutingEndsContextInputs(t *testing.T) {
 	}
 }
 
-// When the newest input finds no owner, an older one that may go elsewhere
-// still gets its own cycle.
-func TestCoordinatorOlderInputRoutedAfterNoOwner(t *testing.T) {
-	edge, cloud := edgeCloud()
-	cloud.started = make(chan Activation, 8)
-	release := make(chan struct{})
-	cloud.push(gate(release, replyWith("plan ready")))
-	var edgeUp atomic.Bool
-	edgeUp.Store(true)
-	env := newCoEnv(t, nil, func(cfg *Config) {
-		cfg.Router = zoneRouter()
-		cfg.Available = func(name string) bool { return name != "edge" || edgeUp.Load() }
-	}, edge, cloud)
-	env.say("plan")
-	waitStarted(t, cloud)
-	shared := env.submit(Query{Text: "the hotel?", Disclosure: DiscloseShared})
-	secret := env.submit(Query{Text: "my PIN", Disclosure: DiscloseEdgeOnly})
-	edgeUp.Store(false)
-	close(release)
-	env.idle()
-	if m := findEntries(env.log(), KindMarker, MarkerNoOwner); len(m) != 1 || m[0].BasedOn != secret {
-		t.Fatalf("no_owner markers = %+v", m)
-	}
-	ca := cloud.activations()
-	if len(ca) != 2 || ca[1].Trigger.Seq != shared {
-		t.Fatalf("the older shared input was not answered: %+v", ca)
-	}
-}
-
 // A cloud participant imports what it lacks in full, whatever its window:
 // nothing is cut, skipped or compacted on the way in, so its peer summary
-// excludes only edge-only entries and entries past its snapshot's cursor.
+// excludes only other participants' entries past its snapshot's cursor.
 func TestCoordinatorCloudImportsInFull(t *testing.T) {
 	store := NewMemoryStore(WithClock(fixedClock()))
 	for i := 1; i <= 5; i++ {
-		mustAppend(t, store, nil, Entry{Kind: KindArtifact, Origin: Origin{Participant: "edge"}, Visibility: Shared,
+		mustAppend(t, store, nil, Entry{Kind: KindArtifact, Origin: Origin{Participant: "edge"},
 			Content: textBlocks(fmt.Sprintf("EDGE-%d ", i) + strings.Repeat("e", 110))})
 	}
 	edge := newFakePart("edge", ZoneEdge)
@@ -306,7 +118,7 @@ func TestCoordinatorCloudImportsInFull(t *testing.T) {
 	cloud.state.InputTokens = 150
 	cloud.push(grow(500, "plan ready"))
 	env := newCoEnv(t, store, func(cfg *Config) {
-		cfg.Router = zoneRouter()
+		cfg.Router = cloudRouter()
 		cfg.Summaries.PeerEvery = 100
 	}, edge, cloud)
 	env.say("plan") // #6, owner_change #7, reply #8
@@ -333,54 +145,6 @@ func TestCoordinatorCloudImportsInFull(t *testing.T) {
 	}
 }
 
-// An unclassified query submitted while the edge is tainted is edge-only in
-// every respect: its entry, the running cloud owner's Pending, routing and
-// Transfer.
-func TestCoordinatorUnclassifiedWhileTaintedIsEdgeOnly(t *testing.T) {
-	edge, cloud := edgeCloud()
-	edge.setState(func(s *ParticipantState) { s.Tainted = true })
-	cloud.started = make(chan Activation, 8)
-	release := make(chan struct{})
-	var pending []*Sync
-	cloud.push(gate(release, func(r *fakeRun) *ActivationEnd {
-		pending = append(pending, r.pending())
-		return r.reply("planned")
-	}))
-	var transferErr error
-	edge.push(func(r *fakeRun) *ActivationEnd {
-		_, transferErr = r.transfer("cloud")
-		return r.reply("kept on the device")
-	})
-	env := newCoEnv(t, nil, func(cfg *Config) {
-		cfg.Router = &fakeRouter{fn: func(context.Context, *RouteRequest) (RouteDecision, error) {
-			return RouteDecision{Target: "cloud"}, nil // the Coordinator overrides it for an edge-only query
-		}}
-	}, edge, cloud)
-	env.submit(Query{Text: "plan", Disclosure: DiscloseShared})
-	waitStarted(t, cloud)
-	q := env.submit(Query{Text: "taint-secret"})
-	close(release)
-	env.idle()
-
-	e, _, _ := env.store.Get(t.Context(), q)
-	if e.Visibility != EdgeOnly {
-		t.Fatalf("the query is stored %s", e.Visibility)
-	}
-	if len(pending) != 1 || pending[0] != nil {
-		t.Fatalf("the cloud's Pending = %v", pending)
-	}
-	if containsText(cloud.seenTexts(), "taint-secret") {
-		t.Fatal("the query reached the cloud")
-	}
-	ea := edge.activations()
-	if len(ea) != 1 || ea[0].Trigger.Seq != q {
-		t.Fatalf("edge activations = %+v", ea)
-	}
-	if !errors.Is(transferErr, errPrivateBrief) {
-		t.Fatalf("transfer of the cycle to the cloud with no disclosure policy: %v", transferErr)
-	}
-}
-
 // A wake that fails writes its markers and does not fail over: the query
 // it would pass on was already answered.
 func TestCoordinatorFailedWakeDoesNotFailOver(t *testing.T) {
@@ -394,7 +158,7 @@ func TestCoordinatorFailedWakeDoesNotFailOver(t *testing.T) {
 		return &ActivationEnd{Reason: types.ReplyError, Err: errors.New("cloud down"), ToolCalls: 1}
 	})
 	edge.push(replyWith("42 photos"))
-	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = zoneRouter() }, edge, cloud)
+	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = cloudRouter() }, edge, cloud)
 	env.say("ORIGINAL-Q1 please")
 	env.idle()
 
@@ -442,7 +206,7 @@ func TestCoordinatorFailedWakeQueuesItsSteering(t *testing.T) {
 		return &ActivationEnd{Reason: types.ReplyError, Err: errors.New("cloud down")}
 	}), replyWith("the album is sorted"))
 	edge.push(replyWith("42 photos"))
-	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = zoneRouter() }, edge, cloud)
+	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = cloudRouter() }, edge, cloud)
 	env.say("count my photos")
 	waitStarted(t, cloud)
 	wake := waitStarted(t, cloud)
@@ -485,7 +249,7 @@ func TestCoordinatorWakeThatCannotStartWaits(t *testing.T) {
 		return r.reply("SCAN-RESULT")
 	})
 	env := newCoEnv(t, nil, func(cfg *Config) {
-		cfg.Router = zoneRouter()
+		cfg.Router = cloudRouter()
 		cfg.Available = func(name string) bool { return name != "cloud" || !cloudDown.Load() }
 	}, edge, cloud)
 	env.say("scan please")
@@ -671,30 +435,24 @@ func TestCoordinatorBackgroundPendingGetsOwnTaskReport(t *testing.T) {
 	}
 }
 
-// Interrupting the owner while its Transfer waits for the disclosure policy
-// commits nothing: no owner change, no answer from the target.
+// A Transfer the owner makes after it was interrupted commits nothing: no
+// owner change, no answer from the target.
 func TestCoordinatorInterruptDuringTransferCommitsNothing(t *testing.T) {
 	edge, cloud := edgeCloud()
-	inPolicy := make(chan struct{}, 1)
+	started := make(chan struct{})
 	release := make(chan struct{})
-	policy := &fakePolicy{fn: func(string) (Visibility, error) {
-		select {
-		case inPolicy <- struct{}{}:
-		default:
-		}
-		<-release
-		return Shared, nil
-	}}
 	var transferErr error
 	edge.push(func(r *fakeRun) *ActivationEnd {
 		r.say("handing over")
+		close(started)
+		<-release
 		_, transferErr = r.host().Transfer(r.ctx, TransferRequest{From: Origin{Participant: "edge"}, Epoch: r.act.Epoch,
-			To: "cloud", Brief: testBrief(), Text: r.text(), Private: true})
+			To: "cloud", Brief: testBrief(), Text: r.text()})
 		return &ActivationEnd{Reason: types.ReplyInterrupted, Text: r.text()}
 	})
-	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Disclosure = policy }, edge, cloud)
+	env := newCoEnv(t, nil, nil, edge, cloud)
 	q := env.submit(Query{Text: "go", Explicit: "edge"})
-	<-inPolicy
+	<-started
 	env.c.Interrupt()
 	close(release)
 	env.idle()
@@ -802,95 +560,16 @@ func TestCoordinatorTransferForwardsEventsShownBefore(t *testing.T) {
 	}
 }
 
-// A cloud reader never sees an edge-only event record, whatever the
-// CloudReadsEdge switch says.
-func TestEventListEdgeOnlyRecords(t *testing.T) {
-	l := NewEventList(EventListOptions{})
-	private := edgeRecord("Read", "diary.txt", "SECRET diary")
-	private.Visibility = EdgeOnly
-	odd := edgeRecord("Read", "odd.txt", "SECRET odd")
-	odd.Visibility = "secret" // unknown values count as edge-only
-	unmarked := edgeRecord("Read", "notes.txt", "SECRET unmarked")
-	unmarked.Visibility = "" // an unmarked edge record is edge-only
-	pid := l.Add(private)
-	oid := l.Add(odd)
-	l.Add(unmarked)
-	sid := l.Add(edgeRecord("Camera", "front", "jpeg"))
-	if got := ids(l.Outline(ZoneCloud, true, 0)); !reflect.DeepEqual(got, []string{sid}) {
-		t.Fatalf("cloud outline = %v, want only %s", got, sid)
-	}
-	if got := ids(l.Search(ZoneCloud, true, "SECRET", 0)); len(got) != 0 {
-		t.Fatalf("cloud search found %v", got)
-	}
-	for _, id := range []string{pid, oid} {
-		if _, _, err := l.Page(ZoneCloud, true, id, 0, 0); !errors.Is(err, ErrEventNotFound) {
-			t.Fatalf("cloud paged edge-only %s: %v", id, err)
-		}
-	}
-	if text, _, err := l.Page(ZoneCloud, true, sid, 0, 0); err != nil || text != "jpeg" {
-		t.Fatalf("cloud page of a shared record = %q %v", text, err)
-	}
-	cloudRec := cloudRecord("Read", "a", "x")
-	cloudRec.Visibility = EdgeOnly
-	cid := l.Add(cloudRec)
-	if text, _, err := l.Page(ZoneEdge, false, cid, 0, 0); err != nil || text != "x" {
-		t.Fatalf("edge page of an edge-only record = %q %v", text, err)
-	}
-}
-
-// RecordEvent stores an edge record as edge-only when the caller says so or
-// when the Coordinator knows the edge's context is private.
-func TestCoordinatorRecordEventVisibility(t *testing.T) {
-	edge, cloud := edgeCloud()
-	var ids []string
-	edge.push(func(r *fakeRun) *ActivationEnd {
-		h := r.host()
-		ids = append(ids,
-			h.RecordEvent(EventRecord{Tool: "camera", Output: "open output", Visibility: Shared}),
-			h.RecordEvent(EventRecord{Tool: "sensor", Output: "PRIVATE-TOOL", Visibility: EdgeOnly}))
-		return r.reply("ok")
-	}, func(r *fakeRun) *ActivationEnd {
-		ids = append(ids, r.host().RecordEvent(EventRecord{Tool: "contacts", Output: "PRIVATE-CONTEXT", Visibility: Shared}))
-		return r.reply("ok")
-	})
-	var outline []EventSummary
-	var pageErrs []error
-	cloud.push(func(r *fakeRun) *ActivationEnd {
-		outline = r.host().EventOutline("cloud", 0)
-		for _, id := range ids {
-			_, err := r.page(id)
-			pageErrs = append(pageErrs, err)
-		}
-		return r.reply("seen")
-	})
-	env := newCoEnv(t, nil, func(cfg *Config) { cfg.CloudReadsEdge = true }, edge, cloud)
-	env.submit(Query{Text: "look", Explicit: "edge"})
-	env.idle()
-	env.submit(Query{Text: "private", Disclosure: DiscloseEdgeOnly})
-	env.idle()
-	env.submit(Query{Text: "shared", Explicit: "cloud"})
-	env.idle()
-	if len(outline) != 1 || outline[0].Tool != "camera" {
-		t.Fatalf("cloud outline = %+v", outline)
-	}
-	if len(pageErrs) != 3 || pageErrs[0] != nil || !errors.Is(pageErrs[1], ErrEventNotFound) || !errors.Is(pageErrs[2], ErrEventNotFound) {
-		t.Fatalf("cloud page errors = %v", pageErrs)
-	}
-	if containsText(cloud.seenTexts(), "PRIVATE") {
-		t.Fatal("an edge-only record reached the cloud")
-	}
-}
-
 // Recovery counts only the report that ended a task, restores lastSealed
 // from task reports and keeps Notify reports past the cursor waiting.
 func TestCoordinatorRecoveryTaskReports(t *testing.T) {
 	store := NewMemoryStore(WithClock(fixedClock()))
 	assign := func(id string) Entry {
-		return Entry{Kind: KindAssign, Origin: Origin{Participant: "cloud"}, To: []string{"edge"}, Visibility: Shared,
+		return Entry{Kind: KindAssign, Origin: Origin{Participant: "cloud"}, To: []string{"edge"},
 			Task: &Task{ID: id}, Content: textBlocks("do " + id)}
 	}
 	taskReport := func(id, key string, notify bool) Entry {
-		return Entry{Kind: KindReport, Origin: Origin{Participant: "edge"}, To: []string{"cloud"}, Visibility: Shared,
+		return Entry{Kind: KindReport, Origin: Origin{Participant: "edge"}, To: []string{"cloud"},
 			Task: &Task{ID: id, Notify: notify}, Notify: notify, Content: textBlocks("about " + id), DedupKey: key}
 	}
 	mustAppend(t, store, nil,
@@ -898,7 +577,7 @@ func TestCoordinatorRecoveryTaskReports(t *testing.T) {
 		taskReport("t-1", "", false),          // #2: progress only
 		assign("t-2"),                         // #3
 		taskReport("t-2", "report:x-1", true), // #4: the final report, Notify
-		Entry{Kind: KindArtifact, Origin: Origin{Participant: "edge"}, Visibility: Shared, Refs: []ArtifactRef{{URI: "f"}}}, // #5
+		Entry{Kind: KindArtifact, Origin: Origin{Participant: "edge"}, Refs: []ArtifactRef{{URI: "f"}}}, // #5
 	)
 	edge, cloud := edgeCloud()
 	cloud.setState(func(s *ParticipantState) { s.Cursor = 3 })
@@ -1003,45 +682,9 @@ func TestCoordinatorUnrecordedOwnerChangeParksInput(t *testing.T) {
 	}
 }
 
-// An edge write the caller marks private is edge-only and makes the edge
-// private at once: the reply sealed after it is edge-only too.
-func TestCoordinatorPrivateWriteMakesEdgePrivate(t *testing.T) {
-	for name, write := range map[string]func(Host) error{
-		"report": func(h Host) error {
-			_, err := h.Report(t.Context(), ReportRequest{From: Origin{Participant: "edge"}, Text: "PRIVATE note", Private: true})
-			return err
-		},
-		"publish": func(h Host) error {
-			_, err := h.Publish(t.Context(), PublishRequest{From: Origin{Participant: "edge"}, Refs: []ArtifactRef{{URI: "file:///diary"}}, Private: true})
-			return err
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			edge, cloud := edgeCloud()
-			edge.push(func(r *fakeRun) *ActivationEnd {
-				if err := write(r.host()); err != nil {
-					t.Errorf("%s: %v", name, err)
-				}
-				return r.reply("about what I wrote")
-			})
-			env := newCoEnv(t, nil, nil, edge, cloud)
-			env.submit(Query{Text: "go", Explicit: "edge"})
-			env.idle()
-			if !edgePrivate(env, "edge") {
-				t.Fatal("the edge is not private after an edge-only write")
-			}
-			for _, e := range env.log() {
-				if e.Origin.Participant == "edge" && e.Visibility != EdgeOnly {
-					t.Fatalf("#%d %s from the edge is %s", e.Seq, e.Kind, e.Visibility)
-				}
-			}
-		})
-	}
-}
-
 // A clear the edge cannot apply leaves the Coordinator's view as it was: the
-// edge stays private, holds no new coverage and is cleared again at the next
-// takeover, with the whole import in that one Sync.
+// edge holds no new coverage and is cleared again at the next takeover, with
+// the whole import in that one Sync.
 func TestCoordinatorFailedClearKeepsTheView(t *testing.T) {
 	store := NewMemoryStore(WithClock(fixedClock()))
 	mustAppend(t, store, nil, userInput("plan"))
@@ -1050,11 +693,11 @@ func TestCoordinatorFailedClearKeepsTheView(t *testing.T) {
 	rep.Origin.Path = ""
 	mustAppend(t, store, &Guard{Owner: "cloud", Epoch: 1}, rep)
 	mustAppend(t, store, nil, Entry{
-		Kind: KindSummary, Origin: Origin{Participant: "cloud"}, Visibility: Shared,
+		Kind: KindSummary, Origin: Origin{Participant: "cloud"},
 		Summary: &SummaryMeta{Target: "edge"}, Coverage: &Coverage{Through: 3}, Content: textBlocks("SUMMARY"),
 	}) // #4
 	for i := 1; i <= 8; i++ {
-		mustAppend(t, store, nil, Entry{Kind: KindArtifact, Visibility: Shared,
+		mustAppend(t, store, nil, Entry{Kind: KindArtifact,
 			Content: textBlocks(fmt.Sprintf("CHUNK-%d ", i) + strings.Repeat("b", 300))})
 	}
 	edge := smallEdge()
@@ -1062,9 +705,6 @@ func TestCoordinatorFailedClearKeepsTheView(t *testing.T) {
 	_, cloud := edgeCloud()
 	cloud.push(replyWith("taken over"))
 	env := newCoEnv(t, store, nil, edge, cloud)
-	env.c.mu.Lock()
-	env.c.parts["edge"].raisePrivateLocked()
-	env.c.mu.Unlock()
 
 	env.submit(Query{Text: "continue", Explicit: "edge"})
 	env.idle()
@@ -1073,10 +713,10 @@ func TestCoordinatorFailedClearKeepsTheView(t *testing.T) {
 	}
 	env.c.mu.Lock()
 	ps := env.c.parts["edge"]
-	private, held, from := ps.private, ps.heldCoverage, ps.resetFrom
+	held, from := ps.heldCoverage, ps.resetFrom
 	env.c.mu.Unlock()
-	if !private || held != nil || from != 0 {
-		t.Fatalf("after the failed clear: private %v held %+v resetFrom %d", private, held, from)
+	if held != nil || from != 0 {
+		t.Fatalf("after the failed clear: held %+v resetFrom %d", held, from)
 	}
 
 	edge.mu.Lock()
@@ -1094,9 +734,9 @@ func TestCoordinatorFailedClearKeepsTheView(t *testing.T) {
 		t.Fatalf("the clear must bring the whole import: %q", texts)
 	}
 	env.c.mu.Lock()
-	private, from = ps.private, ps.resetFrom
+	from = ps.resetFrom
 	env.c.mu.Unlock()
-	if private || from != 4 {
-		t.Fatalf("after the clear: private %v resetFrom %d", private, from)
+	if from != 4 {
+		t.Fatalf("after the clear: resetFrom %d", from)
 	}
 }

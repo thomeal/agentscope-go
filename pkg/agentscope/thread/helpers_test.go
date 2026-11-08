@@ -19,32 +19,29 @@ func textBlocks(s string) []message.ContentBlock {
 }
 
 func userInput(s string) Entry {
-	return Entry{Kind: KindUserInput, Visibility: Shared, Content: textBlocks(s)}
+	return Entry{Kind: KindUserInput, Content: textBlocks(s)}
 }
 
 func replyFrom(participant, s string) Entry {
 	return Entry{
-		Kind:       KindReply,
-		Origin:     Origin{Participant: participant, Path: "master"},
-		Visibility: Shared,
-		Content:    textBlocks(s),
+		Kind:    KindReply,
+		Origin:  Origin{Participant: participant, Path: "master"},
+		Content: textBlocks(s),
 	}
 }
 
 func ownerChange(from, to string) Entry {
 	return Entry{
-		Kind:       KindOwnerChange,
-		Visibility: Shared,
-		Owner:      &OwnerChange{From: from, To: to, Reason: ReasonRouter},
+		Kind:  KindOwnerChange,
+		Owner: &OwnerChange{From: from, To: to, Reason: ReasonRouter},
 	}
 }
 
 func report(participant, s string) Entry {
 	return Entry{
-		Kind:       KindReport,
-		Origin:     Origin{Participant: participant},
-		Visibility: Shared,
-		Content:    textBlocks(s),
+		Kind:    KindReport,
+		Origin:  Origin{Participant: participant},
+		Content: textBlocks(s),
 	}
 }
 

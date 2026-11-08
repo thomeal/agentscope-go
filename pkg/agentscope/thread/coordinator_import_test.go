@@ -3,16 +3,16 @@ package thread
 import (
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
-	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/message"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/types"
 )
 
 // clearRuleStore holds a cloud conversation and a summary written for the
-// edge that covers #1–#6 except an edge-only artifact (#4) and a shared
-// report the cloud never imported (#5). When edgeWrote is set, the edge
+// edge that covers #1–#6 except an artifact (#4) and a report (#5) the
+// cloud never imported. When edgeWrote is set, the edge
 // published #8 itself after the summary.
 func clearRuleStore(t *testing.T, edgeWrote bool) Store {
 	t.Helper()
@@ -27,17 +27,17 @@ func clearRuleStore(t *testing.T, edgeWrote bool) Store {
 	}
 	mustAppend(t, s, &Guard{Owner: "cloud", Epoch: 1}, cloudReply("here is the plan", 1))
 	mustAppend(t, s, nil,
-		Entry{Kind: KindArtifact, Visibility: EdgeOnly, Content: textBlocks("passport X123"), Refs: []ArtifactRef{{URI: "file:///passport"}}},
-		Entry{Kind: KindReport, Visibility: Shared, Content: textBlocks("a shared note")},
+		Entry{Kind: KindArtifact, Content: textBlocks("passport X123"), Refs: []ArtifactRef{{URI: "file:///passport"}}},
+		Entry{Kind: KindReport, Content: textBlocks("a shared note")},
 	)
 	mustAppend(t, s, &Guard{Owner: "cloud", Epoch: 1}, cloudReply("more planning", 0))
 	mustAppend(t, s, nil, Entry{
-		Kind: KindSummary, Origin: Origin{Participant: "cloud"}, Visibility: Shared,
+		Kind: KindSummary, Origin: Origin{Participant: "cloud"},
 		Summary: &SummaryMeta{Target: "edge", Budget: 200}, Coverage: &Coverage{Through: 6, Excluded: []uint64{4, 5}},
 		Content: textBlocks("SUMMARY: the trip plan"),
 	})
 	if edgeWrote {
-		mustAppend(t, s, nil, Entry{Kind: KindArtifact, Origin: Origin{Participant: "edge"}, Visibility: Shared,
+		mustAppend(t, s, nil, Entry{Kind: KindArtifact, Origin: Origin{Participant: "edge"},
 			Refs: []ArtifactRef{{URI: "file:///photo"}}})
 	} else {
 		mustAppend(t, s, &Guard{Owner: "cloud", Epoch: 1}, cloudReply("after the summary", 0))
@@ -63,23 +63,20 @@ func TestCoordinatorImportClearRule(t *testing.T) {
 	if s == nil || !s.Reset || s.PeerSummary == nil || s.PeerSummary.Seq != 7 || s.Cursor != 8 {
 		t.Fatalf("sync = %+v", s)
 	}
-	art, _, _ := store.Get(t.Context(), 4)
-	if want := EdgeIndex([]Entry{art}, defaultIndexRunes); s.Index == nil || *s.Index != want || !strings.Contains(want, "passport") {
-		t.Fatalf("index = %v, want %q", s.Index, want)
+	want := []string{
+		"[#4 artifact from coordinator] file:///passport\npassport X123",
+		"[#5 report from coordinator] a shared note",
+		"[#8 reply from cloud] after the summary",
 	}
-	want := []string{"[#5 report from coordinator] a shared note", "[#8 reply from cloud] after the summary"}
 	if got := syncTexts(s); !reflect.DeepEqual(got, want) {
 		t.Fatalf("messages = %q, want %q", got, want)
 	}
-	if s.Taint == nil || *s.Taint {
-		t.Fatalf("taint = %v", s.Taint)
-	}
 	env.c.mu.Lock()
 	ps := env.c.parts["edge"]
-	private, held, from := ps.private, ps.heldCoverage, ps.resetFrom
+	held, from := ps.heldCoverage, ps.resetFrom
 	env.c.mu.Unlock()
-	if !private || held == nil || held.Through != 6 || from != 7 {
-		t.Fatalf("edge state: private %v held %+v resetFrom %d", private, held, from)
+	if held == nil || held.Through != 6 || !slices.Equal(held.Excluded, []uint64{4, 5}) || from != 7 {
+		t.Fatalf("edge state: held %+v resetFrom %d", held, from)
 	}
 
 	// The same summary is not applied twice, even though the edge still has
@@ -106,28 +103,6 @@ func TestCoordinatorImportIncremental(t *testing.T) {
 	if len(texts) != 6 || !containsText(texts, "passport X123") || containsText(texts, "SUMMARY") || containsText(texts, "photo") {
 		t.Fatalf("incremental messages = %q", texts)
 	}
-	env.c.mu.Lock()
-	private := env.c.parts["edge"].private
-	env.c.mu.Unlock()
-	if !private {
-		t.Fatal("importing an edge-only entry did not mark the edge private")
-	}
-}
-
-func TestCoordinatorCloudImportWithholdsEdgeOnly(t *testing.T) {
-	store := clearRuleStore(t, false)
-	edge, cloud := edgeCloud()
-	env := newCoEnv(t, store, nil, edge, cloud)
-	env.say("continue") // the owner, cloud, stays
-	env.idle()
-	s := cloud.activations()[0].Sync
-	texts := syncTexts(s)
-	if !containsText(texts, "[#4 withheld: edge-only entry]") || containsText(texts, "passport") {
-		t.Fatalf("cloud import = %q", texts)
-	}
-	if containsText(cloud.seenTexts(), "passport") {
-		t.Fatal("edge-only text reached the cloud")
-	}
 }
 
 // chunkStore holds n shared artifacts of about 38 tokens each.
@@ -135,7 +110,7 @@ func chunkStore(t *testing.T, n int) Store {
 	t.Helper()
 	s := NewMemoryStore(WithClock(fixedClock()))
 	for i := 0; i < n; i++ {
-		mustAppend(t, s, nil, Entry{Kind: KindArtifact, Visibility: Shared, Content: textBlocks(strings.Repeat("a", 120))})
+		mustAppend(t, s, nil, Entry{Kind: KindArtifact, Content: textBlocks(strings.Repeat("a", 120))})
 	}
 	return s
 }
@@ -215,66 +190,8 @@ func TestCoordinatorChunkedImportSkipsOneEntry(t *testing.T) {
 	if got := syncTexts(s); !reflect.DeepEqual(got, []string{"[#2 not imported: read it with thread_read]"}) {
 		t.Fatalf("final sync = %q", got)
 	}
-	if v, ok := MsgVisibility(s.Messages[0]); !ok || v != Shared {
-		t.Fatalf("a notice over shared entries carries %q %v", v, ok)
-	}
-
-	// A notice standing for an edge-only entry carries EdgeOnly.
-	store := NewMemoryStore(WithClock(fixedClock()))
-	mustAppend(t, store, nil, Entry{Kind: KindArtifact, Visibility: Shared, Content: textBlocks(strings.Repeat("a", 120))})
-	mustAppend(t, store, nil, Entry{Kind: KindArtifact, Visibility: EdgeOnly, Content: textBlocks(strings.Repeat("b", 120))})
-	edge2 := smallEdge()
-	edge2.compactPlan = []fakeCompact{{err: errors.New("down")}}
-	_, cloud2 := edgeCloud()
-	env2 := newCoEnv(t, store, nil, edge2, cloud2)
-	env2.submit(Query{Text: "go", Explicit: "edge"})
-	env2.idle()
-	s2 := edge2.activations()[0].Sync
-	if got := syncTexts(s2); !reflect.DeepEqual(got, []string{"[#2 not imported: read it with thread_read]"}) {
-		t.Fatalf("final sync = %q", got)
-	}
-	if v, ok := MsgVisibility(s2.Messages[0]); !ok || v != EdgeOnly {
-		t.Fatalf("a notice over an edge-only entry carries %q %v", v, ok)
-	}
-}
-
-func TestRenderedEdgeOnlyTrustsTheVisibilityKey(t *testing.T) {
-	shared := Entry{Seq: 1, Kind: KindReport, Visibility: Shared}
-	private := Entry{Seq: 2, Kind: KindReport, Visibility: EdgeOnly}
-	lookups := 0
-	lookup := func(seq uint64) *Entry {
-		lookups++
-		switch seq {
-		case 1:
-			return &shared
-		case 2:
-			return &private
-		}
-		return nil
-	}
-	keyed := func(e *Entry) *message.Msg { return projectedMsg("x", e.Seq, string(e.Kind), e.EffectiveVisibility()) }
-	bare := func(e *Entry) *message.Msg {
-		m := keyed(e)
-		delete(m.Metadata, VisibilityMetadataKey)
-		return m
-	}
-	gap := projectedMsg("[#3 withheld: edge-only entry]", 3, GapKind, EdgeOnly)
-	for _, tc := range []struct {
-		name    string
-		msgs    []*message.Msg
-		want    bool
-		lookups int
-	}{
-		{"keyed shared", []*message.Msg{keyed(&shared)}, false, 0},
-		{"keyed edge-only", []*message.Msg{keyed(&private)}, true, 0},
-		{"gap", []*message.Msg{gap}, false, 0},
-		{"no key, shared", []*message.Msg{bare(&shared)}, false, 1},
-		{"no key, edge-only", []*message.Msg{bare(&private)}, true, 1},
-	} {
-		lookups = 0
-		if got := renderedEdgeOnly(tc.msgs, lookup); got != tc.want || lookups != tc.lookups {
-			t.Errorf("%s: %v with %d lookups, want %v with %d", tc.name, got, lookups, tc.want, tc.lookups)
-		}
+	if k := s.Messages[0].Metadata[KindMetadataKey]; k != string(KindMarker) {
+		t.Fatalf("the notice's kind = %v", k)
 	}
 }
 

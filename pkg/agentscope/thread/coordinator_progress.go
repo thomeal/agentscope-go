@@ -48,9 +48,7 @@ func planText(ev event.Event) string {
 
 // recordProgress writes the plan an activation's agent just published as a
 // progress entry, so the log holds where the run stands if it fails or the
-// process stops. An edge participant's progress is edge-only: the run may
-// have read private material the Coordinator cannot see yet, and a
-// disclosure policy call per plan update is not worth it.
+// process stops.
 func (c *Coordinator) recordProgress(a *activation, plan string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -58,19 +56,14 @@ func (c *Coordinator) recordProgress(a *activation, plan string) {
 		return
 	}
 	ps := a.part
-	vis := Shared
-	if ps.desc.Zone == ZoneEdge {
-		vis = EdgeOnly
-	}
 	a.progressN++
 	stored := c.commitLocked(ps.name, []Entry{{
-		Kind:       KindProgress,
-		Origin:     Origin{Participant: ps.name},
-		Visibility: vis,
-		BasedOn:    a.trigger.Seq,
-		Run:        a.id,
-		Content:    textContent(plan),
-		DedupKey:   fmt.Sprintf("progress:%s:%d", a.id, a.progressN),
+		Kind:     KindProgress,
+		Origin:   Origin{Participant: ps.name},
+		BasedOn:  a.trigger.Seq,
+		Run:      a.id,
+		Content:  textContent(plan),
+		DedupKey: fmt.Sprintf("progress:%s:%d", a.id, a.progressN),
 	}}, nil)
 	if len(stored) == 1 && c.answersCycleLocked(a) {
 		p := cloneEntry(&stored[0])
@@ -104,25 +97,10 @@ func failoverNote(a *activation) string {
 
 // restartNote is the input of an activation that resumes a request the
 // stopped process was answering. Nothing that ran before the restart is
-// re-run: the participant checks the actual state first. An owner resuming
-// from a Transfer's brief is pointed at the brief; the request is never
-// quoted to it.
+// re-run: the participant checks the actual state first.
 func restartNote(a *activation, hostNote string) string {
 	var b strings.Builder
 	switch {
-	case a.briefSeq != 0:
-		fmt.Fprintf(&b, "[The session restarted while you were continuing the request handed to you in #%d", a.briefSeq)
-		for i, e := range a.recoverWith {
-			switch {
-			case i > 0:
-				b.WriteString(", ")
-			case len(a.recoverWith) == 1:
-				b.WriteString(", with the user's message ")
-			default:
-				b.WriteString(", with the user's messages ")
-			}
-			fmt.Fprintf(&b, "#%d %s", e.Seq, quoteRequest(e.Text()))
-		}
 	case len(a.recoverWith) == 0:
 		fmt.Fprintf(&b, "[The session restarted while the user's request #%d %s was being answered", a.cycleInput, quoteRequest(a.userText))
 	default:

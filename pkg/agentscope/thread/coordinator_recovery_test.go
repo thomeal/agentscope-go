@@ -2,174 +2,13 @@ package thread
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/model"
-	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/types"
 )
-
-// TestCoordinatorPrivacySession runs a session with edge-only inputs and
-// private edge work, then checks that no edge-only text reached the cloud
-// through a Sync, a Pending result, a Read, an activation input or an
-// event page.
-func TestCoordinatorPrivacySession(t *testing.T) {
-	edge, cloud := edgeCloud()
-	edgeErrs := map[string]error{}
-	var recordID string
-	edge.push(func(r *fakeRun) *ActivationEnd {
-		h := r.host()
-		recordID = h.RecordEvent(EventRecord{Tool: "read_contacts", Output: "SECRET-E3 alice 555"})
-		_, _, edgeErrs["assign"] = r.assign("cloud", "look up SECRET-P1", false)
-		_, edgeErrs["report"] = r.report("SECRET-R4", true, "cloud")
-		if _, err := h.Publish(r.ctx, PublishRequest{From: Origin{Participant: "edge"}, Refs: []ArtifactRef{{URI: "file:///SECRET-A5"}}}); err != nil {
-			t.Errorf("publish: %v", err)
-		}
-		r.say("Noted SECRET-R2")
-		return &ActivationEnd{Reason: types.ReplyCompleted, Text: r.text(), Private: true}
-	})
-	var cloudErrs []error
-	cloud.push(replyWith("Rome plan"), func(r *fakeRun) *ActivationEnd {
-		r.pending()
-		if _, err := r.read(ReadQuery{}); err != nil {
-			cloudErrs = append(cloudErrs, err)
-		}
-		var all []uint64
-		for i := uint64(1); i <= 20; i++ {
-			all = append(all, i)
-		}
-		if _, err := r.read(ReadQuery{Seqs: all}); err != nil {
-			cloudErrs = append(cloudErrs, err)
-		}
-		if got := r.host().EventOutline("cloud", 0); len(got) != 0 {
-			t.Errorf("cloud outline = %+v", got)
-		}
-		if _, err := r.page(recordID); !errors.Is(err, ErrEventNotFound) {
-			t.Errorf("cloud page error = %v", err)
-		}
-		return r.reply("flights booked")
-	})
-	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = zoneRouter() }, edge, cloud)
-	env.say("plan a trip to Rome")
-	env.idle()
-	env.submit(Query{Text: "my passport is SECRET-P1", Disclosure: DiscloseEdgeOnly})
-	env.idle()
-	env.say("book flights")
-	env.idle()
-
-	for _, name := range []string{"assign", "report"} {
-		if !errors.Is(edgeErrs[name], errPrivateBrief) {
-			t.Errorf("private %s to the cloud: %v", name, edgeErrs[name])
-		}
-	}
-	if len(cloudErrs) > 0 {
-		t.Fatalf("cloud reads failed: %v", cloudErrs)
-	}
-	log := env.log()
-	var edgeOnly int
-	for i := range log {
-		e := &log[i]
-		if strings.Contains(renderEntry(e), "SECRET") && e.Visibility != EdgeOnly {
-			t.Errorf("#%d %s holds private text but is %s", e.Seq, e.Kind, e.Visibility)
-		}
-		if e.Visibility == EdgeOnly {
-			edgeOnly++
-		}
-	}
-	if edgeOnly != 3 { // the input, the private reply and the artifact
-		t.Fatalf("%d edge-only entries", edgeOnly)
-	}
-	seen := cloud.seenTexts()
-	if containsText(seen, "SECRET") {
-		t.Fatalf("edge-only text reached the cloud: %q", seen)
-	}
-	if !containsText(seen, "withheld: edge-only") {
-		t.Fatalf("the cloud saw no gap: %q", seen)
-	}
-	for _, s := range cloud.pendingResults() {
-		if containsText(syncTexts(s), "SECRET") {
-			t.Fatal("a Pending result held edge-only text")
-		}
-	}
-	env.c.mu.Lock()
-	private := env.c.parts["edge"].private
-	env.c.mu.Unlock()
-	if !private {
-		t.Fatal("the edge is not marked private")
-	}
-}
-
-func TestCoordinatorDisclosurePolicyDeclassifies(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		fn   func(string) (Visibility, error)
-		want Visibility
-	}{
-		{"shared", func(string) (Visibility, error) { return Shared, nil }, Shared},
-		{"edge only", func(string) (Visibility, error) { return EdgeOnly, nil }, EdgeOnly},
-		{"error", func(string) (Visibility, error) { return "", errors.New("down") }, EdgeOnly},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			edge, cloud := edgeCloud()
-			policy := &fakePolicy{fn: tc.fn}
-			edge.push(func(r *fakeRun) *ActivationEnd {
-				r.say("the weather is fine")
-				return &ActivationEnd{Reason: types.ReplyCompleted, Text: r.text(), Private: true,
-					Digest: &ToolDigest{Calls: []ToolCallDigest{{Name: "Read", Args: `{"path":"notes.txt"}`}}}}
-			})
-			env := newCoEnv(t, nil, func(cfg *Config) { cfg.Disclosure = policy }, edge, cloud)
-			env.say("weather?")
-			env.idle()
-			reps := findEntries(env.log(), KindReply, "")
-			if len(reps) != 1 || reps[0].Visibility != tc.want {
-				t.Fatalf("reply = %+v", reps)
-			}
-			if len(policy.calls) != 1 || !strings.Contains(policy.calls[0], "notes.txt") {
-				t.Fatalf("classified %q; the digest must be classified with the text", policy.calls)
-			}
-		})
-	}
-}
-
-func TestCoordinatorTaintPropagation(t *testing.T) {
-	edge, cloud := edgeCloud()
-	edge.push(func(r *fakeRun) *ActivationEnd {
-		r.say("from the web")
-		return &ActivationEnd{Reason: types.ReplyCompleted, Text: r.text(), Tainted: true}
-	}, func(r *fakeRun) *ActivationEnd {
-		seq, err := r.host().Transfer(r.ctx, TransferRequest{From: Origin{Participant: "edge"}, Epoch: r.act.Epoch,
-			To: "cloud", Brief: testBrief(), Text: "handing over", Tainted: true})
-		if err != nil || seq == 0 {
-			t.Errorf("transfer: %v", err)
-		}
-		return &ActivationEnd{Reason: types.ReplyHandedOff}
-	})
-	env := newCoEnv(t, nil, nil, edge, cloud)
-	env.say("search")
-	env.idle()
-	env.say("continue in the cloud")
-	env.idle()
-	log := env.log()
-	reps := findEntries(log, KindReply, "")
-	if len(reps) < 2 || !reps[0].Tainted || !reps[1].Tainted {
-		t.Fatalf("replies = %+v", reps)
-	}
-	ocs := findEntries(log, KindOwnerChange, "")
-	if last := ocs[len(ocs)-1]; last.Owner.Reason != ReasonTransfer || !last.Tainted {
-		t.Fatalf("transfer = %+v", last)
-	}
-	acts := cloud.activations()
-	if len(acts) != 1 || acts[0].Sync == nil || acts[0].Sync.Taint == nil || !*acts[0].Sync.Taint {
-		t.Fatalf("cloud import taint = %+v", acts[0].Sync)
-	}
-	if !strings.Contains(strings.Join(syncTexts(acts[0].Sync), "\n"), "(untrusted source)") {
-		t.Fatal("the tainted reply is not marked in the projection")
-	}
-}
 
 // TestCoordinatorRecovery: a request the stopped process was answering is
 // resumed on its owner. The restarted marker carries the host's note, the
@@ -185,15 +24,14 @@ func TestCoordinatorRecovery(t *testing.T) {
 	mustAppend(t, store, &Guard{Owner: "cloud", Epoch: 1}, rep)
 	mustAppend(t, store, nil,
 		userInput("unanswered"),
-		Entry{Kind: KindAssign, Origin: Origin{Participant: "cloud"}, To: []string{"edge"}, Visibility: Shared,
+		Entry{Kind: KindAssign, Origin: Origin{Participant: "cloud"}, To: []string{"edge"},
 			Task: &Task{ID: "t-7"}, Content: textBlocks("do it")},
-		Entry{Kind: KindArtifact, Visibility: EdgeOnly, Refs: []ArtifactRef{{URI: "file:///private"}}},
-		Entry{Kind: KindProgress, Origin: Origin{Participant: "cloud"}, Visibility: Shared, BasedOn: 4, Run: "a-1",
+		Entry{Kind: KindArtifact, Refs: []ArtifactRef{{URI: "file:///notes"}}},
+		Entry{Kind: KindProgress, Origin: Origin{Participant: "cloud"}, BasedOn: 4, Run: "a-1",
 			Content: textBlocks("1. [in_progress] look it up"), DedupKey: "progress:a-1:1"},
 	)
 	edge, cloud := edgeCloud()
-	// The edge imported the edge-only artifact: its checkpoint is private.
-	edge.setState(func(s *ParticipantState) { s.Cursor, s.Private = 6, true })
+	edge.setState(func(s *ParticipantState) { s.Cursor = 6 })
 	cloud.setState(func(s *ParticipantState) { s.Cursor = 4 })
 	var taskID string
 	cloud.push(func(r *fakeRun) *ActivationEnd {
@@ -245,11 +83,10 @@ func TestCoordinatorRecovery(t *testing.T) {
 		t.Fatalf("owner = %s %d", owner, epoch)
 	}
 	env.c.mu.Lock()
-	private := env.c.parts["edge"].private
 	waiting := len(env.c.inputs)
 	env.c.mu.Unlock()
-	if !private || waiting != 0 {
-		t.Fatalf("private %v, waiting inputs %d", private, waiting)
+	if waiting != 0 {
+		t.Fatalf("waiting inputs %d", waiting)
 	}
 
 	// A second restart finds nothing new to recover.
@@ -280,12 +117,12 @@ func TestCoordinatorRecoveryAfterAFailover(t *testing.T) {
 	fo.BasedOn = 1
 	fo.Owner.Reason = ReasonFailover
 	mustAppend(t, store, nil,
-		Entry{Kind: KindProgress, Origin: Origin{Participant: "cloud"}, Visibility: Shared, BasedOn: 1, Run: "a-1",
+		Entry{Kind: KindProgress, Origin: Origin{Participant: "cloud"}, BasedOn: 1, Run: "a-1",
 			Content: textBlocks("1. [in_progress] draft the morning"), DedupKey: "progress:a-1:1"},
 		failed)
 	mustAppend(t, store, &Guard{Owner: "cloud", Epoch: 1}, fo)
 	mustAppend(t, store, nil,
-		Entry{Kind: KindProgress, Origin: Origin{Participant: "edge"}, Visibility: EdgeOnly, BasedOn: 5, Run: "a-2",
+		Entry{Kind: KindProgress, Origin: Origin{Participant: "edge"}, BasedOn: 5, Run: "a-2",
 			Content: textBlocks("1. [in_progress] read the calendar"), DedupKey: "progress:a-2:1"})
 	edge, cloud := edgeCloud()
 	edge.setState(func(s *ParticipantState) { s.Cursor = 2 })
@@ -369,7 +206,7 @@ func TestCoordinatorRecoveryStopsAfterRepeatedRestarts(t *testing.T) {
 
 // assignTo is a task the cloud assigned to a participant.
 func assignTo(to, id string) Entry {
-	return Entry{Kind: KindAssign, Origin: Origin{Participant: "cloud"}, To: []string{to}, Visibility: Shared,
+	return Entry{Kind: KindAssign, Origin: Origin{Participant: "cloud"}, To: []string{to},
 		Task: &Task{ID: id}, Content: textBlocks("check the sensors")}
 }
 
@@ -504,51 +341,6 @@ func TestCoordinatorRecoveryJoinsSteering(t *testing.T) {
 	}
 }
 
-// TestCoordinatorRecoveryRequeuesWhatTheOwnerCannotRead: an edge-only input
-// sent while the cloud answered was waiting for a cycle of its own; it does
-// not go with the cloud's request but is routed again after it. The cloud
-// resumes its request with the restart warning even when nothing in the log
-// is based on it yet (an owner change without a base stands for a log
-// whose cloud run wrote nothing).
-func TestCoordinatorRecoveryRequeuesWhatTheOwnerCannotRead(t *testing.T) {
-	for _, based := range []bool{true, false} {
-		t.Run(fmt.Sprintf("based=%v", based), func(t *testing.T) {
-			store := NewMemoryStore(WithClock(fixedClock()))
-			mustAppend(t, store, nil, userInput("send the email to Bob"))
-			oc := ownerChange("", "cloud")
-			if based {
-				oc.BasedOn = 1
-			}
-			mustAppend(t, store, &Guard{}, oc)
-			private := userInput("my passport number is X")
-			private.Visibility, private.Disclosure = EdgeOnly, DiscloseEdgeOnly
-			mustAppend(t, store, nil, private)
-			edge, cloud := edgeCloud()
-			cloud.push(replyWith("sent"))
-			edge.push(replyWith("noted"))
-			env := newCoEnv(t, store, nil, edge, cloud)
-			env.idle()
-			acts := cloud.activations()
-			if len(acts) != 1 || strings.Contains(acts[0].Input, "passport") ||
-				!strings.HasPrefix(acts[0].Input, `[The session restarted while the user's request #1 "send the email to Bob"`) {
-				t.Fatalf("cloud activations = %+v", acts)
-			}
-			if acts := edge.activations(); len(acts) != 1 || acts[0].Trigger.Seq != 3 && acts[0].Trigger.BasedOn != 3 {
-				t.Fatalf("the edge-only input was not routed again: %+v", acts)
-			}
-			log := env.log()
-			if m := findEntries(log, KindMarker, MarkerRecovered); len(m) != 0 {
-				t.Fatalf("recovered markers = %+v", m)
-			}
-			for _, r := range findEntries(log, KindReply, "") {
-				if len(r.Steered) != 0 {
-					t.Fatalf("a reply took the other request for steering: %+v", r)
-				}
-			}
-		})
-	}
-}
-
 // transferLog writes a request the edge took and handed to the cloud with a
 // Transfer, then the cloud's progress: #1 the request, #2 the router's owner
 // change, #3 the edge's progress, #4 the Transfer, #5 the cloud's progress.
@@ -559,31 +351,29 @@ func transferLog(t *testing.T, request *Entry) *MemoryStore {
 	oc := ownerChange("", "edge")
 	oc.BasedOn = 1
 	mustAppend(t, store, &Guard{}, oc)
-	mustAppend(t, store, nil, Entry{Kind: KindProgress, Origin: Origin{Participant: "edge"}, Visibility: EdgeOnly,
-		BasedOn: 1, Run: "a-1", Content: textBlocks("1. [in_progress] read the door code"), DedupKey: "progress:a-1:1"})
+	mustAppend(t, store, nil, Entry{Kind: KindProgress, Origin: Origin{Participant: "edge"},
+		BasedOn: 1, Run: "a-1", Content: textBlocks("1. [in_progress] check the calendar"), DedupKey: "progress:a-1:1"})
 	tr := ownerChange("edge", "cloud")
 	tr.BasedOn, tr.Origin = 1, Origin{Participant: "edge"}
 	tr.Owner.Reason = ReasonTransfer
 	tr.Owner.Brief = &Brief{Goal: "book the garage service for Friday", Remaining: []string{"pick a slot"}}
 	tr.DedupKey = "transfer:a-1"
 	mustAppend(t, store, &Guard{Owner: "edge", Epoch: 1}, tr)
-	mustAppend(t, store, nil, Entry{Kind: KindProgress, Origin: Origin{Participant: "cloud"}, Visibility: Shared,
+	mustAppend(t, store, nil, Entry{Kind: KindProgress, Origin: Origin{Participant: "cloud"},
 		BasedOn: 4, Run: "a-2", Content: textBlocks("1. [in_progress] find a slot"), DedupKey: "progress:a-2:1"})
 	return store
 }
 
-// TestCoordinatorRecoveryResumesATransferFromItsBrief: the process stopped
-// while the cloud answered an edge-only request the edge had handed to it
-// through a cleared brief. The cloud resumes it: its input points at the
-// brief, never quotes the request, and its trigger is a marker it may read;
-// the inputs the cloud may read join it. The edge does not run.
-func TestCoordinatorRecoveryResumesATransferFromItsBrief(t *testing.T) {
-	private := userInput("the door code is 4711, book the garage service")
-	private.Visibility, private.Disclosure = EdgeOnly, DiscloseEdgeOnly
-	store := transferLog(t, &private)
+// TestCoordinatorRecoveryResumesATransfer: the process stopped while the
+// cloud answered a request the edge had handed to it with a Transfer. The
+// cloud resumes it, with the inputs that came later joined; the edge does
+// not run.
+func TestCoordinatorRecoveryResumesATransfer(t *testing.T) {
+	request := userInput("book the garage service")
+	store := transferLog(t, &request)
 	mustAppend(t, store, nil, userInput("Friday morning if possible"), userInput("and send me the invoice")) // #6, #7
 	edge, cloud := edgeCloud()
-	edge.setState(func(s *ParticipantState) { s.Cursor, s.Private = 3, true })
+	edge.setState(func(s *ParticipantState) { s.Cursor = 3 })
 	cloud.push(replyWith("booked for Friday 9:00"))
 	env := newCoEnv(t, store, func(cfg *Config) { cfg.RecoveryNote = "power loss" }, edge, cloud)
 	env.idle()
@@ -594,11 +384,11 @@ func TestCoordinatorRecoveryResumesATransferFromItsBrief(t *testing.T) {
 	}
 	mk := acts[0].Trigger
 	if mk.Kind != KindMarker || mk.Marker.Kind != MarkerRestarted || mk.BasedOn != 4 || mk.DedupKey != "restart:4" ||
-		mk.Visibility != Shared || !strings.Contains(mk.Marker.Detail, "#1 (handed over in #4), #6, #7") {
+		!strings.Contains(mk.Marker.Detail, "#1, #6, #7") {
 		t.Fatalf("resume trigger = %+v %+v", mk, mk.Marker)
 	}
-	wantInput := `[The session restarted while you were continuing the request handed to you in #4, ` +
-		`with the user's messages #6 "Friday morning if possible", #7 "and send me the invoice" (host: power loss). ` +
+	wantInput := `[The session restarted while the user's messages #1 "book the garage service", ` +
+		`#6 "Friday morning if possible", #7 "and send me the invoice" were being answered (host: power loss). ` +
 		`Work done before the restart may or may not have taken effect: check the actual state before you redo anything. ` +
 		`The latest progress is #5. Continue the request.]`
 	if acts[0].Input != wantInput {
@@ -608,11 +398,6 @@ func TestCoordinatorRecoveryResumesATransferFromItsBrief(t *testing.T) {
 	for _, want := range []string{"[#4 foreground: edge → cloud, reason transfer]", "book the garage service for Friday", "[#5 progress of cloud]"} {
 		if !strings.Contains(imported, want) {
 			t.Fatalf("the cloud's import lacks %q:\n%s", want, imported)
-		}
-	}
-	for _, text := range append(syncTexts(acts[0].Sync), acts[0].Input, mk.Marker.Detail) {
-		if strings.Contains(text, "4711") || strings.Contains(text, "door code") {
-			t.Fatalf("the cloud saw edge-only material: %q", text)
 		}
 	}
 	if acts := edge.activations(); len(acts) != 0 {
@@ -640,165 +425,6 @@ func TestCoordinatorRecoveryResumesATransferFromItsBrief(t *testing.T) {
 	}
 }
 
-// TestCoordinatorRecoveryNeverJoinsWhatTheOwnerCannotRead: two edge-only
-// requests the edge handed to the cloud are open; the cloud's run of the
-// first ended with no text and no tool calls, so no reply sealed it. The
-// cloud resumes the newer one from its brief and does not join the older
-// one, whose text it would quote: that one gets a recovered marker.
-func TestCoordinatorRecoveryNeverJoinsWhatTheOwnerCannotRead(t *testing.T) {
-	transfer := func(basedOn uint64, key string) Entry {
-		tr := ownerChange("edge", "cloud")
-		tr.BasedOn, tr.Origin = basedOn, Origin{Participant: "edge"}
-		tr.Owner.Reason = ReasonTransfer
-		tr.Owner.Brief = &Brief{Goal: "finish the booking", Remaining: []string{"pick a slot"}}
-		tr.DedupKey = key
-		return tr
-	}
-	edgeOnly := func(text string) Entry {
-		e := userInput(text)
-		e.Visibility, e.Disclosure = EdgeOnly, DiscloseEdgeOnly
-		return e
-	}
-	store := NewMemoryStore(WithClock(fixedClock()))
-	mustAppend(t, store, nil, edgeOnly("the door code is 4711")) // #1
-	toEdge := ownerChange("", "edge")
-	toEdge.BasedOn = 1
-	mustAppend(t, store, &Guard{}, toEdge)                                             // #2
-	mustAppend(t, store, &Guard{Owner: "edge", Epoch: 1}, transfer(1, "transfer:a-1")) // #3
-	mustAppend(t, store, nil, edgeOnly("my PIN is 9902, pay the garage"))              // #4
-	back := ownerChange("cloud", "edge")
-	back.BasedOn = 4
-	mustAppend(t, store, &Guard{Owner: "cloud", Epoch: 2}, back)                       // #5
-	mustAppend(t, store, &Guard{Owner: "edge", Epoch: 3}, transfer(4, "transfer:a-3")) // #6
-	edge, cloud := edgeCloud()
-	edge.setState(func(s *ParticipantState) { s.Cursor, s.Private = 5, true })
-	cloud.setState(func(s *ParticipantState) { s.Cursor = 6 })
-	cloud.push(replyWith("paid"))
-	env := newCoEnv(t, store, nil, edge, cloud)
-	env.idle()
-
-	acts := cloud.activations()
-	if len(acts) != 1 || acts[0].Trigger.BasedOn != 6 {
-		t.Fatalf("cloud activations = %+v", acts)
-	}
-	for _, text := range append(syncTexts(acts[0].Sync), acts[0].Input, acts[0].Trigger.Text(), acts[0].Trigger.Marker.Detail) {
-		if strings.Contains(text, "4711") || strings.Contains(text, "9902") {
-			t.Fatalf("the cloud saw an edge-only request: %q", text)
-		}
-	}
-	if want := "[The session restarted while you were continuing the request handed to you in #6. "; !strings.HasPrefix(acts[0].Input, want) {
-		t.Fatalf("resume input %q, want the prefix %q", acts[0].Input, want)
-	}
-	log := env.log()
-	rec := findEntries(log, KindMarker, MarkerRecovered)
-	if len(rec) != 1 || rec[0].BasedOn != 3 {
-		t.Fatalf("recovered markers = %+v", rec)
-	}
-	rep := findEntries(log, KindReply, "")
-	if len(rep) != 1 || rep[0].Origin.Participant != "cloud" || len(rep[0].Steered) != 0 {
-		t.Fatalf("replies = %+v", rep)
-	}
-	if acts := edge.activations(); len(acts) != 0 {
-		t.Fatalf("the edge ran: %+v", acts)
-	}
-}
-
-// TestCoordinatorRecoveryResumesATransferTheCloudMayNotTake: a request the
-// cloud may read but not take after the restart (unclassified, with the
-// edge tainted) is resumed on the cloud when the edge transferred it there;
-// the input quotes it, as for any request the owner reads.
-func TestCoordinatorRecoveryResumesATransferTheCloudMayNotTake(t *testing.T) {
-	req := userInput("book the garage service")
-	req.Disclosure = DiscloseUnclassified
-	store := transferLog(t, &req)
-	edge, cloud := edgeCloud()
-	edge.setState(func(s *ParticipantState) { s.Cursor, s.Tainted = 3, true })
-	cloud.push(replyWith("booked"))
-	env := newCoEnv(t, store, nil, edge, cloud)
-	env.idle()
-	acts := cloud.activations()
-	if len(acts) != 1 || acts[0].Trigger.BasedOn != 4 ||
-		!strings.HasPrefix(acts[0].Input, `[The session restarted while the user's request #1 "book the garage service" was being answered`) {
-		t.Fatalf("cloud activations = %+v", acts)
-	}
-	if acts := edge.activations(); len(acts) != 0 {
-		t.Fatalf("the edge ran: %+v", acts)
-	}
-}
-
-// TestCoordinatorRecoveryRequeueDropsTheTransfer: a requeue starts the
-// request over, so the Transfer before it no longer hands the request to
-// the cloud: an edge-only request is routed to the edge again.
-func TestCoordinatorRecoveryRequeueDropsTheTransfer(t *testing.T) {
-	private := userInput("the door code is 4711, book the garage service")
-	private.Visibility, private.Disclosure = EdgeOnly, DiscloseEdgeOnly
-	store := transferLog(t, &private)
-	rq := markerEntry(MarkerRestarted, 1, "restarted")
-	rq.Visibility, rq.DedupKey = EdgeOnly, "requeue:1:1"
-	mustAppend(t, store, nil, rq) // #6
-	edge, cloud := edgeCloud()
-	edge.setState(func(s *ParticipantState) { s.Cursor, s.Private = 3, true })
-	edge.push(replyWith("booked"))
-	env := newCoEnv(t, store, nil, edge, cloud)
-	env.idle()
-	if acts := cloud.activations(); len(acts) != 0 {
-		t.Fatalf("the cloud ran: %+v", acts)
-	}
-	acts := edge.activations()
-	if len(acts) != 1 {
-		t.Fatalf("edge activations = %+v", acts)
-	}
-	if m := findEntries(env.log(), KindMarker, MarkerRestarted); len(m) != 2 || m[1].DedupKey != "requeue:1:2" {
-		t.Fatalf("restarted markers = %+v", m)
-	}
-}
-
-// TestCoordinatorRecoveryResumesASkippedInput: an edge-only input skipped by
-// a cloud cycle got its own cycle after the cloud answered, and the process
-// stopped while the edge answered it. That cycle is the turn in flight,
-// although a newer request was answered, so the edge resumes it, also in a
-// log whose owner change names no request.
-func TestCoordinatorRecoveryResumesASkippedInput(t *testing.T) {
-	for _, based := range []bool{true, false} {
-		t.Run(fmt.Sprintf("based=%v", based), func(t *testing.T) {
-			store := NewMemoryStore(WithClock(fixedClock()))
-			secret := userInput("my private note")
-			secret.Visibility, secret.Disclosure = EdgeOnly, DiscloseEdgeOnly
-			mustAppend(t, store, nil, secret, userInput("plan my trip"))
-			toCloud := ownerChange("", "cloud")
-			toCloud.BasedOn = 2
-			mustAppend(t, store, &Guard{}, toCloud)
-			rep := replyFrom("cloud", "planned")
-			rep.BasedOn = 2
-			mustAppend(t, store, &Guard{Owner: "cloud", Epoch: 1}, rep)
-			toEdge := ownerChange("cloud", "edge")
-			if based {
-				toEdge.BasedOn = 1
-			}
-			mustAppend(t, store, &Guard{Owner: "cloud", Epoch: 1}, toEdge)
-			edge, cloud := edgeCloud()
-			edge.push(replyWith("noted"))
-			env := newCoEnv(t, store, nil, edge, cloud)
-			env.idle()
-			log := env.log()
-			if m := findEntries(log, KindMarker, MarkerRecovered); len(m) != 0 {
-				t.Fatalf("recovered markers = %+v", m)
-			}
-			acts := edge.activations()
-			if len(acts) != 1 || len(cloud.activations()) != 0 {
-				t.Fatalf("edge activations = %+v, cloud = %+v", acts, cloud.activations())
-			}
-			restarted := findEntries(log, KindMarker, MarkerRestarted)
-			if len(restarted) != 1 || restarted[0].BasedOn != 1 || restarted[0].DedupKey != "restart:1" || restarted[0].Visibility != EdgeOnly {
-				t.Fatalf("restarted markers = %+v", restarted)
-			}
-			if !strings.Contains(acts[0].Input, `request #1 "my private note"`) {
-				t.Fatalf("edge input = %q", acts[0].Input)
-			}
-		})
-	}
-}
-
 // TestCoordinatorRecoveryJoinsAnEarlierRequest: a request recovery routed
 // again at an earlier restart was waiting while a newer one ran. Both are
 // the turn in flight: the newer one, which the router sent to the cloud, is
@@ -810,7 +436,7 @@ func TestCoordinatorRecoveryJoinsAnEarlierRequest(t *testing.T) {
 	requeued := markerEntry(MarkerRestarted, 1, "restarted")
 	requeued.DedupKey = "requeue:1:1"
 	mustAppend(t, store, nil, requeued,
-		Entry{Kind: KindProgress, Origin: Origin{Participant: "cloud"}, Visibility: Shared, BasedOn: 1, Run: "a-0",
+		Entry{Kind: KindProgress, Origin: Origin{Participant: "cloud"}, BasedOn: 1, Run: "a-0",
 			Content: textBlocks("1. [in_progress] compare hotels"), DedupKey: "progress:a-0:1"},
 		userInput("and a car"))
 	oc := ownerChange("", "cloud")
@@ -909,125 +535,6 @@ func TestCoordinatorRecoveryResumesTheNextRequest(t *testing.T) {
 	}
 }
 
-// TestCoordinatorRecoveryKeepsTheEdgePrivate: after a restart the
-// Coordinator takes the edge's privacy from its checkpoint (Private), not
-// from the log: a run's private reading is saved with the flag, and the log
-// shows neither. The edge was answering a shared request when the process
-// stopped; resumed, its reply stays edge-only (there is no disclosure
-// policy) exactly when the checkpoint is private, whatever progress the run
-// left in the log.
-func TestCoordinatorRecoveryKeepsTheEdgePrivate(t *testing.T) {
-	for _, private := range []bool{true, false} {
-		for _, progress := range []bool{true, false} {
-			t.Run(fmt.Sprintf("private=%v/progress=%v", private, progress), func(t *testing.T) {
-				store := NewMemoryStore(WithClock(fixedClock()))
-				mustAppend(t, store, nil, userInput("how am I doing"))
-				oc := ownerChange("", "edge")
-				oc.BasedOn = 1
-				mustAppend(t, store, &Guard{}, oc)
-				if progress {
-					mustAppend(t, store, nil, Entry{Kind: KindProgress, Origin: Origin{Participant: "edge"}, Visibility: EdgeOnly, BasedOn: 1,
-						Run: "a-1", Content: textBlocks("1. [completed] read heart rate: 142 bpm\n2. [in_progress] answer"),
-						DedupKey: "progress:a-1:1"})
-				}
-				edge, cloud := edgeCloud()
-				edge.setState(func(s *ParticipantState) { s.Cursor, s.Private = 1, private })
-				edge.push(replyWith("Your heart rate is 142 bpm."))
-				env := newCoEnv(t, store, nil, edge, cloud)
-				env.idle()
-				want := Shared
-				if private || progress {
-					// The resumed run imports its own edge-only progress.
-					want = EdgeOnly
-				}
-				replies := findEntries(env.log(), KindReply, "")
-				if len(replies) != 1 || replies[0].Visibility != want {
-					t.Fatalf("replies = %+v", replies)
-				}
-			})
-		}
-	}
-	// The cloud answers after the restart, and the edge's checkpoint is
-	// private (its cut-off background task read a sensor): the edge stays
-	// private although nothing in the log says so.
-	t.Run("cut-off task", func(t *testing.T) {
-		store := NewMemoryStore(WithClock(fixedClock()))
-		mustAppend(t, store, nil, userInput("check my vitals in the background"))
-		oc := ownerChange("", "cloud")
-		oc.BasedOn = 1
-		mustAppend(t, store, &Guard{}, oc)
-		as := assignTo("edge", "t-1")
-		as.BasedOn = 1
-		mustAppend(t, store, nil, as)
-		rep := replyFrom("cloud", "started a task on the edge")
-		rep.BasedOn, rep.DedupKey = 1, "reply:a-1"
-		mustAppend(t, store, &Guard{Owner: "cloud", Epoch: 1}, rep)
-		edge, cloud := edgeCloud()
-		edge.setState(func(s *ParticipantState) { s.Cursor, s.Private = 3, true })
-		cloud.setState(func(s *ParticipantState) { s.Cursor = 4 })
-		env := newCoEnv(t, store, nil, edge, cloud)
-		env.idle()
-		if !edgePrivate(env, "edge") {
-			t.Fatal("the edge's private checkpoint did not make it private")
-		}
-	})
-	// A clear lowered the edge's privacy before the stop: the edge-only
-	// entries it imported earlier no longer count, so its replies after the
-	// restart are shared again.
-	t.Run("cleared before the stop", func(t *testing.T) {
-		store := NewMemoryStore(WithClock(fixedClock()))
-		mustAppend(t, store, nil, userInput("hi"))
-		oc := ownerChange("", "edge")
-		oc.BasedOn = 1
-		mustAppend(t, store, &Guard{}, oc)
-		mustAppend(t, store, nil, Entry{Kind: KindArtifact, Visibility: EdgeOnly, Refs: []ArtifactRef{{URI: "file:///private"}}})
-		rep := replyFrom("edge", "hello")
-		rep.BasedOn, rep.DedupKey = 1, "reply:a-1"
-		mustAppend(t, store, &Guard{Owner: "edge", Epoch: 1}, rep)
-		edge, cloud := edgeCloud()
-		edge.setState(func(s *ParticipantState) { s.Cursor = 4 })
-		edge.push(replyWith("you are welcome"))
-		env := newCoEnv(t, store, nil, edge, cloud)
-		env.idle()
-		if edgePrivate(env, "edge") {
-			t.Fatal("the edge turned private although its checkpoint is not")
-		}
-		env.say("thanks")
-		env.idle()
-		replies := findEntries(env.log(), KindReply, "")
-		if len(replies) != 2 || replies[1].Visibility != Shared {
-			t.Fatalf("replies = %+v", replies)
-		}
-	})
-	// A graceful Close sealed the edge's run while an input still waited:
-	// the checkpoint is not private, so its replies stay shared.
-	t.Run("queued input at a graceful close", func(t *testing.T) {
-		store := NewMemoryStore(WithClock(fixedClock()))
-		mustAppend(t, store, nil, userInput("hi"))
-		oc := ownerChange("", "edge")
-		oc.BasedOn = 1
-		mustAppend(t, store, &Guard{}, oc)
-		mustAppend(t, store, nil, userInput("and the weather?"))
-		rep := replyFrom("edge", "hello")
-		rep.BasedOn, rep.DedupKey = 1, "reply:a-1"
-		mustAppend(t, store, &Guard{Owner: "edge", Epoch: 1}, rep)
-		edge, cloud := edgeCloud()
-		edge.setState(func(s *ParticipantState) { s.Cursor = 1 })
-		edge.push(replyWith("sunny"), replyWith("you are welcome"))
-		env := newCoEnv(t, store, nil, edge, cloud)
-		env.idle()
-		env.say("thanks")
-		env.idle()
-		if edgePrivate(env, "edge") {
-			t.Fatal("the edge turned private although its checkpoint is not")
-		}
-		replies := findEntries(env.log(), KindReply, "")
-		if len(replies) != 3 || replies[1].Visibility != Shared || replies[2].Visibility != Shared {
-			t.Fatalf("replies = %+v", replies)
-		}
-	})
-}
-
 // failedWith is a failed marker of run id based on seq that lists the
 // inputs the run took.
 func failedWith(seq uint64, id string, steered ...uint64) Entry {
@@ -1037,22 +544,20 @@ func failedWith(seq uint64, id string, steered ...uint64) Entry {
 }
 
 // TestCoordinatorRecoveryMovesSteeringWithItsRequest: an input a failed run
-// took follows that run's request after a crash: it is routed again on its
-// own when the resuming owner may not read it, gets a recovered marker when
+// took follows that run's request after a crash: it joins the request when
+// the owner the run failed over to resumes it, gets a recovered marker when
 // the request is parked, and is queued with the request when the request is
 // routed again. Steered lists that point back at each other or at entries
 // that are not requests change nothing.
 func TestCoordinatorRecoveryMovesSteeringWithItsRequest(t *testing.T) {
-	t.Run("unreadable by the new owner", func(t *testing.T) {
+	t.Run("joined by the new owner", func(t *testing.T) {
 		store := NewMemoryStore(WithClock(fixedClock()))
 		mustAppend(t, store, nil, userInput("plan my trip"))
 		toEdge := ownerChange("", "edge")
 		toEdge.BasedOn = 1
 		mustAppend(t, store, &Guard{}, toEdge)
-		private := userInput("my passport number is X")
-		private.Visibility, private.Disclosure = EdgeOnly, DiscloseEdgeOnly
-		mustAppend(t, store, nil, private, failedWith(1, "a-1", 3, 2))
-		mustAppend(t, store, &Guard{Owner: "edge", Epoch: 1}, Entry{Kind: KindOwnerChange, Visibility: Shared, BasedOn: 1,
+		mustAppend(t, store, nil, userInput("and book the hotel"), failedWith(1, "a-1", 3, 2))
+		mustAppend(t, store, &Guard{Owner: "edge", Epoch: 1}, Entry{Kind: KindOwnerChange, BasedOn: 1,
 			Owner: &OwnerChange{From: "edge", To: "cloud", Reason: ReasonFailover}, DedupKey: "failover:a-1"})
 		edge, cloud := edgeCloud()
 		cloud.push(replyWith("planned"))
@@ -1060,17 +565,14 @@ func TestCoordinatorRecoveryMovesSteeringWithItsRequest(t *testing.T) {
 		env := newCoEnv(t, store, nil, edge, cloud)
 		env.idle()
 		restarted := findEntries(env.log(), KindMarker, MarkerRestarted)
-		if len(restarted) != 1 || restarted[0].BasedOn != 5 || strings.Contains(restarted[0].Marker.Detail, "#3") {
+		if len(restarted) != 1 || restarted[0].BasedOn != 5 || !strings.Contains(restarted[0].Marker.Detail, "#1, #3") {
 			t.Fatalf("restarted markers = %+v", restarted)
 		}
-		if acts := cloud.activations(); len(acts) != 1 || strings.Contains(acts[0].Input, "passport") {
+		if acts := cloud.activations(); len(acts) != 1 || !strings.Contains(acts[0].Input, `#3 "and book the hotel"`) {
 			t.Fatalf("cloud activations = %+v", acts)
 		}
-		if acts := edge.activations(); len(acts) != 1 || acts[0].Trigger.Seq != 3 {
+		if acts := edge.activations(); len(acts) != 0 {
 			t.Fatalf("edge activations = %+v", acts)
-		}
-		if containsText(cloud.seenTexts(), "passport") {
-			t.Fatal("the edge-only steering reached the cloud")
 		}
 	})
 	t.Run("request parked", func(t *testing.T) {
@@ -1195,7 +697,7 @@ func TestCoordinatorHostCalls(t *testing.T) {
 	check := func(name string, err error) { results = append(results, result{name, err}) }
 	edge.push(func(r *fakeRun) *ActivationEnd {
 		h := r.host()
-		id := h.RecordEvent(EventRecord{Origin: Origin{Participant: "cloud"}, Zone: ZoneCloud, Tool: "camera", Output: "jpeg bytes", Visibility: Shared})
+		id := h.RecordEvent(EventRecord{Origin: Origin{Participant: "cloud"}, Zone: ZoneCloud, Tool: "camera", Output: "jpeg bytes"})
 		h.RecordUsage(LedgerEntry{Participant: "cloud", Kind: UsageMain, Usage: &model.ChatUsage{InputTokens: 3}})
 		if d := h.Descriptors(); len(d) != 2 || d[0].Name != "edge" || d[1].Name != "cloud" {
 			t.Errorf("descriptors = %+v", d)
@@ -1228,17 +730,24 @@ func TestCoordinatorHostCalls(t *testing.T) {
 			t.Errorf("report: %v", err)
 		}
 		if _, err := h.Publish(r.ctx, PublishRequest{From: Origin{Participant: "edge"}, Refs: []ArtifactRef{{URI: "file:///plan.md"}},
-			Text: "the plan", Private: true}); err != nil {
+			Text: "the plan"}); err != nil {
 			t.Errorf("publish: %v", err)
 		}
-		// The edge-only artifact made the edge private: a report to the cloud
-		// now needs the disclosure policy, and there is none.
-		_, err = h.Report(r.ctx, ReportRequest{From: Origin{Participant: "edge"}, Text: "fyi", To: []string{"cloud"}})
-		check("private report to the cloud", err)
 		got, err := h.Read(r.ctx, "edge", ReadQuery{Seqs: []uint64{1, 99}, Kinds: []Kind{KindUserInput}, Limit: 1})
 		if err != nil || len(got) != 1 || got[0].Seq != 1 {
 			t.Errorf("read seqs = %+v %v", got, err)
 		}
+		// A missing seq and one of another kind are skipped.
+		got, err = h.Read(r.ctx, "edge", ReadQuery{Seqs: []uint64{99, 2, 1}, Kinds: []Kind{KindUserInput}})
+		if err != nil || len(got) != 1 || got[0].Seq != 1 {
+			t.Errorf("read skipping seqs = %+v %v", got, err)
+		}
+		got, err = h.Read(r.ctx, "edge", ReadQuery{Kinds: []Kind{KindOwnerChange}, Limit: 1})
+		if err != nil || len(got) != 1 || got[0].Seq != 2 {
+			t.Errorf("read by kind = %+v %v", got, err)
+		}
+		_, err = h.Read(r.ctx, "cloud", ReadQuery{})
+		check("read as another", err)
 		return r.reply("done")
 	})
 	cloud.push(func(r *fakeRun) *ActivationEnd {
@@ -1253,12 +762,12 @@ func TestCoordinatorHostCalls(t *testing.T) {
 			t.Errorf("cloud page = %q %v", text, err)
 		}
 		got, err := r.read(ReadQuery{Seqs: []uint64{4, 1}})
-		if err != nil || len(got) != 1 || got[0].Seq != 1 {
+		if err != nil || len(got) != 2 || got[0].Seq != 4 || got[1].Seq != 1 {
 			t.Errorf("cloud read = %+v %v", got, err)
 		}
 		return r.reply("seen")
 	})
-	env := newCoEnv(t, nil, func(cfg *Config) { cfg.CloudReadsEdge = true }, edge, cloud)
+	env := newCoEnv(t, nil, nil, edge, cloud)
 	env.say("hello") // #1, owner_change #2; the edge reports #3 and publishes #4
 	env.idle()
 	env.submit(Query{Text: "shared", Explicit: "cloud"})
@@ -1278,8 +787,8 @@ func TestCoordinatorHostCalls(t *testing.T) {
 	log := env.log()
 	arts := findEntries(log, KindArtifact, "")
 	reps := findEntries(log, KindReport, "")
-	if len(arts) != 1 || arts[0].Seq != 4 || arts[0].Visibility != EdgeOnly || len(reps) != 1 || !reflect.DeepEqual(reps[0].To, []string{"cloud"}) ||
-		reps[0].Task == nil || reps[0].Task.ID != "t-9" || reps[0].Visibility != Shared {
+	if len(arts) != 1 || arts[0].Seq != 4 || len(reps) != 1 || !reflect.DeepEqual(reps[0].To, []string{"cloud"}) ||
+		reps[0].Task == nil || reps[0].Task.ID != "t-9" {
 		t.Fatalf("artifact %+v report %+v", arts, reps)
 	}
 }

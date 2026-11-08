@@ -194,12 +194,17 @@ func TestThreadSeqOfVariants(t *testing.T) {
 		ok   bool
 	}{
 		{"uint64", uint64(9), 9, true},
+		{"uint", uint(9), 9, true},
+		{"uint32", uint32(9), 9, true},
 		{"int", 9, 9, true},
 		{"int64", int64(9), 9, true},
+		{"int32", int32(9), 9, true},
 		{"float64", float64(9), 9, true},
 		{"json.Number", json.Number("9"), 9, true},
 		{"string", "9", 9, true},
 		{"negative int", -1, 0, false},
+		{"negative int64", int64(-1), 0, false},
+		{"negative int32", int32(-1), 0, false},
 		{"fraction", 9.5, 0, false},
 		{"float overflow", 1e30, 0, false},
 		{"not a number", "nine", 0, false},
@@ -244,7 +249,6 @@ func TestThreadMessagesInjectedInOrder(t *testing.T) {
 
 	a.state.Summary = "own summary"
 	a.state.PeerSummary = &PeerSummary{Text: "peer text", Origin: "cloud/master", Through: 12}
-	a.state.ThreadIndex = "#13 edge note"
 	a.state.Plan = []tool.PlanItem{{Step: "step", Status: tool.PlanStatusInProgress}}
 	a.state.Context = []*message.Msg{message.UserMsg("u", "hello")}
 	got := a.prepareModelInput(context.Background())
@@ -252,7 +256,6 @@ func TestThreadMessagesInjectedInOrder(t *testing.T) {
 		"sys",
 		"[Previous context summary]: own summary",
 		"[Summary from cloud/master, covering the shared thread through #12]:\npeer text",
-		"[Thread index: entries kept out of the summary; read them with thread_read]:\n#13 edge note",
 		"[Current plan]:\n1. [in_progress] step",
 		"hello",
 	}
@@ -264,13 +267,13 @@ func TestThreadMessagesInjectedInOrder(t *testing.T) {
 			t.Fatalf("message %d = %q, want %q", i, msgText(got[i]), want[i])
 		}
 	}
-	for _, m := range got[1:5] {
+	for _, m := range got[1:4] {
 		if m.Role != message.RoleUser {
 			t.Fatalf("injected messages are user messages, got %s", m.Role)
 		}
 	}
 
-	// An empty peer text injects no summary message; the index still appears.
+	// An empty peer text injects no summary message.
 	a.state.PeerSummary = &PeerSummary{Origin: "cloud/master", Through: 3}
 	if n := len(a.prepareModelInput(context.Background())); n != len(want)-1 {
 		t.Fatalf("empty peer text: got %d messages, want %d", n, len(want)-1)
@@ -278,12 +281,12 @@ func TestThreadMessagesInjectedInOrder(t *testing.T) {
 }
 
 func TestCompressionAccountingCountsThreadMessages(t *testing.T) {
-	base := compressionBaseMsgs("a", "sys", "own", threadPromptMsgs("a", &PeerSummary{Text: "peer", Origin: "o", Through: 1}, "idx"), []tool.PlanItem{{Step: "s", Status: tool.PlanStatusPending}})
+	base := compressionBaseMsgs("a", "sys", "own", threadPromptMsgs("a", &PeerSummary{Text: "peer", Origin: "o", Through: 1}), []tool.PlanItem{{Step: "s", Status: tool.PlanStatusPending}})
 	var texts []string
 	for _, m := range base {
 		texts = append(texts, msgText(m))
 	}
-	if len(texts) != 5 || !strings.HasPrefix(texts[2], "[Summary from o") || !strings.HasPrefix(texts[3], "[Thread index") || !strings.HasPrefix(texts[4], "[Current plan]") {
+	if len(texts) != 4 || !strings.HasPrefix(texts[2], "[Summary from o") || !strings.HasPrefix(texts[3], "[Current plan]") {
 		t.Fatalf("base messages out of order: %q", texts)
 	}
 
@@ -316,9 +319,7 @@ func TestCheckpointSchemaVersionFollowsThreadState(t *testing.T) {
 	}
 	for _, set := range []func(*AgentState){
 		func(s *AgentState) { s.ThreadCursor = 4 },
-		func(s *AgentState) { s.ThreadIndex = "#5" },
 		func(s *AgentState) { s.PeerSummary = &PeerSummary{Text: "p"} },
-		func(s *AgentState) { s.Tainted = true },
 	} {
 		b := NewUnifiedAgent("a", "sys", &seamModel{}, WithStateSaver(saver))
 		b.state.SessionID = "t"
@@ -350,10 +351,8 @@ func TestAgentStateV3RoundTrip(t *testing.T) {
 		SchemaVersion: 3,
 		SessionID:     "s",
 		Context:       []*message.Msg{importedMsg(3, "entry")},
-		PeerSummary:   &PeerSummary{Text: "peer", Origin: "cloud/master", Through: 2, Excluded: []uint64{1}, Tainted: true},
-		ThreadIndex:   "#3 entry",
+		PeerSummary:   &PeerSummary{Text: "peer", Origin: "cloud/master", Through: 2, Excluded: []uint64{1}},
 		ThreadCursor:  3,
-		Tainted:       true,
 	}
 	raw, err := json.Marshal(st)
 	if err != nil {
@@ -363,7 +362,7 @@ func TestAgentStateV3RoundTrip(t *testing.T) {
 	if err := json.Unmarshal(raw, &back); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(back.PeerSummary, st.PeerSummary) || back.ThreadIndex != st.ThreadIndex || back.ThreadCursor != 3 || !back.Tainted || back.SchemaVersion != 3 {
+	if !reflect.DeepEqual(back.PeerSummary, st.PeerSummary) || back.ThreadCursor != 3 || back.SchemaVersion != 3 {
 		t.Fatalf("thread state lost in round trip: %+v", back)
 	}
 	if seq, ok := ThreadSeqOf(back.Context[0]); !ok || seq != 3 {
@@ -397,34 +396,33 @@ func TestApplyThreadUpdateValidation(t *testing.T) {
 	a.state.ThreadCursor = 5
 	a.state.Context = []*message.Msg{message.UserMsg("u", "keep")}
 	before := append([]*message.Msg(nil), a.state.Context...)
-	idx := "new index"
 	call := message.AssistantMsg("x", []message.ContentBlock{message.ToolCallBlock{Type: "tool_call", ID: "c", Name: "t", Input: `{}`}})
 	result := message.AssistantMsg("x", []message.ContentBlock{message.ToolResultBlock{Type: "tool_result", ID: "c", Name: "t", Output: "r"}})
 	thinking := message.AssistantMsg("x", []message.ContentBlock{message.ThinkingBlock{Type: "thinking", Thinking: "hmm"}})
 	for name, u := range map[string]ThreadUpdate{
-		"system role":           {Messages: []*message.Msg{message.SystemMsg("s", "x")}, Index: &idx},
-		"tool call":             {Messages: []*message.Msg{call}, Index: &idx},
-		"tool result":           {Messages: []*message.Msg{result}, Index: &idx},
-		"thinking":              {Messages: []*message.Msg{thinking}, Index: &idx},
-		"cursor backwards":      {Cursor: 4, Index: &idx},
-		"set and clear summary": {PeerSummary: &PeerSummary{Text: "p"}, ClearPeerSummary: true, Index: &idx},
+		"system role":           {Messages: []*message.Msg{message.SystemMsg("s", "x")}},
+		"tool call":             {Messages: []*message.Msg{call}},
+		"tool result":           {Messages: []*message.Msg{result}},
+		"thinking":              {Messages: []*message.Msg{thinking}},
+		"cursor backwards":      {Cursor: 4},
+		"set and clear summary": {PeerSummary: &PeerSummary{Text: "p"}, ClearPeerSummary: true},
 	} {
 		if err := a.ApplyThreadUpdate(ctx, u); err == nil {
 			t.Fatalf("%s: update must be rejected", name)
 		}
 	}
-	if a.state.ThreadIndex != "" || a.state.ThreadCursor != 5 || !reflect.DeepEqual(a.state.Context, before) {
+	if a.state.ThreadCursor != 5 || !reflect.DeepEqual(a.state.Context, before) {
 		t.Fatal("a rejected update changed state")
 	}
 	// Zero keeps the cursor; an equal cursor is allowed.
-	if err := a.ApplyThreadUpdate(ctx, ThreadUpdate{Cursor: 5, Index: &idx}); err != nil {
+	if err := a.ApplyThreadUpdate(ctx, ThreadUpdate{Cursor: 5}); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.ApplyThreadUpdate(ctx, ThreadUpdate{Messages: []*message.Msg{importedMsg(6, "six")}}); err != nil {
 		t.Fatal(err)
 	}
-	if a.state.ThreadCursor != 5 || a.state.ThreadIndex != idx || len(a.state.Context) != 2 {
-		t.Fatalf("unexpected state after valid updates: cursor=%d index=%q len=%d", a.state.ThreadCursor, a.state.ThreadIndex, len(a.state.Context))
+	if a.state.ThreadCursor != 5 || len(a.state.Context) != 2 {
+		t.Fatalf("unexpected state after valid updates: cursor=%d len=%d", a.state.ThreadCursor, len(a.state.Context))
 	}
 }
 
@@ -594,7 +592,6 @@ func TestBetweenRepliesSeamsWaitForTheReplyCore(t *testing.T) {
 		}
 	}
 	busy("ApplyThreadUpdate", a.ApplyThreadUpdate(bg, ThreadUpdate{Reset: true}))
-	busy("SetTainted", a.SetTainted(true))
 	busy("ApplySummary", a.ApplySummary(bg, &ForkSnapshot{}, "summary", SummaryApplyOptions{}))
 	_, err = a.CompactStrict(bg, CompactStrictOptions{})
 	busy("CompactStrict", err)
@@ -619,8 +616,8 @@ func TestBetweenRepliesSeamsWaitForTheReplyCore(t *testing.T) {
 			}
 		}
 	}
-	if results != 1 || a.state.Tainted || a.state.Summary != "" {
-		t.Fatalf("results=%d tainted=%v summary=%q", results, a.state.Tainted, a.state.Summary)
+	if results != 1 || a.state.Summary != "" {
+		t.Fatalf("results=%d summary=%q", results, a.state.Summary)
 	}
 	if err := a.ApplyThreadUpdate(bg, ThreadUpdate{Reset: true}); err != nil {
 		t.Fatalf("once the core returned the agent is idle: %v", err)
@@ -637,7 +634,7 @@ func TestReplyEndLeavesNoRunningCore(t *testing.T) {
 			if _, err := a.Reply(context.Background(), "go"); err != nil {
 				t.Fatal(err)
 			}
-			if err := a.SetTainted(i%2 == 0); err != nil {
+			if err := a.ApplyThreadUpdate(context.Background(), ThreadUpdate{Cursor: uint64(i + 1)}); err != nil {
 				t.Fatalf("reply %d: %v", i, err)
 			}
 		}
@@ -658,8 +655,7 @@ func TestApplyThreadUpdateResetScope(t *testing.T) {
 	a.lastModelInputTokens = 500
 	a.pendingPrecompress = &precompressResult{summary: "stale"}
 	before := a.compactionVersion
-	keep := "index"
-	if err := a.ApplyThreadUpdate(context.Background(), ThreadUpdate{Reset: true, Index: &keep, Messages: []*message.Msg{importedMsg(9, "fresh")}, Cursor: 9}); err != nil {
+	if err := a.ApplyThreadUpdate(context.Background(), ThreadUpdate{Reset: true, Messages: []*message.Msg{importedMsg(9, "fresh")}, Cursor: 9}); err != nil {
 		t.Fatal(err)
 	}
 	if len(a.state.Context) != 1 || msgText(a.state.Context[0]) != "fresh" {
@@ -671,7 +667,7 @@ func TestApplyThreadUpdateResetScope(t *testing.T) {
 	if len(a.state.Plan) != 1 || a.toolkit.Get("probe") == nil || len(a.engine.GrantedDirectories()) != 1 {
 		t.Fatal("reset must keep the plan, the toolkit and permission grants")
 	}
-	if a.state.ThreadCursor != 9 || a.state.ThreadIndex != "index" {
+	if a.state.ThreadCursor != 9 {
 		t.Fatal("the rest of the update applies after the reset")
 	}
 }
@@ -696,12 +692,9 @@ func TestApplyThreadUpdatePersists(t *testing.T) {
 	if a.state.ThreadCursor != 4 {
 		t.Fatal("a persistence failure leaves the update applied in memory")
 	}
-	if err := a.SetTainted(true); err == nil {
-		t.Fatal("SetTainted reports the persistence failure")
-	}
 	saver.err = nil
-	if err := a.SetTainted(true); err != nil || !a.state.Tainted || !saver.states["s"].Tainted {
-		t.Fatalf("SetTainted: err=%v tainted=%v", err, a.state.Tainted)
+	if err := a.ApplyThreadUpdate(ctx, ThreadUpdate{Cursor: 5}); err != nil || saver.states["s"].ThreadCursor != 5 {
+		t.Fatalf("after the failure clears: err=%v", err)
 	}
 }
 
@@ -722,12 +715,9 @@ func TestApplyThreadUpdateRejectedWhileBusy(t *testing.T) {
 	if err := a.ApplyThreadUpdate(context.Background(), ThreadUpdate{Cursor: 1}); err == nil {
 		t.Fatal("ApplyThreadUpdate must be rejected during a reply")
 	}
-	if err := a.SetTainted(true); err == nil {
-		t.Fatal("SetTainted must be rejected during a reply")
-	}
 	close(gate.gate)
 	drain(t, ch)
-	if a.state.ThreadCursor != 0 || a.state.Tainted {
+	if a.state.ThreadCursor != 0 {
 		t.Fatal("a rejected update changed state")
 	}
 
@@ -872,12 +862,11 @@ func TestThreadViewTokensAndWindow(t *testing.T) {
 	m := &seamModel{tokens: perMsg, window: 1000}
 	a := NewUnifiedAgent("a", "sys", m)
 	a.state.PeerSummary = &PeerSummary{Text: "peer", Through: 4}
-	a.state.ThreadIndex = "#5"
 	a.state.ThreadCursor = 5
 	a.state.Context = []*message.Msg{message.UserMsg("u", "a"), message.UserMsg("u", "b")}
 	v := a.ThreadView()
-	// system + peer summary + index + two context messages.
-	if v.InputTokens != 500 || v.Window != 1000 || v.ContextMessages != 2 || v.Cursor != 5 || v.Index != "#5" {
+	// system + peer summary + two context messages.
+	if v.InputTokens != 400 || v.Window != 1000 || v.ContextMessages != 2 || v.Cursor != 5 {
 		t.Fatalf("view = %+v", v)
 	}
 	v.PeerSummary.Text = "changed"
@@ -946,7 +935,6 @@ func TestStructuredResponseIncludesThreadMessages(t *testing.T) {
 		SessionID:   "s",
 		Summary:     "own",
 		PeerSummary: &PeerSummary{Text: "peer text", Origin: "cloud/master", Through: 3},
-		ThreadIndex: "#4 note",
 		Context:     []*message.Msg{message.UserMsg("u", "hello")},
 	}
 	var got []string
@@ -966,7 +954,6 @@ func TestStructuredResponseIncludesThreadMessages(t *testing.T) {
 		"system",
 		"[Previous context summary]: own",
 		"[Summary from cloud/master, covering the shared thread through #3]:\npeer text",
-		"[Thread index: entries kept out of the summary; read them with thread_read]:\n#4 note",
 		"hello",
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -975,7 +962,7 @@ func TestStructuredResponseIncludesThreadMessages(t *testing.T) {
 }
 
 // TestPrecompressChargesThreadMessages: the background split charges the
-// peer summary and index against the reserve, like the synchronous one.
+// peer summary against the reserve, like the synchronous one.
 func TestPrecompressChargesThreadMessages(t *testing.T) {
 	reserved := func(peer *PeerSummary) int {
 		m := &seamModel{tokens: charTokens, respond: func(int, []*message.Msg, *model.CallOptions) (*model.ChatResponse, error) {
@@ -1058,7 +1045,7 @@ func TestThreadSummaryTokensSharesTheBudget(t *testing.T) {
 		t.Fatalf("own budget next to a full peer summary = %d, want %d", got, minOwnSummaryTokens)
 	}
 	base := int(8000 * c.ReserveRatio)
-	thread := m.CountTokens(threadPromptMsgs(a.name, big, ""), nil)
+	thread := m.CountTokens(threadPromptMsgs(a.name, big), nil)
 	if got := a.reserveTokens(&c, 8000); got != base+thread {
 		t.Fatalf("reserve = %d, want %d + %d", got, base, thread)
 	}
@@ -1138,5 +1125,54 @@ func TestThreadViewCompactAt(t *testing.T) {
 	}
 	if got := NewUnifiedAgent("c", "sys", &seamModel{tokens: charTokens}).ThreadView().CompactAt; got != 0 {
 		t.Fatalf("CompactAt without a ContextConfig = %d, want 0", got)
+	}
+}
+
+// TestCloneMsgsKeepsNils: the copies keep nil slices and nil entries, and
+// own their content slices.
+func TestCloneMsgsKeepsNils(t *testing.T) {
+	if cloneMsgs(nil) != nil {
+		t.Fatal("a nil slice stays nil")
+	}
+	m := message.UserMsg("u", "hello")
+	out := cloneMsgs([]*message.Msg{nil, m})
+	if len(out) != 2 || out[0] != nil || out[1] == m || msgText(out[1]) != "hello" {
+		t.Fatalf("clone = %+v", out)
+	}
+	out[1].Content[0] = message.TextBlock{Type: "text", Text: "changed"}
+	if msgText(m) != "hello" {
+		t.Fatal("the copy must own its content slice")
+	}
+}
+
+// TestApplyThreadUpdateNilContextAndNilMessages: a nil context means
+// context.Background, and nil messages are skipped.
+func TestApplyThreadUpdateNilContextAndNilMessages(t *testing.T) {
+	a := NewUnifiedAgent("a", "sys", &seamModel{})
+	var ctx context.Context // nil: the case under test
+	if err := a.ApplyThreadUpdate(ctx, ThreadUpdate{Messages: []*message.Msg{nil, message.UserMsg("u", "entry")}, Cursor: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if v := a.ThreadView(); v.Cursor != 2 || v.ContextMessages != 1 {
+		t.Fatalf("view = %+v", v)
+	}
+}
+
+// TestOwnSummaryShareUsesTheSmallerFallbackWindow: without a configured
+// ContextSize the automatic budget is sized from the smaller of the model's
+// and the fallback model's windows.
+func TestOwnSummaryShareUsesTheSmallerFallbackWindow(t *testing.T) {
+	a := NewUnifiedAgent("a", "sys", &compressionMockModel{contextSize: 200000},
+		WithModelConfig(ModelConfig{FallbackModel: &compressionMockModel{contextSize: 8192}}),
+		WithContextConfig(&ContextConfig{}))
+	a.state.Summary = strings.Repeat("o", 12000)                      // 3,000 estimated tokens
+	peer := &PeerSummary{Text: strings.Repeat("p", 8000), Through: 3} // 2,000
+	if err := a.ApplyThreadUpdate(context.Background(), ThreadUpdate{PeerSummary: peer, Cursor: 3}); err != nil {
+		t.Fatal(err)
+	}
+	// 3/8 of the fallback's 8,192 is 3,072; the peer summary leaves 1,072.
+	// The primary's 200,000-token window would leave room for all of it.
+	if n := len(a.state.Summary) / 4; n > 1100 || n < 1000 {
+		t.Fatalf("own summary is %d tokens; want the 1,072-token share of the fallback's window", n)
 	}
 }

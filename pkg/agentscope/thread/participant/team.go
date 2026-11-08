@@ -36,19 +36,18 @@ type TeamConfig struct {
 	// Members are the sub-agents. They never see the thread and must not be
 	// given thread tools; their text never becomes a reply entry.
 	Members []pipeline.TeamMember
-	// TaintingTools and PrivateTools work as in AgentConfig and apply to
+	// CaptureOutputs and MaxEventOutput work as in AgentConfig and apply to
 	// member tool results too.
-	TaintingTools, PrivateTools []string
-	CaptureOutputs              *bool
-	MaxEventOutput              int
-	// Prepare selects the master's thread tools, taint gate and extra loop
-	// hooks, with Prepare's defaults.
+	CaptureOutputs *bool
+	MaxEventOutput int
+	// Prepare selects the master's thread tools and extra loop hooks, with
+	// Prepare's defaults.
 	Prepare PrepareOptions
 	// Load returns the master's persisted state, the state the Master factory
 	// restores, or nil when there is none yet. NewTeamParticipant calls it
 	// once, with a background context (bound a slow store inside Load), so
 	// that before the first activation State reports the persisted
-	// cursor, taint and an estimate of the input instead of an empty master:
+	// cursor and an estimate of the input instead of an empty master:
 	// the Coordinator syncs and recovers from that state, and a participant
 	// rebuilt after a restart must not receive the entries its master already
 	// holds a second time. Without Load the participant is for a new session
@@ -78,13 +77,8 @@ type TeamParticipant struct {
 	restored     uint64
 	queued       []agent.ThreadUpdate
 	queuedCursor uint64
-	queuedTaint  bool
-	// queuedPrivate is the loaded state's Private with the queued updates
-	// on top; queuedPlan keeps a clear from lowering it, as on the agent.
-	queuedPrivate bool
-	queuedPlan    bool
-	queuedTokens  int // estimated input before the first master: the loaded state plus the queued updates
-	actSync       *thread.Sync
+	queuedTokens int // estimated input before the first master: the loaded state plus the queued updates
+	actSync      *thread.Sync
 	// syncApplied is set once the leader applied actSync (or it was empty).
 	syncApplied bool
 	run         *pipeline.TeamRun
@@ -107,7 +101,7 @@ func NewTeamParticipant(cfg TeamConfig) (*TeamParticipant, error) { //nolint:goc
 	if err != nil {
 		return nil, err
 	}
-	c.configure(cfg.TaintingTools, cfg.PrivateTools, cfg.CaptureOutputs, cfg.MaxEventOutput)
+	c.configure(cfg.CaptureOutputs, cfg.MaxEventOutput)
 	tp := &TeamParticipant{c: c, cfg: cfg, confirmReqs: map[string]string{}}
 	if cfg.Load != nil {
 		st, err := cfg.Load(context.Background())
@@ -119,8 +113,7 @@ func NewTeamParticipant(cfg TeamConfig) (*TeamParticipant, error) { //nolint:goc
 				return nil, fmt.Errorf("participant %s: the master's state has schema version %d, newer than the supported %d",
 					c.desc.Name, st.SchemaVersion, agent.StateSchemaVersion)
 			}
-			tp.restored, tp.queuedCursor, tp.queuedTaint = st.ThreadCursor, st.ThreadCursor, st.Tainted
-			tp.queuedPrivate, tp.queuedPlan = st.Private, len(st.Plan) > 0
+			tp.restored, tp.queuedCursor = st.ThreadCursor, st.ThreadCursor
 			tp.queuedTokens = stateTokens(st)
 		}
 	}
@@ -215,20 +208,20 @@ func (tp *TeamParticipant) Release(h thread.Host) { tp.c.release(h) }
 
 // State reports the master's thread view. Before the first activation it
 // reports the state TeamConfig.Load returned with the queued updates on top:
-// their cursor and taint, and a rough estimate of the input (about four
+// their cursor, and a rough estimate of the input (about four
 // characters per token, without the system prompt and tool schemas). The
 // window is unknown (0) until a master exists.
 func (tp *TeamParticipant) State() thread.ParticipantState {
 	busy := tp.c.busy()
 	tp.mu.Lock()
-	m, cursor, tainted, private, tokens := tp.master, tp.queuedCursor, tp.queuedTaint, tp.queuedPrivate, tp.queuedTokens
+	m, cursor, tokens := tp.master, tp.queuedCursor, tp.queuedTokens
 	tp.mu.Unlock()
 	if m == nil {
-		return thread.ParticipantState{Cursor: cursor, InputTokens: tokens, Tainted: tainted, Private: private, Busy: busy}
+		return thread.ParticipantState{Cursor: cursor, InputTokens: tokens, Busy: busy}
 	}
 	v := m.ThreadView()
 	return thread.ParticipantState{Cursor: v.Cursor, InputTokens: v.InputTokens, Window: v.Window, SummaryTokens: v.SummaryTokens,
-		CompactAt: v.CompactAt, Tainted: v.Tainted, Private: v.Private, Busy: busy}
+		CompactAt: v.CompactAt, Busy: busy}
 }
 
 // Sync applies s to the last master between activations, or queues it
@@ -247,20 +240,13 @@ func (tp *TeamParticipant) Sync(ctx context.Context, s thread.Sync) error { //no
 	}
 	tp.mu.Lock()
 	defer tp.mu.Unlock()
-	// The agent's cursor rule: it never moves back. A reset keeps the taint
-	// unless the update sets it.
+	// The agent's cursor rule: it never moves back.
 	if u.Cursor != 0 && u.Cursor < tp.queuedCursor {
 		return fmt.Errorf("participant %s: thread update cursor %d is behind the queued cursor %d", tp.c.desc.Name, u.Cursor, tp.queuedCursor)
 	}
 	tp.queued = append(tp.queued, u)
 	if u.Cursor != 0 {
 		tp.queuedCursor = u.Cursor
-	}
-	if u.Taint != nil {
-		tp.queuedTaint = *u.Taint
-	}
-	if u.Private != nil {
-		tp.queuedPrivate = *u.Private || (tp.queuedPrivate && tp.queuedPlan)
 	}
 	if u.Reset {
 		tp.queuedTokens = 0
@@ -305,12 +291,8 @@ func (tp *TeamParticipant) Activate(ctx context.Context, act thread.Activation) 
 	if err != nil {
 		return nil, err
 	}
-	if tp.c.importsEdgeOnly(ctx, host, act.Sync) {
-		a.markPrivate()
-	}
 	runCtx, cancel := context.WithCancel(ctx)
 	a.ctx = runCtx
-	stop := context.AfterFunc(runCtx, a.close)
 	startCtx := runCtx
 	if act.Trigger.Seq > 0 {
 		// The mark reaches the master's reply input. Members' replies share
@@ -330,7 +312,6 @@ func (tp *TeamParticipant) Activate(ctx context.Context, act thread.Activation) 
 	master, applied := tp.master, tp.syncApplied
 	tp.mu.Unlock()
 	if err != nil {
-		stop()
 		cancel()
 		tp.c.endActivation()
 		err = fmt.Errorf("participant %s: start team run: %w", tp.c.desc.Name, err)
@@ -368,8 +349,6 @@ func (tp *TeamParticipant) Activate(ctx context.Context, act thread.Activation) 
 		waitErr := run.Wait()
 		t.finishAll()
 		cancel()
-		stop()
-		a.close()
 		end := t.end(ctx.Err(), waitErr)
 		tp.settle(ctx, master, t, end)
 		tp.mu.Lock()
@@ -383,26 +362,16 @@ func (tp *TeamParticipant) Activate(ctx context.Context, act thread.Activation) 
 }
 
 // settle brings the master in line with what the run did once it ended, like
-// AgentParticipant.settle (the taint it was not told about, an edge run's
-// privacy, a note for each writing call whose answer it did not record), and
-// saves its state. The next
+// AgentParticipant.settle (a note for each writing call whose answer it did
+// not record), and saves its state. The next
 // activation builds a new master from the checkpoint, and the agent saves one
 // after each tool step but not after its final answer, so the finished state
 // is saved now, also after a cancellation.
 func (tp *TeamParticipant) settle(ctx context.Context, master *agent.UnifiedAgent, t *tracker, end *thread.ActivationEnd) {
 	ctx = context.WithoutCancel(ctx)
 	u := agent.ThreadUpdate{Messages: t.notes()}
-	view := master.ThreadView()
-	if end.Tainted && !view.Tainted {
-		v := true
-		u.Taint = &v
-	}
-	if _, private := t.act.flags(); private && !view.Private && tp.c.desc.Zone == thread.ZoneEdge {
-		v := true
-		u.Private = &v
-	}
 	var err error
-	if len(u.Messages) > 0 || u.Taint != nil || u.Private != nil {
+	if len(u.Messages) > 0 {
 		// The run joined the master's reply core, but after a cancellation it
 		// stops reading the master's events, and the goroutine that ends the
 		// event stream may still be finishing: the agent refuses updates
@@ -494,7 +463,7 @@ func (tp *TeamParticipant) Fork(ctx context.Context, snap thread.Snapshot, spec 
 
 // stateTokens estimates the input a master restored from st would send.
 func stateTokens(st *agent.AgentState) int {
-	n := runes(st.Summary) + runes(st.ThreadIndex) + msgRunes(st.Context)
+	n := runes(st.Summary) + msgRunes(st.Context)
 	if st.PeerSummary != nil {
 		n += runes(st.PeerSummary.Text)
 	}
@@ -506,9 +475,6 @@ func updateTokens(u *agent.ThreadUpdate) int {
 	n := msgRunes(u.Messages)
 	if u.PeerSummary != nil {
 		n += runes(u.PeerSummary.Text)
-	}
-	if u.Index != nil {
-		n += runes(*u.Index)
 	}
 	return (n + 3) / 4
 }

@@ -37,12 +37,11 @@ func namedCand(name string, zone thread.Zone, available bool) thread.RouteCandid
 	return thread.RouteCandidate{Descriptor: thread.Descriptor{Name: name, Zone: zone}, Available: available}
 }
 
-// request returns a shared query with both participants available.
+// request returns a query with both participants available.
 func request() thread.RouteRequest {
 	return thread.RouteRequest{
 		OperationID:  "op-1",
 		Query:        "What is the weather like?",
-		Disclosure:   thread.DiscloseShared,
 		Participants: []thread.RouteCandidate{edgeCand(true, "device", "files"), cloudCand(true, "web", "files")},
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -17,7 +18,7 @@ func forkEnv(t *testing.T, store Store, mutate func(*Config)) (*coEnv, *fakePart
 	edge := newFakePart("edge", ZoneEdge)
 	cloud := newFakeForker("cloud")
 	env := newCoEnv(t, store, func(cfg *Config) {
-		cfg.Router = zoneRouter()
+		cfg.Router = cloudRouter()
 		cfg.Summaries.PeerEvery = 100
 		if mutate != nil {
 			mutate(cfg)
@@ -36,7 +37,7 @@ func grow(tokens int, text string) fakeScript {
 
 func TestCoordinatorPeerForkAfterGrowth(t *testing.T) {
 	store := NewMemoryStore(WithClock(fixedClock()))
-	mustAppend(t, store, nil, Entry{Kind: KindArtifact, Visibility: EdgeOnly, Refs: []ArtifactRef{{URI: "file:///diary"}}})
+	mustAppend(t, store, nil, Entry{Kind: KindArtifact, Refs: []ArtifactRef{{URI: "file:///diary"}}})
 	env, _, cloud := forkEnv(t, store, nil)
 	cloud.push(grow(500, "plan ready"), grow(700, "more planning"))
 	env.say("plan") // #2, owner_change #3, reply #4
@@ -48,10 +49,10 @@ func TestCoordinatorPeerForkAfterGrowth(t *testing.T) {
 	}
 	s := sums[0]
 	if s.Origin.Participant != "cloud" || s.Summary.Target != "edge" || s.Summary.Budget != 200 || s.Summary.Lossy ||
-		s.Visibility != Shared || s.Text() != "peer summary text" || !strings.HasPrefix(s.DedupKey, "peer:") {
+		s.Text() != "peer summary text" || !strings.HasPrefix(s.DedupKey, "peer:") {
 		t.Fatalf("summary = %+v %+v", s, s.Summary)
 	}
-	if s.Coverage.Through != 4 || len(s.Coverage.Excluded) != 2 || s.Coverage.Excluded[0] != 1 || s.Coverage.Excluded[1] != 3 {
+	if s.Coverage.Through != 4 || !slices.Equal(s.Coverage.Excluded, []uint64{3}) {
 		t.Fatalf("coverage = %+v", s.Coverage)
 	}
 	specs := cloud.forkSpecs()
@@ -421,7 +422,7 @@ func TestCoordinatorPeerForkByEdgeWindow(t *testing.T) {
 	edge := newFakePart("edge", ZoneEdge)
 	edge.desc.Window = 1000 // the limit is 800 tokens
 	cloud := newFakeForker("cloud")
-	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = zoneRouter() }, edge, cloud)
+	env := newCoEnv(t, nil, func(cfg *Config) { cfg.Router = cloudRouter() }, edge, cloud)
 	long := strings.Repeat("w", 1200) // about 300 tokens a reply
 	cloud.push(replyWith(long), replyWith(long+"."), replyWith("short"))
 

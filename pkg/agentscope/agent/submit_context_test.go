@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -188,25 +189,37 @@ func TestSubmitContextWaitsWhileACoreRuns(t *testing.T) {
 // waits, like the plain methods.
 func TestSubmitContextAnswersALiveReply(t *testing.T) {
 	t.Run("confirm", func(t *testing.T) {
-		f := newTaintFixture("write", true, WithTaintGate("write"))
-		if err := f.a.SetTainted(true); err != nil {
-			t.Fatal(err)
-		}
+		var runs atomic.Int32
+		m := &seamModel{respond: func(call int, _ []*message.Msg, _ *model.CallOptions) (*model.ChatResponse, error) {
+			if call == 0 {
+				return seamToolCalls(message.ToolCallBlock{ID: "c1", Name: "write"}), nil
+			}
+			return seamText("done"), nil
+		}}
+		perms := permission.NewContext(permission.ModeDefault)
+		perms.AskRules["write"] = []permission.Rule{{ToolName: "write", Behavior: permission.BehaviorAsk}}
+		a := NewUnifiedAgent("a", "sys", m, WithToolkit(tool.NewToolkit(countingTool("write", &runs))), WithPermissionContext(perms))
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		ch, err := f.a.ReplyStream(ctx, "go")
+		ch, err := a.ReplyStream(ctx, "go")
 		if err != nil {
 			t.Fatal(err)
 		}
 		for e := range ch {
 			if req, ok := e.(event.RequireUserConfirmEvent); ok {
 				res := &event.UserConfirmResultEvent{ConfirmResults: []event.ConfirmResult{{Confirmed: true, ToolCall: req.ToolCalls[0]}}}
-				if err := f.a.SubmitUserConfirmContext(ctx, res); err != nil {
+				if err := a.SubmitUserConfirmContext(ctx, res); err != nil {
 					t.Fatal(err)
 				}
 			}
 		}
-		if r := f.lastResult(); r.State != message.ToolResultSuccess || f.runs["write"].Load() != 1 {
+		var r message.ToolResultBlock
+		for _, msg := range a.state.Context {
+			for _, b := range msg.GetContentBlocks(message.ContentBlockToolResult) {
+				r = b.(message.ToolResultBlock)
+			}
+		}
+		if r.State != message.ToolResultSuccess || runs.Load() != 1 {
 			t.Fatalf("result = %+v", r)
 		}
 	})

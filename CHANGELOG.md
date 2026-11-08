@@ -21,9 +21,11 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
   `transfer` of the foreground with a structured brief, background tasks and
   reports, summaries written by forked requests that reuse the prompt cache
   (with an optional guardrail on their text), a one-step clear for edge
-  handovers, chunked import with strict compaction as the edge's fallback,
-  edge-only visibility that never reaches the cloud, taint tracking, a shared
-  ledger, an opt-in tool-output list and leases. The classifier call is
+  handovers, chunked import with strict compaction as the edge's fallback, a
+  shared ledger, an opt-in tool-output list and leases. The log has no
+  privacy classes: every participant may read every entry (a design for
+  edge-only data and taint is left as future work in
+  `docs/design/main-thread-privacy.md`). The classifier call is
   bounded by a timeout, after which routing falls through to the mode's
   default; the hybrid question is stage 0's, and the participant
   descriptions follow stage 0 with tool calls in place of its records.
@@ -35,16 +37,11 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
   the line.
   Tool digests keep each call's arguments, cut at 200 characters. A failed
   owner leaves a `failed` marker and hands the request to the other side,
-  queued behind any task running there, and takes the failed run's
-  steering it may read (the rest gets a cycle of its own); plan updates are
-  logged as `progress`; after a crash the turn in flight is resumed on its
-  owner, with the user's steering since then and a warning to check the
-  actual state (an edge-only request the edge transferred to the cloud is
-  resumed there from its brief, which the restart points at instead of
-  quoting the request, and is never joined to another resumed request).
-  The edge's privacy is saved in its checkpoint with what
-  caused it, and recovery reads it from there. See
-  [Main Thread](docs/main-thread.md) and `examples/main_thread`.
+  queued behind any task running there, with the failed run's steering;
+  plan updates are logged as `progress`; after a crash the turn in flight is
+  resumed on its owner, with the user's steering since then and a warning to
+  check the actual state. See [Main Thread](docs/main-thread.md) and
+  `examples/main_thread`.
 - Opt-in `agent` seams it builds on, inert unless used: `ApplyThreadUpdate`,
   `WithBoundaryInput`, `WithThreadInput`, `ThreadView`, `WithForkCapture`,
   `ForkSnapshot`, `ForkSummary` (with `ForkRequest.KeepToolChoice` for
@@ -53,12 +50,8 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
   trigger), `CompactStrict`, `ContextConfig.ThreadSummaryTokens` (the own
   summary's share next to a peer summary, sized from the window by default)
   and `SetThreadSummaryTokens`, `MarkHandedOff`, `WithExclusiveTools` (matched by the name
-  the toolkit resolves), `WithTaintGate` (a gated call is denied in
-  `ModeDontAsk` instead of asking), `SetTainted`, `WithPrivacyProbe` (asked
-  before every checkpoint; a true answer sets `AgentState.Private`, which
-  `ThreadUpdate.Private` also sets or clears and which a held plan keeps
-  set), and the context-aware `SubmitExternalResultContext` and
-  `SubmitUserConfirmContext`.
+  the toolkit resolves), and the context-aware `SubmitExternalResultContext`
+  and `SubmitUserConfirmContext`.
 - The loop hooks' `BeforeToolExec` and `AfterToolExec` now also run around
   the awaiting calls a resumed reply executes, as on the normal tool path.
 - `types.ReplyHandedOff` (`"handed_off"`) ends a reply after a committed

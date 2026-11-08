@@ -52,13 +52,7 @@ func (a *UnifiedAgent) SaveCheckpoint(ctx context.Context) error {
 	if a.stateSaver == nil {
 		return fmt.Errorf("agent: no StateSaver configured")
 	}
-	// Asked before the state is copied and without a.mu: the probe may take
-	// the host's own locks.
-	private := a.privacyProbe != nil && a.privacyProbe()
 	a.mu.Lock()
-	if private {
-		a.state.Private = true
-	}
 	st := *a.state
 	// Sync permission state from the engine: session-learned rules and
 	// user-granted working directories live there, while a.state.PermissionCtx
@@ -128,13 +122,7 @@ func (a *UnifiedAgent) ForkSession(ctx context.Context, newSessionID string) err
 	if a.stateSaver == nil {
 		return fmt.Errorf("agent: no StateSaver configured")
 	}
-	// Asked before the state is copied and without a.mu: the probe may take
-	// the host's own locks.
-	private := a.privacyProbe != nil && a.privacyProbe()
 	a.mu.Lock()
-	if private {
-		a.state.Private = true
-	}
 	st := *a.state
 	if a.engine != nil {
 		st.PermissionCtx = a.engine.SnapshotContext()

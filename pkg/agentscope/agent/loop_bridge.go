@@ -69,8 +69,7 @@ func (m *modelCallerAdapter) Call(ctx context.Context, msgs []*message.Msg, tool
 // and acting-middleware layers used by UnifiedAgent. The loop protocol has no
 // HITL event channel, so confirmation-required and external tools fail closed;
 // callers that need interactive approval must use UnifiedAgent.ReplyStream.
-// For the same reason a taint-gated call (WithTaintGate) fails closed while
-// the agent is tainted. WithExclusiveTools is honored per batch. The loop has
+// WithExclusiveTools is honored per batch. The loop has
 // no handed-off end: MarkHandedOff does not stop a loop run.
 type toolExecutorAdapter struct {
 	agent        *UnifiedAgent
@@ -82,9 +81,6 @@ func (t *toolExecutorAdapter) Execute(ctx context.Context, call message.ToolCall
 		resolved := t.agent.toolkit.Get(input.ToolCall.Name)
 		if resolved != nil && resolved.IsExternalTool() {
 			return tool.NewErrorResponse(fmt.Errorf("tool %q requires external execution; use UnifiedAgent.ReplyStream", input.ToolCall.Name)), nil
-		}
-		if t.agent.engine != nil && t.agent.taintGated(resolved) {
-			return tool.NewErrorResponse(fmt.Errorf("tool %q requires user confirmation after untrusted input; use UnifiedAgent.ReplyStream", input.ToolCall.Name)), nil
 		}
 		return t.orchestrator.Execute(ctx, input.ToolCall)
 	}

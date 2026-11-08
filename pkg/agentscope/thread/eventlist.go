@@ -24,7 +24,7 @@ const (
 )
 
 // ErrEventNotFound is returned by Page for an unknown or dropped record, or
-// one the reader may not read.
+// one from the reader's own zone.
 var ErrEventNotFound = errors.New("thread: event not found")
 
 // EventRecord is one tool output a participant produced. Records are kept
@@ -34,34 +34,16 @@ type EventRecord struct {
 	ID     string
 	Origin Origin
 	// Zone is the zone of the participant whose tool produced the output.
-	Zone Zone
-	// Visibility says whether a cloud reader may ever read the output. An
-	// empty value is Shared for a cloud record and EdgeOnly for an edge one
-	// (unmarked edge output never reaches the cloud); any value other than
-	// Shared or empty is treated as EdgeOnly. A cloud reader never sees an EdgeOnly record, whatever
-	// the CloudReadsEdge switch says. Edge participants set EdgeOnly for
-	// outputs of private tools and of activations whose context holds
-	// edge-only material.
-	Visibility Visibility
-	Tool       string
-	Target     string
-	Output     string
-	Tainted    bool
-	Time       time.Time
-}
-
-// effectiveVisibility treats an empty visibility as Shared for a cloud
-// record and EdgeOnly for any other, and any unknown one as EdgeOnly.
-func (r *EventRecord) effectiveVisibility() Visibility {
-	if r.Visibility == Shared || (r.Visibility == "" && r.Zone == ZoneCloud) {
-		return Shared
-	}
-	return EdgeOnly
+	Zone   Zone
+	Tool   string
+	Target string
+	Output string
+	Time   time.Time
 }
 
 // readableBy reports whether a reader in zone z may read the record.
-func (r *EventRecord) readableBy(z Zone, cloudReadsEdge bool) bool {
-	return Readable(z, r.Zone, cloudReadsEdge) && z.CanRead(r.effectiveVisibility())
+func (r *EventRecord) readableBy(z Zone) bool {
+	return Readable(z, r.Zone)
 }
 
 // EventSummary describes a record without its output.
@@ -71,8 +53,7 @@ type EventSummary struct {
 	FirstLine string
 	Origin    Origin
 	// Size is the output length in runes, the unit Page uses.
-	Size    int
-	Tainted bool
+	Size int
 }
 
 // EventListOptions bounds an EventList.
@@ -113,15 +94,13 @@ func NewEventList(opts EventListOptions) *EventList {
 	return &EventList{opts: opts}
 }
 
-// Add stores a record and returns its ID. Any caller-set ID is replaced, a
-// zero Time is set to the current time and the visibility is stored as
-// Shared or EdgeOnly. The oldest records are dropped when the list exceeds
-// its caps.
+// Add stores a record and returns its ID. Any caller-set ID is replaced and
+// a zero Time is set to the current time. The oldest records are dropped
+// when the list exceeds its caps.
 func (l *EventList) Add(r EventRecord) string { //nolint:gocritic // value parameter keeps the documented API
 	if r.Time.IsZero() {
 		r.Time = time.Now()
 	}
-	r.Visibility = r.effectiveVisibility()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if len(r.Output) > l.opts.MaxBytes {
@@ -152,42 +131,32 @@ func cutBytes(s string, n int) string {
 	return s[:n]
 }
 
-// Readable reports whether a reader in zone z may read records produced in
-// zone from. Edge readers read cloud records. Cloud readers read edge
-// records only when cloudReadsEdge is true (a host-held switch, default
-// off). Records from the reader's own zone are not offered (the reader has
-// them). The lists also apply each record's Visibility: a cloud reader never
-// reads an EdgeOnly record.
-func Readable(z, from Zone, cloudReadsEdge bool) bool {
-	switch {
-	case z == ZoneEdge && from == ZoneCloud:
-		return true
-	case z == ZoneCloud && from == ZoneEdge:
-		return cloudReadsEdge
-	default:
-		return false
-	}
+// Readable reports whether a reader in zone z is offered records produced in
+// zone from: records from the other zone are, records from the reader's own
+// zone are not (the reader has them).
+func Readable(z, from Zone) bool {
+	return (z == ZoneEdge && from == ZoneCloud) || (z == ZoneCloud && from == ZoneEdge)
 }
 
 // Outline lists the records the reader may read, newest last. A positive
 // limit keeps only the newest limit records.
-func (l *EventList) Outline(reader Zone, cloudReadsEdge bool, limit int) []EventSummary {
-	return l.list(reader, cloudReadsEdge, limit, func(*EventRecord) bool { return true })
+func (l *EventList) Outline(reader Zone, limit int) []EventSummary {
+	return l.list(reader, limit, func(*EventRecord) bool { return true })
 }
 
 // Search lists the readable records whose tool, target or output contains
 // query, ignoring case, newest last. A positive limit keeps only the newest
 // limit matches. An empty query matches every readable record.
-func (l *EventList) Search(reader Zone, cloudReadsEdge bool, query string, limit int) []EventSummary {
+func (l *EventList) Search(reader Zone, query string, limit int) []EventSummary {
 	q := strings.ToLower(query)
-	return l.list(reader, cloudReadsEdge, limit, func(r *EventRecord) bool {
+	return l.list(reader, limit, func(r *EventRecord) bool {
 		return strings.Contains(strings.ToLower(r.Tool), q) ||
 			strings.Contains(strings.ToLower(r.Target), q) ||
 			strings.Contains(strings.ToLower(r.Output), q)
 	})
 }
 
-func (l *EventList) list(reader Zone, cloudReadsEdge bool, limit int, match func(*EventRecord) bool) []EventSummary {
+func (l *EventList) list(reader Zone, limit int, match func(*EventRecord) bool) []EventSummary {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	var out []EventSummary
@@ -196,7 +165,7 @@ func (l *EventList) list(reader Zone, cloudReadsEdge bool, limit int, match func
 			break
 		}
 		e := &l.records[i]
-		if !e.rec.readableBy(reader, cloudReadsEdge) || !match(&e.rec) {
+		if !e.rec.readableBy(reader) || !match(&e.rec) {
 			continue
 		}
 		out = append(out, EventSummary{
@@ -206,7 +175,6 @@ func (l *EventList) list(reader Zone, cloudReadsEdge bool, limit int, match func
 			FirstLine: truncateRunes(firstLine(e.rec.Output), eventFirstLineRunes),
 			Origin:    e.rec.Origin,
 			Size:      e.runes,
-			Tainted:   e.rec.Tainted,
 		})
 	}
 	// Collected newest first; return newest last.
@@ -219,16 +187,16 @@ func (l *EventList) list(reader Zone, cloudReadsEdge bool, limit int, match func
 // Page returns limit runes of a readable record's output from offset, with
 // the output's total length in runes. A non-positive limit, or one above
 // MaxEventPageRunes, reads MaxEventPageRunes runes; a negative offset reads
-// from the start. An unknown, dropped or unreadable record is
-// ErrEventNotFound.
-func (l *EventList) Page(reader Zone, cloudReadsEdge bool, id string, offset, limit int) (text string, total int, err error) {
+// from the start. An unknown or dropped record, or one from the reader's own
+// zone, is ErrEventNotFound.
+func (l *EventList) Page(reader Zone, id string, offset, limit int) (text string, total int, err error) {
 	l.mu.Lock()
 	var output string
 	found := false
 	for i := range l.records {
 		r := &l.records[i].rec
 		if r.ID == id {
-			if r.readableBy(reader, cloudReadsEdge) {
+			if r.readableBy(reader) {
 				output, found = r.Output, true
 			}
 			break

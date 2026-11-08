@@ -35,10 +35,9 @@ func TestPlanText(t *testing.T) {
 	}
 }
 
-// TestRestartNoteFromABrief: an owner resuming from a Transfer's brief is
-// pointed at the brief, with any joined inputs quoted, and never gets the
-// request it may not read.
-func TestRestartNoteFromABrief(t *testing.T) {
+// TestRestartNote: the restart input quotes the request alone, or with the
+// inputs joined to it in log order.
+func TestRestartNote(t *testing.T) {
 	in := func(seq uint64, text string) *Entry { return &Entry{Seq: seq, Content: textContent(text)} }
 	tail := ". Work done before the restart may or may not have taken effect: check the actual state before you redo anything. Continue the request.]"
 	for _, tc := range []struct {
@@ -46,13 +45,13 @@ func TestRestartNoteFromABrief(t *testing.T) {
 		with []*Entry
 		want string
 	}{
-		{"alone", nil, "[The session restarted while you were continuing the request handed to you in #4" + tail},
-		{"one input", []*Entry{in(6, "Friday")}, `[The session restarted while you were continuing the request handed to you in #4, with the user's message #6 "Friday"` + tail},
-		{"two inputs", []*Entry{in(6, "Friday"), in(7, "the invoice")},
-			`[The session restarted while you were continuing the request handed to you in #4, with the user's messages #6 "Friday", #7 "the invoice"` + tail},
+		{"alone", nil, `[The session restarted while the user's request #5 "book the garage" was being answered` + tail},
+		{"one input", []*Entry{in(6, "Friday")}, `[The session restarted while the user's messages #5 "book the garage", #6 "Friday" were being answered` + tail},
+		{"an earlier input", []*Entry{in(7, "the invoice"), in(3, "my car")},
+			`[The session restarted while the user's messages #3 "my car", #5 "book the garage", #7 "the invoice" were being answered` + tail},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			a := &activation{briefSeq: 4, cycleInput: 1, userText: "the door code is 4711", recoverWith: tc.with}
+			a := &activation{cycleInput: 5, userText: "book the garage", recoverWith: tc.with}
 			if got := restartNote(a, ""); got != tc.want {
 				t.Fatalf("note:\n%s\nwant\n%s", got, tc.want)
 			}

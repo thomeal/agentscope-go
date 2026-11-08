@@ -130,8 +130,8 @@ type ContextConfig struct {
 	// the own summary gets what the peer summary leaves, at least 256
 	// estimated tokens and never more than the SummaryMaxTokens budget, and
 	// a peer summary that arrives leaves the own summary middle-elided to
-	// that share at once. The peer summary and thread index are then also
-	// left out of the reserve, so the recent tail keeps its ReserveRatio
+	// that share at once. The peer summary is then also left out of the
+	// reserve, so the recent tail keeps its ReserveRatio
 	// share (the reserve stays under 0.75 of the window). Zero (the default)
 	// sizes the budget from the context window, 3/8 of it (stage 0 gave
 	// 3,000 tokens of an 8,192-token window), and applies it only while a
@@ -699,7 +699,7 @@ func (a *UnifiedAgent) splitContextForCompression(reserveTokenBudget int, tools 
 	systemPrompt := a.systemPrompt
 	summary := a.state.Summary
 	plan := a.state.Plan
-	thread := threadPromptMsgs(a.name, a.state.PeerSummary, a.state.ThreadIndex)
+	thread := threadPromptMsgs(a.name, a.state.PeerSummary)
 	a.mu.Unlock()
 
 	baseMsgs := compressionBaseMsgs(a.name, systemPrompt, summary, thread, plan)
@@ -711,7 +711,7 @@ func (a *UnifiedAgent) splitContextForCompression(reserveTokenBudget int, tools 
 
 // compressionBaseMsgs builds the invariant head every compression accounting
 // must charge against: the system prompt, the previous summary (when any),
-// the thread messages (peer summary and index, see threadPromptMsgs) and the
+// the thread message (the peer summary, see threadPromptMsgs) and the
 // plan tracker message prepareModelInput injects on every call — counting
 // them is what keeps the reserve fit and the trigger estimate honest.
 func compressionBaseMsgs(agentName, systemPrompt, summary string, thread []*message.Msg, plan []tool.PlanItem) []*message.Msg {

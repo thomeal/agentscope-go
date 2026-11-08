@@ -44,13 +44,9 @@ type activation struct {
 	userText   string
 	// failSeq and progress point a failover or a restart at the failed
 	// marker and the newest progress entry of the run it continues; 0 when
-	// there is none it may read.
+	// there is none.
 	failSeq  uint64
 	progress uint64
-	// briefSeq is set on a restart that resumes a request its owner may not
-	// read from the brief a Transfer handed it: the owner change holding the
-	// brief, which its input points at instead of quoting the request.
-	briefSeq uint64
 	// cycleInput is the user_input this activation answers: the trigger of
 	// a routed input, passed on through Transfer and failover; 0 for wakes
 	// and tasks. Only such an activation fails over.
@@ -187,11 +183,6 @@ func (c *Coordinator) execute(a *activation) (*ActivationEnd, bool) {
 	if !c.available(ps.name) {
 		return &ActivationEnd{Reason: types.ReplyError, Err: errUnavailable}, false
 	}
-	if !ps.desc.Zone.CanRead(a.trigger.EffectiveVisibility()) {
-		// Never reached through the Coordinator's own paths; kept so an
-		// edge-only trigger can never become a cloud input.
-		return &ActivationEnd{Reason: types.ReplyError, Err: fmt.Errorf("thread: %s may not read its trigger #%d", ps.name, a.trigger.Seq)}, false
-	}
 	st := ps.p.State()
 	im, err := c.prepareImport(a.ctx, a, st)
 	if cerr := a.ctx.Err(); cerr != nil {
@@ -236,15 +227,12 @@ func (c *Coordinator) execute(a *activation) (*ActivationEnd, bool) {
 		c.mu.Unlock()
 		return &ActivationEnd{Reason: types.ReplyError, Err: fmt.Errorf("thread: activate %s: %w", ps.name, err)}, true
 	}
-	// A participant that stays private after the clear (a plan it kept may
-	// name what a private run read) keeps the Coordinator's flag up too.
-	held := im.clear != nil && ps.p.State().Private
 	c.mu.Lock()
 	// The reply started, so its Sync was applied: a clear it carried is now
 	// in force, and a foreground activation holds everything up to its
 	// cursor.
 	if im.clear != nil {
-		c.commitClearLocked(ps, im.clear, held)
+		c.commitClearLocked(ps, im.clear)
 	}
 	if c.holdsForegroundLocked(a) {
 		through := max(st.Cursor, a.trigger.Seq)
@@ -338,14 +326,9 @@ func (c *Coordinator) flushBacklogLocked(a *activation, force bool) {
 }
 
 // commitClearLocked records a clear whose reset the participant applied:
-// the summary it now holds, the summary's seq (so the same summary does not
-// clear it again), and its privacy, lowered only when nothing set it since
-// the import marked it and the participant itself (held) did not stay
-// private.
-func (c *Coordinator) commitClearLocked(ps *partState, cc *clearCommit, held bool) {
-	if ps.privGen == cc.gen {
-		ps.private = cc.private || held
-	}
+// the summary it now holds and the summary's seq (so the same summary does
+// not clear it again).
+func (c *Coordinator) commitClearLocked(ps *partState, cc *clearCommit) {
 	ps.heldCoverage = cloneCoverage(cc.coverage)
 	ps.resetFrom = cc.seq
 }
@@ -406,10 +389,8 @@ func isFailure(r types.ReplyFinishedReason) bool {
 
 // sealFacts is what sealing needs from calls made without the mutex.
 type sealFacts struct {
-	vis         Visibility
-	avail       map[string]bool
-	edgeTainted bool
-	failed      uint64 // the failed marker the seal wrote, 0 when none
+	avail  map[string]bool
+	failed uint64 // the failed marker the seal wrote, 0 when none
 }
 
 // finish seals the end, releases leases, runs summary bookkeeping and
@@ -419,29 +400,15 @@ func (c *Coordinator) finish(a *activation, end *ActivationEnd, started bool) {
 	reason := endReason(end)
 
 	var f sealFacts
-	for {
-		c.mu.Lock()
-		holding := c.holdsForegroundLocked(a)
-		private := c.privateLocked(ps, a, end.Private)
-		c.mu.Unlock()
-		f.vis = c.visibility(c.ctx, ps, private, c.sealContent(a, end, reason, holding))
-		if holding && reason == types.ReplyError {
-			f.avail = c.availability()
-			f.edgeTainted = c.edgeTainted()
-		}
-		c.mu.Lock()
-		if private || !c.privateLocked(ps, a, end.Private) {
-			break
-		}
-		// The participant turned private while the policy was asked: decide
-		// again, never seal under the older answer.
-		c.mu.Unlock()
+	c.mu.Lock()
+	holding := c.holdsForegroundLocked(a)
+	c.mu.Unlock()
+	if holding && reason == types.ReplyError {
+		// Availability is asked without the mutex; failover uses it.
+		f.avail = c.availability()
 	}
 
-	// The mutex is held from here.
-	if ps.desc.Zone == ZoneEdge && end.Private {
-		ps.raisePrivateLocked()
-	}
+	c.mu.Lock()
 	if a.kind == actWake && isFailure(reason) {
 		// A wake that failed leaves its report for the owner's next
 		// foreground activation instead of waking it again in this cycle.
@@ -451,7 +418,7 @@ func (c *Coordinator) finish(a *activation, end *ActivationEnd, started bool) {
 	case a.foreground && c.holdsForegroundLocked(a):
 		c.sealForegroundLocked(a, end, reason, &f)
 	case a.foreground:
-		c.sealLateLocked(a, end, &f)
+		c.sealLateLocked(a, end)
 		if c.fg == a {
 			// Only a Transfer moves the foreground away from a running
 			// activation, and it also replaces c.fg; release it regardless so
@@ -460,7 +427,7 @@ func (c *Coordinator) finish(a *activation, end *ActivationEnd, started bool) {
 			c.maybeStartCycleLocked()
 		}
 	default:
-		c.sealTaskLocked(a, end, reason, &f)
+		c.sealTaskLocked(a, end, reason)
 	}
 	c.mu.Unlock()
 
@@ -469,91 +436,6 @@ func (c *Coordinator) finish(a *activation, end *ActivationEnd, started bool) {
 	}
 	c.afterEnd(a, reason, started)
 	c.settle(a)
-}
-
-// sealContent is the text whose visibility the end's write needs.
-func (c *Coordinator) sealContent(a *activation, end *ActivationEnd, reason types.ReplyFinishedReason, holding bool) string {
-	switch {
-	case a.foreground && holding:
-		return joinNonEmpty(end.Text, end.Digest.Render())
-	case a.foreground:
-		return end.Text
-	case a.task != nil:
-		return joinNonEmpty(taskContent(a, end, reason, c.hideTaskError(a)), end.Digest.Render())
-	}
-	return ""
-}
-
-// hideTaskError reports whether a failed task's error text must stay out of
-// its report: an edge error is not passed to a cloud assigner, because its
-// text may name private data.
-func (c *Coordinator) hideTaskError(a *activation) bool {
-	if a.task == nil || a.part.desc.Zone != ZoneEdge {
-		return false
-	}
-	as := c.parts[a.task.assigner]
-	return as != nil && as.desc.Zone == ZoneCloud
-}
-
-func joinNonEmpty(parts ...string) string {
-	var keep []string
-	for _, p := range parts {
-		if p != "" {
-			keep = append(keep, p)
-		}
-	}
-	return strings.Join(keep, "\n")
-}
-
-// privateLocked reports whether what ps writes now may hold edge-only
-// material.
-func (c *Coordinator) privateLocked(ps *partState, a *activation, extra bool) bool {
-	if ps.desc.Zone != ZoneEdge {
-		return false
-	}
-	trigger := a != nil && a.trigger.EffectiveVisibility() == EdgeOnly
-	return ps.private || extra || trigger
-}
-
-// visibility applies the write rule: cloud writes are shared; edge writes
-// are shared unless private, in which case the disclosure policy decides
-// (an error, or no policy, keeps them edge-only). Never call it with the
-// mutex held.
-func (c *Coordinator) visibility(ctx context.Context, ps *partState, private bool, content string) Visibility {
-	if ps.desc.Zone != ZoneEdge || !private {
-		return Shared
-	}
-	if content == "" {
-		// Nothing is written from empty content; no need to ask the policy.
-		return EdgeOnly
-	}
-	v, ok := c.classify(ctx, content)
-	if !ok {
-		return EdgeOnly
-	}
-	return v
-}
-
-// classify asks the disclosure policy; ok is false when there is none or it
-// failed. A failure after ctx ended is not reported: the caller's write is
-// abandoned anyway.
-func (c *Coordinator) classify(ctx context.Context, content string) (Visibility, bool) {
-	if c.cfg.Disclosure == nil {
-		return EdgeOnly, false
-	}
-	v, err := c.cfg.Disclosure.Classify(ctx, content)
-	if err != nil {
-		if ctx.Err() == nil {
-			c.mu.Lock()
-			c.failLocked("", fmt.Errorf("thread: disclosure policy: %w", err))
-			c.mu.Unlock()
-		}
-		return EdgeOnly, false
-	}
-	if v == Shared {
-		return Shared, true
-	}
-	return EdgeOnly, true
 }
 
 // steeredSeqs returns the seqs of the user inputs a took besides its
@@ -576,14 +458,12 @@ func (c *Coordinator) sealForegroundLocked(a *activation, end *ActivationEnd, re
 	var batch []Entry
 	if strings.TrimSpace(end.Text) != "" || cloneDigest(end.Digest) != nil {
 		rep := Entry{
-			Kind:       KindReply,
-			Origin:     Origin{Participant: ps.name},
-			Visibility: f.vis,
-			BasedOn:    t,
-			Content:    textContent(end.Text),
-			Digest:     cloneDigest(end.Digest),
-			Tainted:    end.Tainted,
-			DedupKey:   "reply:" + a.id,
+			Kind:     KindReply,
+			Origin:   Origin{Participant: ps.name},
+			BasedOn:  t,
+			Content:  textContent(end.Text),
+			Digest:   cloneDigest(end.Digest),
+			DedupKey: "reply:" + a.id,
 		}
 		if !isFailure(reason) {
 			rep.Steered = a.steeredSeqs()
@@ -611,9 +491,6 @@ func (c *Coordinator) sealForegroundLocked(a *activation, end *ActivationEnd, re
 			switch e := &stored[i]; {
 			case e.Kind == KindReply:
 				ps.lastSealed = e.Seq
-				if e.Visibility == EdgeOnly {
-					ps.raisePrivateLocked()
-				}
 			case e.Kind == KindMarker && e.Marker.Kind == MarkerFailed:
 				f.failed = e.Seq
 			}
@@ -628,7 +505,7 @@ func (c *Coordinator) sealForegroundLocked(a *activation, end *ActivationEnd, re
 			// A failed wake does not fail over: the user's messages it took
 			// are queued again instead of being lost.
 			for _, r := range a.steered {
-				r.parked, r.skipped = false, false
+				r.parked = false
 				c.queueInputLocked(r)
 			}
 		}
@@ -650,17 +527,16 @@ func unknownEffects(who string, calls int, basedOn uint64) Entry {
 }
 
 // failoverLocked moves the foreground away from a failed owner, once per
-// query cycle, to another available participant that may take the cycle's
-// input. The new owner takes the failed run's other inputs it may read; the
-// rest start their own cycle after it, as skipped inputs do. Without a new
-// owner it writes a no_owner marker, and those inputs end with the request.
+// query cycle, to another available participant. The new owner takes the
+// failed run's other inputs too. Without a new owner it writes a no_owner
+// marker, and those inputs end with the request.
 func (c *Coordinator) failoverLocked(a *activation, end *ActivationEnd, f *sealFacts) {
 	from := a.part
 	t := a.trigger.Seq
 	var to *partState
 	if !c.cycle.failedOver {
 		for _, ps := range c.order {
-			if ps != from && f.avail[ps.name] && mayTake(ps.desc.Zone, c.cycle.disclosure, f.edgeTainted) {
+			if ps != from && f.avail[ps.name] {
 				to = ps
 				break
 			}
@@ -673,11 +549,10 @@ func (c *Coordinator) failoverLocked(a *activation, end *ActivationEnd, f *sealF
 	}
 	c.cycle.failedOver = true
 	oc := Entry{
-		Kind:       KindOwnerChange,
-		Visibility: Shared,
-		BasedOn:    t,
-		Owner:      &OwnerChange{From: from.name, To: to.name, Reason: ReasonFailover},
-		DedupKey:   "failover:" + a.id,
+		Kind:     KindOwnerChange,
+		BasedOn:  t,
+		Owner:    &OwnerChange{From: from.name, To: to.name, Reason: ReasonFailover},
+		DedupKey: "failover:" + a.id,
 	}
 	stored := c.commitLocked("", []Entry{oc}, &Guard{Owner: c.owner, Epoch: c.epoch})
 	if len(stored) != 1 {
@@ -685,44 +560,29 @@ func (c *Coordinator) failoverLocked(a *activation, end *ActivationEnd, f *sealF
 	}
 	na := c.newActivationLocked(to, actFailover, &stored[0], true, 0)
 	na.failFrom = from.name
-	na.failReason = failReason(from, to, end.Err)
+	na.failReason = failReason(end.Err)
 	na.userText = c.cycle.text
 	na.cycleInput = a.cycleInput
 	na.failSeq = f.failed
-	if p := c.cycle.progress; p != nil && to.desc.Zone.CanRead(p.EffectiveVisibility()) {
+	if p := c.cycle.progress; p != nil {
 		na.progress = p.Seq
 	}
-	for _, r := range a.steered {
-		if to.desc.Zone.CanRead(r.entry.EffectiveVisibility()) {
-			na.steered = append(na.steered, r)
-			continue
-		}
-		r.skipped, r.parked = true, false
-		c.queueInputLocked(r)
-	}
+	na.steered = append(na.steered, a.steered...)
 	c.startForegroundLocked(na)
 }
 
-// failDetail is what the failed marker says. The log is shared, so an edge
-// error's own text is left out: it may name private data.
+// failDetail is what the failed marker says.
 func failDetail(ps *partState, err error) string {
-	why := "its activation ended with an error"
-	switch {
-	case errors.Is(err, errUnavailable):
-		why = "it is unavailable"
-	case err != nil && ps.desc.Zone != ZoneEdge:
-		why = truncateRunes(oneLine(err.Error()), 200)
-	}
-	return ps.name + " failed: " + why
+	return ps.name + " failed: " + failReason(err)
 }
 
-// failReason explains a failure to the participant taking over. An edge
-// error is not passed to the cloud: its text may name private data.
-func failReason(from, to *partState, err error) string {
+// failReason explains a failure, to the log and to the participant taking
+// over.
+func failReason(err error) string {
 	switch {
 	case errors.Is(err, errUnavailable):
 		return "it is unavailable"
-	case err == nil, from.desc.Zone == ZoneEdge && to.desc.Zone == ZoneCloud:
+	case err == nil:
 		return "its activation ended with an error"
 	}
 	return truncateRunes(oneLine(err.Error()), 200)
@@ -731,45 +591,41 @@ func failReason(from, to *partState, err error) string {
 // sealLateLocked keeps text an activation showed after it lost the
 // foreground as a report to the current owner, with a rejected_output
 // marker. It never writes a reply.
-func (c *Coordinator) sealLateLocked(a *activation, end *ActivationEnd, f *sealFacts) {
+func (c *Coordinator) sealLateLocked(a *activation, end *ActivationEnd) {
 	if strings.TrimSpace(end.Text) == "" {
 		return
 	}
 	ps := a.part
 	t := a.trigger.Seq
 	rep := Entry{
-		Kind:       KindReport,
-		Origin:     Origin{Participant: ps.name},
-		To:         []string{c.owner},
-		Visibility: f.vis,
-		BasedOn:    t,
-		Content:    textContent(end.Text),
-		Tainted:    end.Tainted,
-		DedupKey:   "late:" + a.id,
+		Kind:     KindReport,
+		Origin:   Origin{Participant: ps.name},
+		To:       []string{c.owner},
+		BasedOn:  t,
+		Content:  textContent(end.Text),
+		DedupKey: "late:" + a.id,
 	}
 	mk := markerEntry(MarkerRejected, t, fmt.Sprintf("late output from %s after the foreground moved to %s; kept as a report", ps.name, c.owner))
 	c.commitLocked(ps.name, []Entry{rep, mk}, nil)
 }
 
 // sealTaskLocked reports a background task's result to its assigner.
-func (c *Coordinator) sealTaskLocked(a *activation, end *ActivationEnd, reason types.ReplyFinishedReason, f *sealFacts) {
+func (c *Coordinator) sealTaskLocked(a *activation, end *ActivationEnd, reason types.ReplyFinishedReason) {
 	tk := a.task
 	if tk == nil {
 		return
 	}
 	ps := a.part
 	batch := []Entry{{
-		Kind:       KindReport,
-		Origin:     Origin{Participant: ps.name},
-		To:         []string{tk.assigner},
-		Visibility: f.vis,
-		BasedOn:    tk.seq,
-		Task:       &Task{ID: tk.id, Notify: tk.notify},
-		Notify:     tk.notify,
-		Content:    textContent(taskContent(a, end, reason, c.hideTaskError(a))),
-		Digest:     cloneDigest(end.Digest),
-		Tainted:    end.Tainted,
-		DedupKey:   taskReportPrefix + a.id,
+		Kind:     KindReport,
+		Origin:   Origin{Participant: ps.name},
+		To:       []string{tk.assigner},
+		BasedOn:  tk.seq,
+		Task:     &Task{ID: tk.id, Notify: tk.notify},
+		Notify:   tk.notify,
+		Content:  textContent(taskContent(a, end, reason)),
+		Digest:   cloneDigest(end.Digest),
+		DedupKey: taskReportPrefix + a.id,
 	}}
 	if isFailure(reason) && end.ToolCalls > 0 {
 		batch = append(batch, unknownEffects(ps.name, end.ToolCalls, tk.seq))
@@ -781,9 +637,6 @@ func (c *Coordinator) sealTaskLocked(a *activation, end *ActivationEnd, reason t
 	// The report is the participant's own sealed output: a summary fork
 	// taken after this activation covers through it.
 	ps.lastSealed = stored[0].Seq
-	if stored[0].Visibility == EdgeOnly {
-		ps.raisePrivateLocked()
-	}
 	if tk.notify {
 		c.notifyLocked(c.parts[tk.assigner], &stored[0])
 	}
@@ -792,9 +645,8 @@ func (c *Coordinator) sealTaskLocked(a *activation, end *ActivationEnd, reason t
 // taskReportPrefix starts the dedup key of the report that ends a task.
 const taskReportPrefix = "report:"
 
-// taskContent is a task's report text. hideErr replaces the error text with
-// a generic reason.
-func taskContent(a *activation, end *ActivationEnd, reason types.ReplyFinishedReason, hideErr bool) string {
+// taskContent is a task's report text.
+func taskContent(a *activation, end *ActivationEnd, reason types.ReplyFinishedReason) string {
 	id := ""
 	if a.task != nil {
 		id = a.task.id
@@ -809,9 +661,9 @@ func taskContent(a *activation, end *ActivationEnd, reason types.ReplyFinishedRe
 		why = "the participant is unavailable"
 	case reason == types.ReplyInterrupted:
 		why = "it was interrupted"
-	case end.Err != nil && !hideErr:
+	case end.Err != nil:
 		why = truncateRunes(oneLine(end.Err.Error()), 200)
-	case end.Err != nil, reason == types.ReplyError:
+	case reason == types.ReplyError:
 		why = "it ended with an error"
 	}
 	msg := fmt.Sprintf("Task %s failed: %s", id, why)
@@ -821,12 +673,12 @@ func taskContent(a *activation, end *ActivationEnd, reason types.ReplyFinishedRe
 	return msg
 }
 
-// notifyLocked records a committed Notify report for a recipient that may
-// read it and wakes the recipient when it is the idle owner. A report no
+// notifyLocked records a committed Notify report for its recipient and
+// wakes the recipient when it is the idle owner. A report no
 // foreground activation of the recipient has received keeps waking it later
 // (see checkAddressedLocked).
 func (c *Coordinator) notifyLocked(ps *partState, rep *Entry) {
-	if ps == nil || !ps.desc.Zone.CanRead(rep.EffectiveVisibility()) {
+	if ps == nil {
 		return
 	}
 	if ps.notify == nil {
@@ -847,11 +699,11 @@ func (c *Coordinator) noWakeLocked(seq uint64) {
 }
 
 // wakeLocked starts a foreground activation of the idle owner for a Notify
-// report it may read, within the cycle's wake limit. The trigger may be
+// report, within the cycle's wake limit. The trigger may be
 // below the owner's cursor, when a background activation of the owner
 // imported the report as context: the wake still answers it.
 func (c *Coordinator) wakeLocked(ps *partState, rep *Entry) {
-	if ps == nil || !c.idleOwnerLocked(ps) || !ps.desc.Zone.CanRead(rep.EffectiveVisibility()) || c.cycle.noWake[rep.Seq] {
+	if ps == nil || !c.idleOwnerLocked(ps) || c.cycle.noWake[rep.Seq] {
 		return
 	}
 	if c.cycle.wakes >= c.cfg.Limits.MaxWakesPerQuery {
@@ -927,7 +779,7 @@ func (c *Coordinator) checkAddressedLocked(ps *partState, cur uint64) {
 	}
 	for i := range entries {
 		e := &entries[i]
-		if tk := c.tasks[e.Seq]; tk != nil && !tk.queued && ps.desc.Zone.CanRead(e.EffectiveVisibility()) {
+		if tk := c.tasks[e.Seq]; tk != nil && !tk.queued {
 			c.queueTaskLocked(tk, e)
 		}
 	}

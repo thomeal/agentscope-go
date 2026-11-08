@@ -35,7 +35,7 @@ func newToolEnv(t *testing.T, d thread.Descriptor) *toolEnv { //nolint:gocritic 
 		t.Fatal(err)
 	}
 	c := prep.c
-	c.configure(nil, nil, nil, 0)
+	c.configure(nil, 0)
 	h := newFakeHost(cloudDesc, edgeDesc)
 	if err := c.bind(h); err != nil {
 		t.Fatal(err)
@@ -115,7 +115,6 @@ func TestAssignReportPublish(t *testing.T) {
 	if !strings.HasSuffix(resultText(&r), "read it with thread_read when you need it.") {
 		t.Fatalf("assign without notify: %q", resultText(&r))
 	}
-	e.act.markPrivate()
 	r = e.write(ToolReport, map[string]any{"text": "the lamp is on", "to": []any{"edge", " "}, "task_id": "task-1", "notify": true})
 	if r.State != message.ToolResultSuccess || resultText(&r) != "Reported (entry #103)." {
 		t.Fatalf("report: %+v", r)
@@ -126,15 +125,15 @@ func TestAssignReportPublish(t *testing.T) {
 	}
 	h := e.host.snapshot()
 	a := h.assigns[0]
-	if a.From.Participant != "cloud" || a.Epoch != 2 || a.Depth != 1 || a.To != "edge" || a.Text != "read the sensor" || !a.Notify || a.Tainted || a.Private {
+	if a.From.Participant != "cloud" || a.Epoch != 2 || a.Depth != 1 || a.To != "edge" || a.Text != "read the sensor" || !a.Notify {
 		t.Fatalf("assign request = %+v", a)
 	}
 	rp := h.reports[0]
-	if rp.Text != "the lamp is on" || len(rp.To) != 1 || rp.To[0] != "edge" || rp.TaskID != "task-1" || !rp.Notify || !rp.Private {
+	if rp.Text != "the lamp is on" || len(rp.To) != 1 || rp.To[0] != "edge" || rp.TaskID != "task-1" || !rp.Notify {
 		t.Fatalf("report request = %+v", rp)
 	}
 	pb := h.publishes[0]
-	if len(pb.Refs) != 1 || pb.Refs[0] != (thread.ArtifactRef{URI: "file://plan.md", Summary: "the plan", Size: 42}) || pb.Text != "note" || !pb.Private {
+	if len(pb.Refs) != 1 || pb.Refs[0] != (thread.ArtifactRef{URI: "file://plan.md", Summary: "the plan", Size: 42}) || pb.Text != "note" {
 		t.Fatalf("publish request = %+v", pb)
 	}
 }
@@ -166,72 +165,6 @@ func TestWriteToolErrors(t *testing.T) {
 	bad := message.ToolCallBlock{ID: "b", Name: ToolReport, Input: "{not json"}
 	if r := e.tr.runWrite(&bad); !strings.Contains(resultText(&r), "not valid JSON") {
 		t.Fatalf("bad input: %+v", r)
-	}
-}
-
-func TestWriteGateNeedsConfirmationOnceTainted(t *testing.T) {
-	e := newToolEnv(t, cloudDesc)
-	e.act.markTainted()
-	r := e.write(ToolReport, map[string]any{"text": "x"})
-	if r.State != message.ToolResultError || !strings.Contains(resultText(&r), "report did not run") {
-		t.Fatalf("an unconfirmed gated call must be refused: %+v", r)
-	}
-	e.tr.confirmed["w1"] = true
-	r = e.write(ToolReport, map[string]any{"text": "x"})
-	if r.State != message.ToolResultSuccess {
-		t.Fatalf("a confirmed call runs: %+v", r)
-	}
-	if reps := e.host.snapshot().reports; len(reps) != 1 || !reps[0].Tainted {
-		t.Fatalf("reports = %+v", reps)
-	}
-
-	// A tool outside the gate runs without confirmation.
-	prep, err := Prepare(cloudDesc, PrepareOptions{TaintGate: []string{ToolTransfer}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if prep.c.gated(ToolReport) || !prep.c.gated(ToolTransfer) {
-		t.Fatal("the configured gate replaces the default")
-	}
-}
-
-// TestWriteGateResolvesGroupsConservatively covers a taint gate naming a
-// toolkit group. The agent's gate resolves groups through its toolkit, which
-// the participant cannot see, so an entry that is not a thread tool name may
-// be a group holding the writing tools and gates every one of them. Once the
-// agent knew about the taint when it checked the step, its own gate has
-// decided and the participant does not refuse the call again.
-func TestWriteGateResolvesGroupsConservatively(t *testing.T) {
-	prep, err := Prepare(cloudDesc, PrepareOptions{TaintGate: []string{"thread-writes"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range []string{ToolTransfer, ToolAssignTask, ToolReport, ToolPublishArtifact} {
-		if !prep.c.gated(name) {
-			t.Fatalf("%s is not gated by a gate that may be a group holding it", name)
-		}
-	}
-	prep, err = Prepare(cloudDesc, PrepareOptions{TaintGate: []string{ToolTransfer, ToolThreadRead}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if prep.c.gated(ToolReport) || !prep.c.gated(ToolTransfer) {
-		t.Fatal("a gate of thread tool names gates exactly those tools")
-	}
-
-	// The race the check is for: the activation read untrusted content after
-	// the agent checked the call, so the user never confirmed it.
-	e := newToolEnv(t, cloudDesc)
-	e.c.gate = []string{"thread-writes"}
-	e.act.markTainted()
-	if r := e.write(ToolReport, map[string]any{"text": "x"}); r.State != message.ToolResultError || !strings.Contains(resultText(&r), "report did not run") {
-		t.Fatalf("a call gated through a group must be refused: %+v", r)
-	}
-	// The agent was tainted when it checked the step: it decided, and a call
-	// it let through without asking is not gated for it.
-	e.tr.checkTainted = true
-	if r := e.write(ToolReport, map[string]any{"text": "x"}); r.State != message.ToolResultSuccess {
-		t.Fatalf("a call the tainted agent let through must run: %+v", r)
 	}
 }
 
@@ -327,23 +260,16 @@ func TestAnswerExternalRefusesForeignTools(t *testing.T) {
 
 func TestThreadRead(t *testing.T) {
 	e := newToolEnv(t, cloudDesc)
-	report := entryText(3, thread.KindReport, "the lamp is on")
-	report.Tainted = true
-	summary := thread.Entry{Seq: 4, Kind: thread.KindSummary, Origin: thread.Origin{Participant: "cloud"}, Visibility: thread.Shared,
+	summary := thread.Entry{Seq: 4, Kind: thread.KindSummary, Origin: thread.Origin{Participant: "cloud"},
 		Summary: &thread.SummaryMeta{Target: "edge"}, Coverage: &thread.Coverage{Through: 3},
 		Content: []message.ContentBlock{message.TextBlock{Type: "text", Text: "what happened"}}}
-	hidden := entryText(5, thread.KindReport, "edge secret")
-	hidden.Visibility = thread.EdgeOnly
-	e.host.entries = []thread.Entry{entryText(2, thread.KindReport, "first report"), report, summary, hidden}
+	e.host.entries = []thread.Entry{entryText(2, thread.KindReport, "first report"), entryText(3, thread.KindReport, "the lamp is on"), summary}
 
 	out, st := e.run(t, ToolThreadRead, map[string]any{"after": 2})
 	if st != message.ToolResultSuccess || !strings.Contains(out, "the lamp is on") ||
 		!strings.Contains(out, "[#4 summary from cloud for edge, covering through #3]\nwhat happened") ||
-		strings.Contains(out, "first report") || strings.Contains(out, "edge secret") {
+		strings.Contains(out, "first report") {
 		t.Fatalf("thread_read after=2: %q", out)
-	}
-	if tainted, private := e.act.flags(); !tainted || private {
-		t.Fatalf("a tainted entry taints the activation: tainted=%v private=%v", tainted, private)
 	}
 
 	out, _ = e.run(t, ToolThreadRead, map[string]any{"limit": 1})
@@ -363,15 +289,6 @@ func TestThreadRead(t *testing.T) {
 	e.host.readErr = errors.New("log offline")
 	if out, st = e.run(t, ToolThreadRead, nil); st != message.ToolResultError || !strings.Contains(out, "thread_read failed: log offline") {
 		t.Fatalf("read error: %q", out)
-	}
-
-	edge := newToolEnv(t, edgeDesc)
-	edge.host.entries = []thread.Entry{hidden}
-	if out, _ = edge.run(t, ToolThreadRead, nil); !strings.Contains(out, "edge secret") {
-		t.Fatalf("edge read: %q", out)
-	}
-	if _, private := edge.act.flags(); !private {
-		t.Fatal("an edge-only entry makes the edge activation private")
 	}
 }
 
@@ -432,7 +349,7 @@ func TestEventRead(t *testing.T) {
 		t.Fatalf("empty outline: %q", out)
 	}
 	e.host.events.Add(thread.EventRecord{Origin: thread.Origin{Participant: "edge"}, Zone: thread.ZoneCloud, Tool: "web_fetch",
-		Target: "https://x", Output: "line one\nline two", Tainted: true})
+		Target: "https://x", Output: "line one\nline two"})
 	e.host.events.Add(thread.EventRecord{Origin: thread.Origin{Participant: "cloud", Path: "researcher"}, Zone: thread.ZoneCloud,
 		Tool: "read_file", Output: "header\n" + strings.Repeat("z", 293)})
 
@@ -440,33 +357,21 @@ func TestEventRead(t *testing.T) {
 	if st != message.ToolResultSuccess || out != "ev-2 read_file (from cloud/researcher, 300 characters): header" {
 		t.Fatalf("search: %q", out)
 	}
-	if tainted, _ := e.act.flags(); tainted {
-		t.Fatal("an untainted record does not taint")
-	}
 	out, _ = e.run(t, ToolEventRead, map[string]any{"action": "page", "id": "ev-2", "offset": 10, "limit": 100})
 	if !strings.HasPrefix(out, "ev-2 characters 10-110 of 300:\n") || !strings.HasSuffix(out, "[More: event_read action=page id=ev-2 offset=110]") {
 		t.Fatalf("page: %q", out)
 	}
-	if tainted, _ := e.act.flags(); tainted {
-		t.Fatal("paging an untainted record does not taint")
-	}
 	out, _ = e.run(t, ToolEventRead, map[string]any{"action": "page", "id": "ev-1"})
-	if out != "ev-1 characters 0-17 of 17 (untrusted source):\nline one\nline two" {
-		t.Fatalf("tainted page: %q", out)
-	}
-	if tainted, _ := e.act.flags(); !tainted {
-		t.Fatal("paging a tainted record taints")
+	if out != "ev-1 characters 0-17 of 17:\nline one\nline two" {
+		t.Fatalf("whole page: %q", out)
 	}
 
 	f := newToolEnv(t, edgeDesc)
 	f.host.events = e.host.events
 	out, _ = f.run(t, ToolEventRead, map[string]any{"action": "outline", "limit": 5})
-	if out != "ev-1 web_fetch https://x (from edge, 17 characters, untrusted source): line one\n"+
+	if out != "ev-1 web_fetch https://x (from edge, 17 characters): line one\n"+
 		"ev-2 read_file (from cloud/researcher, 300 characters): header" {
 		t.Fatalf("outline: %q", out)
-	}
-	if tainted, _ := f.act.flags(); !tainted {
-		t.Fatal("listing a tainted record taints")
 	}
 
 	for _, tc := range []struct {
@@ -530,58 +435,6 @@ func TestArgumentHelpers(t *testing.T) {
 	}
 }
 
-func TestImportsEdgeOnly(t *testing.T) {
-	e := newToolEnv(t, edgeDesc)
-	ctx := context.Background()
-	shared := entryText(4, thread.KindReport, "x")
-	e.host.entries = []thread.Entry{shared}
-	gap := message.UserMsg("thread", "[entries skipped]")
-	gap.Metadata[thread.KindMetadataKey] = thread.GapKind
-	gap.Metadata[thread.SeqMetadataKey] = uint64(3)
-	gap.Metadata[thread.VisibilityMetadataKey] = string(thread.EdgeOnly)
-	keyed := func(seq uint64, v thread.Visibility) *message.Msg {
-		m := projected(seq, "x")
-		m.Metadata[thread.VisibilityMetadataKey] = string(v)
-		return m
-	}
-	index, empty := "#3 user_input: my door code", ""
-	down := errors.New("down")
-	for _, tc := range []struct {
-		name  string
-		s     *thread.Sync
-		err   error
-		want  bool
-		reads int
-	}{
-		{"nil", nil, nil, false, 0},
-		{"no seqs", &thread.Sync{Messages: []*message.Msg{gap, nil}}, nil, false, 0},
-		// Messages carrying the visibility key are never looked up.
-		{"keyed shared", &thread.Sync{Messages: []*message.Msg{keyed(9, thread.Shared)}}, down, false, 0},
-		{"keyed edge-only", &thread.Sync{Messages: []*message.Msg{keyed(4, thread.Shared), keyed(9, thread.EdgeOnly)}}, nil, true, 0},
-		{"index", &thread.Sync{Reset: true, Index: &index}, nil, true, 0},
-		{"empty index", &thread.Sync{Reset: true, Index: &empty}, nil, false, 0},
-		// Messages without the key fall back to a lookup.
-		{"shared", &thread.Sync{Messages: []*message.Msg{projected(4, "x")}}, nil, false, 1},
-		{"mixed", &thread.Sync{Messages: []*message.Msg{keyed(9, thread.Shared), projected(4, "x")}}, nil, false, 1},
-		{"missing", &thread.Sync{Messages: []*message.Msg{projected(9, "x")}}, nil, true, 1},
-		{"read error", &thread.Sync{Messages: []*message.Msg{projected(4, "x")}}, down, true, 1},
-		{"edge-only summary", &thread.Sync{PeerSummary: &thread.Entry{Kind: thread.KindSummary, Visibility: thread.EdgeOnly}}, nil, true, 0},
-	} {
-		e.host.readErr = tc.err
-		before := len(e.host.snapshot().reads)
-		if got := e.c.importsEdgeOnly(ctx, e.host, tc.s); got != tc.want {
-			t.Fatalf("%s: %v", tc.name, got)
-		}
-		if reads := len(e.host.snapshot().reads) - before; reads != tc.reads {
-			t.Fatalf("%s: %d log reads, want %d", tc.name, reads, tc.reads)
-		}
-	}
-	c := newToolEnv(t, cloudDesc)
-	if c.c.importsEdgeOnly(ctx, c.host, &thread.Sync{PeerSummary: &thread.Entry{Visibility: thread.EdgeOnly}}) {
-		t.Fatal("the cloud never imports edge-only content")
-	}
-}
-
 func TestTrackerHandlesStrayEvents(t *testing.T) {
 	e := newToolEnv(t, cloudDesc)
 	// An event of a reply whose start was not seen opens a main path.
@@ -623,15 +476,13 @@ func TestTrackerHandlesStrayEvents(t *testing.T) {
 }
 
 func TestToUpdateCopies(t *testing.T) {
-	idx, taint := "i", true
-	s := &thread.Sync{Index: &idx, Taint: &taint, Messages: []*message.Msg{projected(1, "a")}, Cursor: 1}
+	s := &thread.Sync{Messages: []*message.Msg{projected(1, "a")}, Cursor: 1}
 	u, err := toUpdate(s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	idx, taint = "changed", false
 	s.Messages[0] = nil
-	if *u.Index != "i" || !*u.Taint || u.Messages[0] == nil || u.Cursor != 1 || u.PeerSummary != nil {
+	if u.Messages[0] == nil || u.Cursor != 1 || u.PeerSummary != nil {
 		t.Fatalf("update = %+v", u)
 	}
 	var _ agent.ThreadUpdate = u

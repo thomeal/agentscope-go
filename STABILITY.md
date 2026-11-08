@@ -178,15 +178,14 @@ ports and deferred work, including realtime/TUI, SOP and model-context wiring.
 - Experimental `thread` (with `thread/participant` and `thread/route`) lets a
   cloud agent and an edge agent share one session through an append-only log
   with one foreground owner, guarded owner/epoch writes, transfer, background
-  tasks, forked summaries and edge-only visibility. The agent seams it uses
+  tasks and forked summaries; its log has no privacy classes. The agent seams it uses
   (`WithForkCapture`, `ForkSnapshot`, `ForkSummary`, `ApplySummary`,
   `OfferSummary`, `AgentState.SummaryOffer`, `CompactStrict`,
   `ContextConfig.ThreadSummaryTokens`, `SetThreadSummaryTokens`,
   `ApplyThreadUpdate`, `WithBoundaryInput`, `WithThreadInput`,
   `ThreadView`, `ThreadSeqOf`, `ErrReplyInProgress`, `MarkHandedOff`,
-  `WithExclusiveTools`, `WithTaintGate`, `SetTainted`, `WithPrivacyProbe`,
-  `AgentState.Private`, `ThreadUpdate.Private`,
-  `SubmitExternalResultContext`, `SubmitUserConfirmContext`) are
+  `WithExclusiveTools`, `SubmitExternalResultContext`,
+  `SubmitUserConfirmContext`) are
   experimental additions to the stable `agent` package and inert unless used.
   The between-replies seams refuse while any reply core is still running, even
   after its event stream closed; hosts that cancel a reply must let its core
@@ -257,7 +256,7 @@ limits. Shared governance across ordinary Agent/helper paths remains proposed.
   [reply recovery guide](docs/reply-recovery.md).
 - Ordinary checkpoints keep schema 1; recovery checkpoints use schema 2 and
   budget snapshot version 1; checkpoints of agents holding Main Thread state
-  (peer summary, thread index, cursor, taint or privacy) use schema 3, which takes
+  (peer summary or cursor) use schema 3, which takes
   precedence. Older loaders reject schema 2, and loaders before schema 3
   reject schema 3. New loaders accept
   older conversation state, but explicit recovery requires its typed snapshot.

@@ -40,10 +40,8 @@ type fakePart struct {
 	bindErr     error
 	state       ParticipantState
 	acts        []Activation
-	syncs       []Sync  // applied through Sync and Activation.Sync
-	pendings    []*Sync // Pending results, nil ones included
+	syncs       []Sync // applied through Sync and Activation.Sync
 	reads       [][]Entry
-	pages       []string
 	seen        []string // every text that entered its context
 	compacts    int
 	compactPlan []fakeCompact
@@ -51,7 +49,6 @@ type fakePart struct {
 	syncErr     error
 	saveErr     error // Activate applies its Sync, then fails (an unsaved checkpoint)
 	activateErr error
-	planHeld    bool // a plan survives clears: clearing Private leaves a set flag set, as on the agent
 	scripts     []fakeScript
 	script      fakeScript // used when scripts is empty
 	confirms    []string
@@ -105,21 +102,12 @@ func (f *fakePart) applyLocked(s *Sync) error {
 	if s.PeerSummary != nil {
 		f.seen = append(f.seen, s.PeerSummary.Text())
 	}
-	if s.Index != nil {
-		f.seen = append(f.seen, *s.Index)
-	}
 	for _, m := range s.Messages {
 		f.seen = append(f.seen, msgText(m))
 		f.state.InputTokens += estimateTokens(m)
 	}
 	if s.Cursor != 0 {
 		f.state.Cursor = s.Cursor
-	}
-	if s.Taint != nil {
-		f.state.Tainted = *s.Taint
-	}
-	if s.Private != nil {
-		f.state.Private = *s.Private || (f.state.Private && f.planHeld)
 	}
 	return nil
 }
@@ -198,11 +186,6 @@ func (f *fakePart) Activate(ctx context.Context, act Activation) (<-chan Activat
 		}
 		f.mu.Lock()
 		f.state.Busy = false
-		if end != nil && end.Private && f.desc.Zone == ZoneEdge {
-			// Like the in-repo participants: a private run leaves the
-			// edge's state private (ParticipantState.Private).
-			f.state.Private = true
-		}
 		f.mu.Unlock()
 		if end != nil {
 			ch <- ActivationEvent{End: end}
@@ -245,12 +228,6 @@ func (f *fakePart) appliedSyncs() []Sync {
 	return slices.Clone(f.syncs)
 }
 
-func (f *fakePart) pendingResults() []*Sync {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return slices.Clone(f.pendings)
-}
-
 func (f *fakePart) seenTexts() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -260,7 +237,7 @@ func (f *fakePart) seenTexts() []string {
 			out = append(out, renderEntry(&rs[i]))
 		}
 	}
-	return append(out, f.pages...)
+	return out
 }
 
 func (f *fakePart) compactCount() int {
@@ -317,7 +294,6 @@ func (r *fakeRun) pending() *Sync {
 			panic(aerr)
 		}
 	}
-	r.f.pendings = append(r.f.pendings, s)
 	r.f.mu.Unlock()
 	return s
 }
@@ -342,15 +318,6 @@ func (r *fakeRun) read(q ReadQuery) ([]Entry, error) {
 	r.f.reads = append(r.f.reads, got)
 	r.f.mu.Unlock()
 	return got, err
-}
-
-// page reads an event page and records it.
-func (r *fakeRun) page(id string) (string, error) {
-	text, _, err := r.host().EventPage(r.name(), id, 0, 0)
-	r.f.mu.Lock()
-	r.f.pages = append(r.f.pages, text)
-	r.f.mu.Unlock()
-	return text, err
 }
 
 func testBrief() Brief {
@@ -520,28 +487,15 @@ func (r *fakeRouter) requests() []RouteRequest {
 	return slices.Clone(r.reqs)
 }
 
-// zoneRouter sends edge-only queries to edge and the rest to cloud.
-func zoneRouter() *fakeRouter {
+// cloudRouter sends the queries that name the edge to edge and the rest to
+// cloud.
+func cloudRouter() *fakeRouter {
 	return &fakeRouter{fn: func(_ context.Context, req *RouteRequest) (RouteDecision, error) {
-		if req.Disclosure == DiscloseEdgeOnly {
+		if req.Explicit == "edge" {
 			return RouteDecision{Target: "edge", Source: RouteHard}, nil
 		}
 		return RouteDecision{Target: "cloud", Source: RouteRule}, nil
 	}}
-}
-
-type fakePolicy struct {
-	mu    sync.Mutex
-	calls []string
-	fn    func(text string) (Visibility, error)
-}
-
-func (p *fakePolicy) Classify(_ context.Context, text string) (Visibility, error) {
-	p.mu.Lock()
-	p.calls = append(p.calls, text)
-	fn := p.fn
-	p.mu.Unlock()
-	return fn(text)
 }
 
 // ---------------------------------------------------------------- store

@@ -24,19 +24,11 @@ type importResult struct {
 type clearCommit struct {
 	seq      uint64    // the summary's seq
 	coverage *Coverage // the summary's coverage
-	private  bool      // whether the new context holds edge-only material
-	gen      uint64    // partState.privGen when the import marked it
 }
 
 // importer imports the entries before an activation's trigger into its
 // participant. It calls the participant (Sync, Compact, State) and must run
 // without the mutex.
-//
-// Everything it learns about a Sync (edge-only content) is recorded before
-// the Sync is sent: a Sync can fail after the participant applied it in
-// memory, so its outcome is unknown, and the Coordinator must then assume
-// it was applied. Only a clear lowers the participant's privacy, and only
-// once its reset is known to be applied.
 type importer struct {
 	c       *Coordinator
 	ps      *partState
@@ -55,9 +47,8 @@ type importer struct {
 // An edge participant is cleared when it returns after another participant
 // held the foreground (the clear rule is for a takeover) and the newest
 // summary written for it covers entries past its own last activity: one
-// Sync resets its context to that summary, an index of the edge-only
-// entries the summary excludes, and the projection of the entries it does
-// not cover. Otherwise the entries between its cursor and the trigger are
+// Sync resets its context to that summary and the projection of the entries
+// it does not cover. Otherwise the entries between its cursor and the trigger are
 // projected. Only an edge import has a budget; one that does not fit is
 // the local fallback: it is applied in chunks with a compaction after each,
 // and when compaction stops helping the rest is skipped with a message
@@ -111,51 +102,23 @@ func foregroundLeft(entries []Entry, name string, seq uint64) bool {
 }
 
 // clear builds the reset import from summary s as one Sync: the context is
-// emptied, s becomes the peer summary, the edge-only entries s excludes go
-// into the index (read in full with thread_read), except progress entries,
-// which are dropped, and every other entry s does not cover is projected. The participant's own entries are projected
-// too when s does not cover them, because the reset drops them from its
-// context. The activation has no budget, neither for this Sync nor for what
-// Pending delivers during it: a context that outgrows the window is the
-// agent's own compression's job, as in any reply.
+// emptied, s becomes the peer summary, and every entry s does not cover is
+// projected. The participant's own entries are projected too when s does
+// not cover them, because the reset drops them from its context. The
+// activation has no budget, neither for this Sync nor for what Pending
+// delivers during it: a context that outgrows the window is the agent's own
+// compression's job, as in any reply.
 func (im *importer) clear(s *Entry) importResult {
-	var shared []uint64
-	var hidden []Entry
-	for _, seq := range s.Coverage.Excluded {
-		e := im.entry(seq)
-		if e == nil || e.Kind == KindProgress {
-			// Progress is a run's working state, not material: the edge
-			// holds no run at a clear, and its own progress would otherwise
-			// keep every later clear private.
-			continue
-		}
-		if e.EffectiveVisibility() == EdgeOnly {
-			hidden = append(hidden, cloneEntry(e))
-		} else {
-			shared = append(shared, seq)
-		}
-	}
-	index := EdgeIndex(hidden, im.c.cfg.Import.IndexRunes)
 	sum := cloneEntry(s)
-	// The edge-only entries s excludes count as covered here, because the
-	// index stands for them.
 	proj := Project(im.entries, &ProjectionSpec{
 		Participant: im.ps.name,
-		Zone:        im.ps.desc.Zone,
-		Covered:     &Coverage{Through: s.Coverage.Through, Excluded: shared},
+		Covered:     cloneCoverage(s.Coverage),
 		IncludeOwn:  true,
 	})
-	taint := s.Tainted || proj.Tainted
-	sync := &Sync{Reset: true, PeerSummary: &sum, Index: &index, Messages: proj.Messages, Cursor: proj.Through, Taint: &taint}
-	private := len(hidden) > 0 || renderedEdgeOnly(proj.Messages, im.entry)
-	if im.ps.desc.Zone == ZoneEdge {
-		sync.Private = &private
-	}
-	gen := im.mark(private)
 	return importResult{
-		sync:   sync,
+		sync:   &Sync{Reset: true, PeerSummary: &sum, Messages: proj.Messages, Cursor: proj.Through},
 		tokens: countTokens(proj.Messages),
-		clear:  &clearCommit{seq: s.Seq, coverage: cloneCoverage(s.Coverage), private: private, gen: gen},
+		clear:  &clearCommit{seq: s.Seq, coverage: cloneCoverage(s.Coverage)},
 	}
 }
 
@@ -182,17 +145,14 @@ func (im *importer) incremental(st ParticipantState, held *Coverage) (importResu
 		budget := im.budgetFor(st)
 		proj := Project(im.entries[min(int(after), len(im.entries)):], &ProjectionSpec{
 			Participant:   im.ps.name,
-			Zone:          im.ps.desc.Zone,
 			After:         after,
 			Covered:       held,
 			MaxTokens:     budget,
 			OwnBasedAfter: ownAfter,
 		})
-		s, private := im.chunk(&proj)
+		s := &Sync{Messages: proj.Messages, Cursor: proj.Through}
 		if !proj.Remaining {
-			// The last chunk goes with the activation: marked now, before
-			// Activate sends it.
-			im.mark(private)
+			// The last chunk goes with the activation.
 			res := importResult{budget: budget, tokens: countTokens(s.Messages)}
 			if !s.Empty() {
 				res.sync = s
@@ -202,7 +162,6 @@ func (im *importer) incremental(st ParticipantState, held *Coverage) (importResu
 		if round >= pol.MaxRounds {
 			return im.skip(st, after), nil
 		}
-		im.mark(private)
 		if err := im.ps.p.Sync(im.ctx, *s); err != nil {
 			return importResult{}, fmt.Errorf("thread: import into %s: %w", im.ps.name, err)
 		}
@@ -223,33 +182,6 @@ func (im *importer) incremental(st ParticipantState, held *Coverage) (importResu
 	}
 }
 
-// mark records, before a Sync is sent, that it brings edge-only content
-// into the participant. It returns the privacy generation after the mark.
-func (im *importer) mark(private bool) uint64 {
-	c := im.c
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if private {
-		im.ps.raisePrivateLocked()
-	}
-	return im.ps.privGen
-}
-
-// chunk turns a projection into a Sync and reports whether it renders
-// edge-only content into an edge participant.
-func (im *importer) chunk(proj *Projection) (*Sync, bool) {
-	s := &Sync{Messages: proj.Messages, Cursor: proj.Through}
-	if proj.Tainted {
-		taint := true
-		s.Taint = &taint
-	}
-	private := im.ps.desc.Zone == ZoneEdge && renderedEdgeOnly(proj.Messages, im.entry)
-	if private {
-		s.Private = &private
-	}
-	return s, private
-}
-
 // skip moves the cursor past the rest of the import with one message that
 // names the range, so nothing is imported again and the participant can
 // read the range with thread_read.
@@ -263,16 +195,7 @@ func (im *importer) skip(st ParticipantState, after uint64) importResult {
 		} else {
 			text = fmt.Sprintf("[#%d–#%d not imported: read them with thread_read]", after+1, last)
 		}
-		// Like a gap, the notice names only seqs; it carries the visibility
-		// of the entries it stands for.
-		vis := Shared
-		for seq := after + 1; seq <= last; seq++ {
-			if e := im.entry(seq); e == nil || e.EffectiveVisibility() == EdgeOnly {
-				vis = EdgeOnly
-				break
-			}
-		}
-		s.Messages = []*message.Msg{projectedMsg(text, last, GapKind, vis)}
+		s.Messages = []*message.Msg{projectedMsg(text, last, string(KindMarker))}
 	}
 	return importResult{sync: s, budget: im.budgetFor(st), tokens: countTokens(s.Messages)}
 }
@@ -293,42 +216,6 @@ func (im *importer) budgetFor(st ParticipantState) int {
 		return 0
 	}
 	return max(int(im.c.cfg.Import.EdgeShare*float64(w))-st.InputTokens, 1)
-}
-
-// entry returns the entry with seq, nil when it is not in range.
-func (im *importer) entry(seq uint64) *Entry {
-	if seq == 0 || seq > uint64(len(im.entries)) {
-		return nil
-	}
-	e := &im.entries[seq-1]
-	if e.Seq != seq {
-		return nil
-	}
-	return e
-}
-
-// renderedEdgeOnly reports whether a projected message renders an edge-only
-// entry, the edge's progress of a running or failed run included: the run
-// may have read private material the Coordinator cannot see. It trusts the
-// message's visibility key and looks the entry up only when the key is
-// missing.
-func renderedEdgeOnly(msgs []*message.Msg, lookup func(uint64) *Entry) bool {
-	for _, m := range msgs {
-		if kind, _ := m.Metadata[KindMetadataKey].(string); kind == GapKind {
-			continue
-		}
-		if v, ok := MsgVisibility(m); ok {
-			if v == EdgeOnly {
-				return true
-			}
-			continue
-		}
-		seq, _ := m.Metadata[SeqMetadataKey].(uint64)
-		if e := lookup(seq); e != nil && e.EffectiveVisibility() == EdgeOnly {
-			return true
-		}
-	}
-	return false
 }
 
 func countTokens(msgs []*message.Msg) int {
@@ -354,7 +241,7 @@ func estimateText(s string) int {
 // wake a foreground activation, not vanish into a background one. The budget
 // is the one its import left, less what Pending already delivered; State is
 // not called here because the participant may be inside its own boundary
-// callback. Everything the Sync brings is recorded before it is returned.
+// callback.
 func (c *Coordinator) pending(ctx context.Context, ps *partState, cursor uint64) (*Sync, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -367,13 +254,9 @@ func (c *Coordinator) pending(ctx context.Context, ps *partState, cursor uint64)
 		return nil, fmt.Errorf("thread: read pending entries for %s: %w", ps.name, err)
 	}
 	fgOwner := c.holdsForegroundLocked(a)
-	zone := ps.desc.Zone
 	x := -1
 	for i := range entries {
 		e := &entries[i]
-		if !zone.CanRead(e.EffectiveVisibility()) {
-			continue
-		}
 		switch e.Kind {
 		case KindUserInput:
 			if fgOwner && c.undeliveredLocked(e.Seq) {
@@ -395,7 +278,6 @@ func (c *Coordinator) pending(ctx context.Context, ps *partState, cursor uint64)
 	window := entries[:x+1]
 	proj := Project(window, &ProjectionSpec{
 		Participant: ps.name,
-		Zone:        zone,
 		After:       cursor,
 		Covered:     ps.heldCoverage,
 		MaxTokens:   budget,
@@ -409,7 +291,7 @@ func (c *Coordinator) pending(ctx context.Context, ps *partState, cursor uint64)
 	ps.seen = max(ps.seen, proj.Through)
 	if fgOwner {
 		c.inputs = slices.DeleteFunc(c.inputs, func(r *inputRec) bool {
-			if r.entry.Seq <= proj.Through && zone.CanRead(r.entry.EffectiveVisibility()) {
+			if r.entry.Seq <= proj.Through {
 				a.steered = append(a.steered, r)
 				return true
 			}
@@ -426,23 +308,7 @@ func (c *Coordinator) pending(ctx context.Context, ps *partState, cursor uint64)
 			}
 		}
 	}
-	lookup := func(seq uint64) *Entry {
-		if seq <= cursor || seq > cursor+uint64(len(window)) {
-			return nil
-		}
-		return &window[seq-cursor-1]
-	}
-	s := &Sync{Messages: proj.Messages, Cursor: proj.Through}
-	if zone == ZoneEdge && renderedEdgeOnly(proj.Messages, lookup) {
-		ps.raisePrivateLocked()
-		private := true
-		s.Private = &private
-	}
-	if proj.Tainted {
-		taint := true
-		s.Taint = &taint
-	}
-	return s, nil
+	return &Sync{Messages: proj.Messages, Cursor: proj.Through}, nil
 }
 
 // ownTaskReportLocked reports whether e reports on a task activation a

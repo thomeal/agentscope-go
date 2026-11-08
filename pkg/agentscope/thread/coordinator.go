@@ -52,7 +52,6 @@ const (
 	defaultMaxRewrites      = 1
 	defaultEdgeShare        = 0.5
 	defaultMaxRounds        = 8
-	defaultIndexRunes       = 1200
 	defaultStaleAfter       = 40
 	defaultMaxWakes         = 4
 	defaultMaxAssignDepth   = 2
@@ -69,18 +68,9 @@ type Query struct {
 	// Submit with the same ID appends nothing and starts nothing.
 	OperationID string
 	Text        string
-	// Disclosure is the host policy's verdict on the text; empty means
-	// DiscloseUnclassified.
-	Disclosure Disclosure
 	// Explicit names a participant the user addressed, "" if none.
 	Explicit    string
 	NeedsGroups []string
-}
-
-// DisclosurePolicy decides whether text an edge participant wrote while its
-// context held edge-only material may be shared with the cloud.
-type DisclosurePolicy interface {
-	Classify(ctx context.Context, text string) (Visibility, error)
 }
 
 // SummaryPolicy schedules the summaries cloud participants fork from their
@@ -144,9 +134,6 @@ type ImportPolicy struct {
 	// does not fit (the local fallback when no new summary covers the
 	// entries); default 8.
 	MaxRounds int
-	// IndexRunes bounds the EdgeIndex an edge receives after a clear; default
-	// 1200.
-	IndexRunes int
 	// StaleAfter marks a peer summary stale for routing when more than this
 	// many readable entries follow it; default 40.
 	StaleAfter int
@@ -183,16 +170,10 @@ type Config struct {
 	Events *EventList
 	// Leases, when set, are released with ReleaseAll(participant) after each
 	// activation.
-	Leases *Leases
-	// Disclosure, when set, may declassify what a private edge participant
-	// writes. Without it such writes stay edge-only.
-	Disclosure DisclosurePolicy
-	Summaries  SummaryPolicy
-	Import     ImportPolicy
-	Limits     Limits
-	// CloudReadsEdge lets cloud participants read edge tool outputs in the
-	// event list. Default off.
-	CloudReadsEdge bool
+	Leases    *Leases
+	Summaries SummaryPolicy
+	Import    ImportPolicy
+	Limits    Limits
 	// Available reports whether a participant can run now; nil means all are.
 	Available func(name string) bool
 	// Clock stamps entries and ledger records; nil uses time.Now.
@@ -201,9 +182,7 @@ type Config struct {
 	// stopped, from its crash log say. When recovery resumes a request the
 	// stopped process was answering, the restarted marker records it (up to
 	// 1,000 characters) and the resuming participant's input quotes it on one
-	// line, cut at 200 characters. The marker is shared whenever the request
-	// is, and the cloud may read it whoever resumes, so never put edge-only
-	// material in it. Empty says nothing beyond the log.
+	// line, cut at 200 characters. Empty says nothing beyond the log.
 	RecoveryNote string
 }
 
@@ -255,8 +234,8 @@ type Event struct {
 // schedules summary forks. It is safe for concurrent use.
 //
 // One mutex guards its state. It is never held while calling a participant,
-// the router, the disclosure policy or the Available callback, nor while
-// sending to the Events channel. Every log append happens under it, so a
+// the router or the Available callback, nor while sending to the Events
+// channel. Every log append happens under it, so a
 // guard read and its append are one step.
 type Coordinator struct {
 	cfg    Config
@@ -320,14 +299,7 @@ type partState struct {
 	lastActivity uint64 // highest seq of an entry it wrote
 	// lastSealed is the seq of its last reply, transfer owner_change or
 	// task report: the newest of its own outputs that a summary fork covers.
-	lastSealed uint64
-	// private is set by anything edge-only it imported or produced, before
-	// the participant receives it, and is cleared only by a clear that
-	// imports nothing edge-only, once the clear is known to be applied.
-	// privGen counts the times it was set, so a clear lowers it only when
-	// nothing set it meanwhile.
-	private      bool
-	privGen      uint64
+	lastSealed   uint64
 	heldCoverage *Coverage // coverage of the peer summary it holds
 	resetFrom    uint64    // seq of the summary its last clear applied
 	// notify holds, by seq, the Notify reports addressed to it that no
@@ -353,28 +325,17 @@ type partState struct {
 	peerLoad int
 }
 
-// raisePrivateLocked marks ps as holding edge-only material.
-func (ps *partState) raisePrivateLocked() {
-	ps.private = true
-	ps.privGen++
-}
-
 // inputRec is an undelivered user input.
 type inputRec struct {
 	entry  Entry
 	q      Query
 	parked bool // waits for the next Submit (no owner, or recovered)
-	// skipped is set when the query cycle of a newer input went to a
-	// participant that may not read this one. It then starts its own cycle,
-	// oldest first, instead of being dropped as context.
-	skipped bool
 }
 
 // cycleState holds the counters of the current query cycle.
 type cycleState struct {
 	input      uint64
 	text       string
-	disclosure Disclosure
 	wakes      int
 	failedOver bool
 	// progress is the newest progress entry an activation answering this
@@ -531,7 +492,6 @@ func (cfg *Config) normalize() error {
 		return errors.New("thread: the edge import share and the peer summary ratio must be at most 1")
 	}
 	im.MaxRounds = intOrDefault(im.MaxRounds, defaultMaxRounds)
-	im.IndexRunes = intOrDefault(im.IndexRunes, defaultIndexRunes)
 	im.StaleAfter = intOrDefault(im.StaleAfter, defaultStaleAfter)
 	l := &cfg.Limits
 	l.MaxWakesPerQuery = intOrDefault(l.MaxWakesPerQuery, defaultMaxWakes)
@@ -593,27 +553,12 @@ func (c *Coordinator) Owner() (string, uint64) {
 
 // Submit appends a user_input and returns its seq; the work proceeds in the
 // background. While a foreground activation runs, the input steers it: the
-// owner receives it at its next boundary when it may read it, and an input
-// still undelivered when the activation ends starts a new query cycle.
-// Submit fails, appending nothing, when MaxPendingInputs inputs are already
-// waiting.
-//
-// An unclassified query submitted while the edge participant is tainted is
-// stored and handled as edge-only (see DiscloseUnclassified).
+// owner receives it at its next boundary, and an input still undelivered
+// when the activation ends starts a new query cycle. Submit fails, appending
+// nothing, when MaxPendingInputs inputs are already waiting.
 func (c *Coordinator) Submit(ctx context.Context, q Query) (uint64, error) { //nolint:gocritic // value parameter keeps the documented API
 	if strings.TrimSpace(q.Text) == "" {
 		return 0, errors.New("thread: query text is empty")
-	}
-	switch q.Disclosure {
-	case "":
-		q.Disclosure = DiscloseUnclassified
-	case DiscloseShared, DiscloseEdgeOnly, DiscloseUnclassified:
-	default:
-		return 0, fmt.Errorf("thread: unknown disclosure %q", q.Disclosure)
-	}
-	if q.Disclosure == DiscloseUnclassified && c.edgeTainted() {
-		// Read without the mutex; the participant is asked, not the log.
-		q.Disclosure = DiscloseEdgeOnly
 	}
 	if q.OperationID == "" {
 		q.OperationID = agentscope.GenerateID()
@@ -629,13 +574,11 @@ func (c *Coordinator) Submit(ctx context.Context, q Query) (uint64, error) { //n
 		return 0, fmt.Errorf("thread: %d user inputs are already waiting; try again when the current work ends", n)
 	}
 	e := Entry{
-		Kind:       KindUserInput,
-		Origin:     Origin{Participant: userName},
-		Visibility: q.Disclosure.Visibility(),
-		Disclosure: q.Disclosure,
-		Content:    textContent(q.Text),
-		DedupKey:   "user:" + q.OperationID,
-		Time:       c.cfg.Clock(),
+		Kind:     KindUserInput,
+		Origin:   Origin{Participant: userName},
+		Content:  textContent(q.Text),
+		DedupKey: "user:" + q.OperationID,
+		Time:     c.cfg.Clock(),
 	}
 	seq, err := c.store.Append(ctx, []Entry{e}, nil)
 	if err != nil {
@@ -792,10 +735,9 @@ func (c *Coordinator) commitLocked(who string, entries []Entry, g *Guard) []Entr
 // markerEntry builds a coordinator marker based on seq.
 func markerEntry(kind MarkerKind, basedOn uint64, detail string) Entry {
 	return Entry{
-		Kind:       KindMarker,
-		Visibility: Shared,
-		BasedOn:    basedOn,
-		Marker:     &Marker{Kind: kind, Detail: detail},
+		Kind:    KindMarker,
+		BasedOn: basedOn,
+		Marker:  &Marker{Kind: kind, Detail: detail},
 	}
 }
 
@@ -934,30 +876,4 @@ func (c *Coordinator) availability() map[string]bool {
 		out[ps.name] = c.available(ps.name)
 	}
 	return out
-}
-
-// edgeTainted reports the edge participant's taint. Never call it with the
-// mutex held.
-func (c *Coordinator) edgeTainted() bool {
-	ps := c.parts[c.edge]
-	if ps == nil {
-		return false
-	}
-	return ps.p.State().Tainted
-}
-
-// mayTake applies the disclosure rules of routing: an edge-only query never
-// goes to the cloud, nor does an unclassified one while the edge is tainted.
-func mayTake(z Zone, d Disclosure, edgeTainted bool) bool {
-	if z != ZoneCloud {
-		return true
-	}
-	switch d {
-	case DiscloseEdgeOnly:
-		return false
-	case DiscloseShared:
-		return true
-	default:
-		return !edgeTainted
-	}
 }

@@ -11,7 +11,6 @@ import (
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/agent"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/loop"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/message"
-	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/pipeline"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/protocol"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/thread"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/tool"
@@ -46,13 +45,10 @@ type core struct {
 	// (boundary input and loop hook); their presence is then checked.
 	prepared bool
 	toolSet  map[string]bool
-	gate     []string
 	hooks    []loop.Hook
 	tools    []tool.Tool
 	hook     *threadHook
 
-	tainting  map[string]bool
-	private   map[string]bool
 	capture   bool
 	maxOutput int
 
@@ -85,10 +81,6 @@ func newCore(d thread.Descriptor, opts PrepareOptions, prepared bool) (*core, er
 		}
 		c.toolSet[n] = true
 	}
-	c.gate = append([]string(nil), opts.TaintGate...)
-	if len(c.gate) == 0 {
-		c.gate = append([]string(nil), defaultTaintGate...)
-	}
 	c.hooks = append([]loop.Hook(nil), opts.LoopHooks...)
 	c.hook = &threadHook{c: c}
 	for _, n := range allToolNames {
@@ -99,10 +91,8 @@ func newCore(d thread.Descriptor, opts PrepareOptions, prepared bool) (*core, er
 	return c, nil
 }
 
-// configure records the per-participant tool lists and event capture.
-func (c *core) configure(tainting, private []string, capture *bool, maxOutput int) {
-	c.tainting = toSet(tainting)
-	c.private = toSet(private)
+// configure records the participant's event capture.
+func (c *core) configure(capture *bool, maxOutput int) {
 	c.capture = false
 	if capture != nil {
 		c.capture = *capture
@@ -111,14 +101,6 @@ func (c *core) configure(tainting, private []string, capture *bool, maxOutput in
 	if c.maxOutput <= 0 {
 		c.maxOutput = defaultMaxEventOutput
 	}
-}
-
-func toSet(names []string) map[string]bool {
-	m := make(map[string]bool, len(names))
-	for _, n := range names {
-		m[n] = true
-	}
-	return m
 }
 
 // options returns the agent options a prepared participant's agent needs.
@@ -130,31 +112,10 @@ func (c *core) options() []agent.AgentOption {
 	if c.toolSet[ToolTransfer] {
 		opts = append(opts, agent.WithExclusiveTools(ToolTransfer))
 	}
-	if len(c.gate) > 0 {
-		opts = append(opts, agent.WithTaintGate(c.gate...))
-	}
 	if c.desc.Zone == thread.ZoneCloud {
 		opts = append(opts, agent.WithForkCapture())
-	} else {
-		opts = append(opts, agent.WithPrivacyProbe(c.privateNow))
 	}
 	return opts
-}
-
-// privateNow is the edge agent's privacy probe (agent.WithPrivacyProbe):
-// whether the running activation took anything edge-only. Every mark lands
-// before the checkpoint that first holds what caused it: the trigger's when
-// the activation is created, an import's before the update is applied, a
-// listed tool's or a TeamAssign's from the loop hook after the call, and
-// thread_read's inside the tool. The agent's settle after the run saves once
-// more while the activation is still current.
-func (c *core) privateNow() bool {
-	act := c.current()
-	if act == nil {
-		return false
-	}
-	_, private := act.flags()
-	return private
 }
 
 // hasWriteTools reports whether an external thread tool is installed; those
@@ -163,23 +124,6 @@ func (c *core) privateNow() bool {
 func (c *core) hasWriteTools() bool {
 	for n := range writeTools {
 		if c.toolSet[n] {
-			return true
-		}
-	}
-	return false
-}
-
-// gated reports whether a call of the thread tool name may be in the taint
-// gate. The agent's gate (agent.WithTaintGate) matches tool names and the
-// toolkit groups holding them; the participant does not see the agent's
-// toolkit, so an entry that is not a thread tool name may be a group holding
-// name and counts as gating it. Erring that way costs at most one refusal:
-// the participant refuses only calls the agent checked before it was told
-// about the taint (see tracker.write); from then on the agent's own gate,
-// which resolves groups exactly, decides.
-func (c *core) gated(name string) bool {
-	for _, g := range c.gate {
-		if g == name || !isThreadTool(g) {
 			return true
 		}
 	}
@@ -276,83 +220,29 @@ type activation struct {
 	// ctx is the reply context; host calls made for the activation use it.
 	ctx context.Context
 
-	mu             sync.Mutex
-	cond           *sync.Cond
-	tainted        bool
-	private        bool
-	taintDelivered bool
-	hookStarted    bool
-	boundaryCalls  int
-	cursor         uint64
-	closed         bool
-	confirms       int // confirmation requests not answered yet
-	assignHooks    int // TeamAssign steps the master finished
-	assignResults  int // TeamAssign results the forwarder processed
+	mu            sync.Mutex
+	hookStarted   bool
+	boundaryCalls int
+	cursor        uint64
+	confirms      int // confirmation requests not answered yet
 }
 
 func newActivation(act *thread.Activation) *activation {
-	a := &activation{
+	return &activation{
 		epoch:      act.Epoch,
 		depth:      act.Depth,
 		foreground: act.Foreground,
 		triggerSeq: act.Trigger.Seq,
 		ctx:        context.Background(),
 	}
-	a.cond = sync.NewCond(&a.mu)
-	if act.Trigger.EffectiveVisibility() == thread.EdgeOnly {
-		a.private = true
-	}
-	return a
 }
 
-// start records the agent's thread state after the activation's own Sync was
-// applied: an agent that is already tainted makes the activation tainted,
-// and one whose state is private makes it private.
+// start records the agent's thread cursor after the activation's own Sync
+// was applied.
 func (a *activation) start(view agent.ThreadView) { //nolint:gocritic // ThreadView is returned by value
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.cursor = max(view.Cursor, a.triggerSeq)
-	if view.Tainted {
-		a.tainted = true
-		a.taintDelivered = true
-	}
-	if view.Private {
-		a.private = true
-	}
-}
-
-func (a *activation) markTainted() {
-	a.mu.Lock()
-	a.tainted = true
-	a.mu.Unlock()
-}
-
-func (a *activation) markPrivate() {
-	a.mu.Lock()
-	a.private = true
-	a.mu.Unlock()
-}
-
-func (a *activation) flags() (tainted, private bool) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.tainted, a.private
-}
-
-// agentTainted reports whether the agent has been told about the taint: it
-// was tainted when the activation started, or a boundary update carried it.
-func (a *activation) agentTainted() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.taintDelivered
-}
-
-// close wakes every waiter; the activation is over or canceled.
-func (a *activation) close() {
-	a.mu.Lock()
-	a.closed = true
-	a.cond.Broadcast()
-	a.mu.Unlock()
 }
 
 func (a *activation) addConfirm() {
@@ -369,29 +259,6 @@ func (a *activation) takeConfirm() bool {
 	}
 	a.confirms--
 	return true
-}
-
-// assignResult records that the forwarder processed one TeamAssign result of
-// the master.
-func (a *activation) assignResult() {
-	a.mu.Lock()
-	a.assignResults++
-	a.cond.Broadcast()
-	a.mu.Unlock()
-}
-
-// awaitAssign runs on the master's goroutine after a TeamAssign step. The
-// member's events reached the run's event channel before the step finished,
-// but the forwarder may not have read them yet; waiting for the step's own
-// result here makes a member's taint visible to the master's next boundary.
-func (a *activation) awaitAssign() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.assignHooks++
-	need := a.assignHooks
-	for a.assignResults < need && !a.closed {
-		a.cond.Wait()
-	}
 }
 
 // boundary is the agent's boundary input (agent.WithBoundaryInput). It runs
@@ -425,76 +292,13 @@ func (c *core) boundary(ctx context.Context) (*agent.ThreadUpdate, error) {
 			return nil, fmt.Errorf("participant %s: pending thread input: %w", c.desc.Name, err)
 		}
 		u = &tu
-		if s.Taint != nil && *s.Taint {
-			act.markTainted()
-		}
-		if c.importsEdgeOnly(ctx, host, s) {
-			act.markPrivate()
-		}
 	}
 	act.mu.Lock()
 	defer act.mu.Unlock()
-	if act.tainted {
-		// A tainted activation never clears the agent's taint, and taint the
-		// agent has not received yet goes out with this update.
-		if u == nil && !act.taintDelivered {
-			u = &agent.ThreadUpdate{}
-		}
-		if u != nil {
-			t := true
-			u.Taint = &t
-			act.taintDelivered = true
-		}
-	}
 	if u != nil && u.Cursor > act.cursor {
 		act.cursor = u.Cursor
 	}
 	return u, nil
-}
-
-// importsEdgeOnly reports whether s brings edge-only content into an edge
-// participant: an edge-only peer summary, an index (it lists edge-only
-// entries only), or a message whose thread.VisibilityMetadataKey says
-// edge-only. Messages without that key are looked up by seq; a failed
-// lookup counts as edge-only. Gap messages name only seqs and never count.
-func (c *core) importsEdgeOnly(ctx context.Context, host thread.Host, s *thread.Sync) bool {
-	if c.desc.Zone != thread.ZoneEdge || s == nil {
-		return false
-	}
-	if s.PeerSummary != nil && s.PeerSummary.EffectiveVisibility() == thread.EdgeOnly {
-		return true
-	}
-	if s.Index != nil && *s.Index != "" {
-		return true
-	}
-	var seqs []uint64
-	for _, m := range s.Messages {
-		if m == nil || m.Metadata[thread.KindMetadataKey] == thread.GapKind {
-			continue
-		}
-		if v, ok := thread.MsgVisibility(m); ok {
-			if v == thread.EdgeOnly {
-				return true
-			}
-			continue
-		}
-		if seq, ok := agent.ThreadSeqOf(m); ok {
-			seqs = append(seqs, seq)
-		}
-	}
-	if len(seqs) == 0 {
-		return false
-	}
-	entries, err := host.Read(ctx, c.desc.Name, thread.ReadQuery{Seqs: seqs})
-	if err != nil || len(entries) < len(seqs) {
-		return true
-	}
-	for i := range entries {
-		if entries[i].EffectiveVisibility() == thread.EdgeOnly {
-			return true
-		}
-	}
-	return false
 }
 
 // errEmptySummary is wrapped by toUpdate for a peer summary entry without
@@ -515,20 +319,8 @@ func toUpdate(s *thread.Sync) (agent.ThreadUpdate, error) {
 		Messages: append([]*message.Msg(nil), s.Messages...),
 		Cursor:   s.Cursor,
 	}
-	if s.Index != nil {
-		idx := *s.Index
-		u.Index = &idx
-	}
-	if s.Taint != nil {
-		t := *s.Taint
-		u.Taint = &t
-	}
-	if s.Private != nil {
-		p := *s.Private
-		u.Private = &p
-	}
 	if e := s.PeerSummary; e != nil {
-		ps := &agent.PeerSummary{Text: e.Text(), Origin: e.Origin.String(), Tainted: e.Tainted}
+		ps := &agent.PeerSummary{Text: e.Text(), Origin: e.Origin.String()}
 		if e.Coverage != nil {
 			ps.Through = e.Coverage.Through
 			ps.Excluded = append([]uint64(nil), e.Coverage.Excluded...)
@@ -538,10 +330,9 @@ func toUpdate(s *thread.Sync) (agent.ThreadUpdate, error) {
 	return u, nil
 }
 
-// threadHook is the loop hook a prepared participant installs. It marks
-// taint and privacy on the agent's own goroutine as soon as a listed tool has
-// run, so the next boundary already sees them, and it holds a team master
-// after each TeamAssign step until the forwarder has read the member's events.
+// threadHook is the loop hook a prepared participant installs. It records
+// that the agent's loop started, so the boundary can tell that the hook is
+// installed.
 type threadHook struct{ c *core }
 
 var _ loop.Hook = (*threadHook)(nil)
@@ -549,6 +340,7 @@ var _ loop.Hook = (*threadHook)(nil)
 func (h *threadHook) BeforeModelCall(protocol.LoopState, int)                       {}
 func (h *threadHook) AfterModelCall(protocol.LoopState, int, error)                 {}
 func (h *threadHook) BeforeToolExec(protocol.LoopState, int, string)                {}
+func (h *threadHook) AfterToolExec(protocol.LoopState, int, string, error)          {}
 func (h *threadHook) OnStateTransition(protocol.LoopState, protocol.LoopState, int) {}
 func (h *threadHook) OnLoopEnd(error)                                               {}
 
@@ -557,21 +349,5 @@ func (h *threadHook) OnLoopStart() {
 		act.mu.Lock()
 		act.hookStarted = true
 		act.mu.Unlock()
-	}
-}
-
-func (h *threadHook) AfterToolExec(_ protocol.LoopState, _ int, name string, _ error) {
-	act := h.c.current()
-	if act == nil {
-		return
-	}
-	if h.c.tainting[name] {
-		act.markTainted()
-	}
-	if h.c.private[name] {
-		act.markPrivate()
-	}
-	if name == pipeline.TeamAssignToolName {
-		act.awaitAssign()
 	}
 }
