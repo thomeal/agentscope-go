@@ -161,6 +161,17 @@ participant's cursor. `participant.Leased` wraps tools that touch shared
 resources (for example a file path) so two participants cannot use one at the
 same time.
 
+**Shared workspace.** When the participants' agents work on one workspace,
+give each its own `tool.ReadCache` with `SetRejectStaleWrites(true)` through
+`agent.WithReadCache`. A whole-file `Write` from a copy the agent read before
+the other side changed the file is then refused, and the agent reads it
+again; see [stale writes](tools.md#stale-writes-on-a-shared-workspace-experimental).
+This includes a team's master and members: a `TeamPipeline` member runs on
+the pipeline's context, not inside its master's tools, so a member without a
+cache of its own has neither the read-first guard nor this check. Stage 0's
+harness had a similar check, which also refused writes to files never read;
+on the short tasks it refused 6 Main Thread writes.
+
 **Progress.** An agent with `agent.WithPlanTool` reports its plan with
 `update_plan`; each update becomes a `progress` entry of its run, and the
 call stays out of the reply's tool digest.

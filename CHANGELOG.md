@@ -59,6 +59,34 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
   middleware; `TeamRun` treats it as a normal end and the goal pipeline as
   not completed.
 
+### Added — canonical replay of a local model's tool calls (experimental)
+
+- `model.WithCanonicalReplay()` makes a `ConnectivityAwareModel` send the
+  cloud the arguments of the local model's tool calls as compact JSON with
+  sorted keys; `FallbackChatModel.CanonicalReplay` does the same for the calls
+  of models later in the chain. The calls are marked in
+  `ToolCallBlock.Extra` as they pass through and rewritten only in the copy of
+  the history sent upstream: stored messages, the local model's requests and
+  each model's own calls are unchanged. In the Main Thread stage 0
+  experiments, 11 replayed requests holding a local model's `write_file`
+  calls made `gpt-6-luna` run into an 8,000-token test cap on 21 to 27 of 330
+  replies across three passes, all on the 8 where the local model wrote
+  `path` before `content`, and on none with sorted keys; in live runs such replies reached the model's 128K output limit. Only
+  `write_file` and that model pair were measured. Main Thread does not replay
+  local calls to the cloud (they reach it only as text digests) and is not
+  affected.
+
+### Added — stale-write check for shared workspaces (experimental)
+
+- `tool.ReadCache.SetRejectStaleWrites(true)` makes `Write` refuse to replace
+  a file whose content is not the version the agent last read or edited, so
+  agents sharing a workspace, such as a Main Thread's participants, cannot
+  overwrite each other's changes from an old copy. Read records the content's
+  SHA-256 (`ReadCacheEntry.Hash`) and, while the check is on, always reads the
+  file; the edit tools record their own results. Edits are not refused. The
+  setting is off by default and is not saved with the cache; Read records the
+  hash either way.
+
 ### Changed — checkpoint schema version, answer matching and Responses status
 
 - `agent.StateSchemaVersion` is now 3. Checkpoints are stamped 3 only when an

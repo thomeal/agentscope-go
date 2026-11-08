@@ -193,6 +193,18 @@ ports and deferred work, including realtime/TUI, SOP and model-context wiring.
   models only; one Coordinator process per log; no live quality, cost or
   latency claim. See [Main Thread](docs/main-thread.md).
 
+- `model.WithCanonicalReplay` (for `ConnectivityAwareModel`) and
+  `FallbackChatModel.CanonicalReplay` are Experimental additions to the
+  `model` package and off by default. They mark tool calls in
+  `ToolCallBlock.Extra` (`agentscope_writer_rank`) and rewrite only the copy
+  of the history sent to a more preferred model. Measured in stage 0 on one
+  cloud and one local model, for `write_file` only.
+
+- `tool.ReadCache.SetRejectStaleWrites` and `ReadCacheEntry.Hash` are
+  Experimental. The check is off by default; `Read` records the hash either
+  way. The check is not a lock and covers the built-in Write tool; files
+  changed by other tools are seen only through their content.
+
 - Experimental `evalkit.Runner.RunManagedLoad` evaluates the managed entry point
   directly with independent scoring and all-arrival/cost reporting. It creates no
   qualification records; offline fixtures and opt-in live quality pilots are

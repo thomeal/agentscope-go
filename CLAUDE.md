@@ -247,6 +247,13 @@ request timeout and relies on the caller's context. Do not assume this describes
 every provider-specific transport. Tests for longer calls must cover cancellation
 as well as successful completion.
 
+`ConnectivityAwareModel` with `WithCanonicalReplay` and
+`FallbackChatModel.CanonicalReplay` (experimental) mark tool calls written by
+a less preferred member in `ToolCallBlock.Extra` and rewrite their arguments
+as sorted compact JSON only in the copy sent to a more preferred one; stored
+messages and each member's own calls stay as written. See
+[canonical replay](docs/edge-deployment.md#replaying-the-local-models-tool-calls-experimental).
+
 `SecretStr` and `ResolveAPIKey` support credential handling in provider configs.
 Keep keys out of logs, errors and test fixtures committed to the repository.
 `GenerateStructuredOutput` uses tool calling; its fallback and retry behavior
@@ -439,6 +446,12 @@ File and command tools can use a `tool.Backend` from the context.
 When that backend is present, inspect its path and operation semantics instead
 of assuming local OS behavior. Use `path` for workspace-relative paths with
 forward slashes and `filepath` for actual host filesystem paths.
+
+`ReadCache.SetRejectStaleWrites` (experimental, per cache) refuses a
+whole-file `Write` over a version that cache has not recorded: `Read` stores a
+content hash and skips cached copies while it is on, and the edit tools record
+their own results. It is a check before the write, not a lock; see
+[stale writes](docs/tools.md#stale-writes-on-a-shared-workspace-experimental).
 
 Local file-tool path confinement is opt-in through `tool.WithWorkspaceRoot`;
 it does not provide process or network isolation. Session grants widen the
