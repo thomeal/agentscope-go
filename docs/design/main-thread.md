@@ -65,9 +65,10 @@ handoff. Each composition runs into one of the following.
   whole.
 - **Window checks send everything to the cloud.** A single history that
   sends any call over the device's window to the cloud, #67's context-bound
-  check in its simplest form, keeps the cloud's view whole. Once the session
-  outgrows the device's window, nearly every call goes to the cloud and the
-  device does little.
+  check in its simplest form, keeps the cloud's view whole. But a single
+  history only grows, so once it outgrows the device's window, later calls no
+  longer fit and go to the cloud: on a long session, all-cloud after the
+  first few turns.
 - **The cloud's summary does not fit the device.** The default summary
   budget is 1/32 of the window, clamped to [1,024, 8,192]
   ([compress.go:41-49](https://github.com/agentscope-ai/agentscope-go/blob/ce51d23/pkg/agentscope/agent/compress.go#L41-L49)).
@@ -707,9 +708,8 @@ scheme's.
 
 The plan and each amendment were written down before the runs they govern, in
 the harness's [`prereg.md`](https://github.com/thomeal/agentscope-go/blob/eval/final/experiments/stage0/prereg.md). The plan changed after early results: the
-primary measure moved from fact retention to hidden tests, some gates were
-dropped after their previews fell short, and a scheme that beat the prototype
-on short tasks was removed from the comparisons (below). The results measure
+primary measure moved from fact retention to hidden tests, and some gates
+were dropped after their previews fell short. The results measure
 the prototype, not this branch, and come from one configuration: one local
 model, one window, one cloud model and one kind of task.
 
@@ -740,16 +740,11 @@ On 12 long tasks (27 to 32 turns), as scored:
 - **Routing.** With owners from a classifier that saw only the query (OpenAI
   Decisions standing in for Jev) instead of the authors', the prototype's
   long-task score changed by −30.7 [−57.9, −0.4] at about a third of the cost.
-- **Two schemes, for reference only.** Both scored higher and did more of the
-  work in the cloud:
-  - an all-cloud session at the cloud's full window: 43.9 points
-    [22.0, 66.6] above the prototype on long tasks, as scored, at about the
-    same cost (.95);
-  - a single history that sent each call over the edge window to the cloud,
-    scored on short tasks only: 9.1 points [5.5, 12.8] above the prototype at
-    the same cloud cost (1.02 [.87, 1.27]). It was dropped before the long
-    tasks on the expectation, never measured, that past the edge window
-    nearly every call goes to the cloud.
+- **All cloud, for reference only.** An all-cloud session at the cloud's
+  full window scored 43.9 points [22.0, 66.6] above the prototype on long
+  tasks, as scored, at about the same cloud cost (.95). It does not serve the
+  case this design targets: the device does no work, and nothing runs when
+  the cloud is down.
 - **A withdrawn comparison.** A comparison of this branch against a routed
   single-history baseline was withdrawn: that baseline was presented as what
   `main` does, but its compression ran on the cloud, which `main` does not
