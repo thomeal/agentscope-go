@@ -383,8 +383,11 @@ installed. Pass host loop hooks through `PrepareOptions.LoopHooks`
 (`agent.WithLoopHooks` replaces earlier hooks). Answer confirmation requests
 from `Events()` with `Coordinator.SubmitUserConfirm`. Show only events with
 `Foreground` set as the reply: background tasks and late output also appear
-in the stream, marked `Foreground: false`. `Interrupt` cancels the foreground
-activation; a transfer, task, report or artifact its tools had not committed
+in the stream, marked `Foreground: false`. A run that ends normally with no text and
+no tool calls writes an empty reply entry; skip it when rendering. `Interrupt` cancels the foreground
+activation (one still queued behind a background task on its participant
+keeps the foreground until that task ends, and only then writes its
+interrupted marker); a transfer, task, report or artifact its tools had not committed
 yet is refused (`thread.ErrInterrupted`), nothing is written and the model is
 told so. A write that committed just before the interrupt reaches the agent's
 context as a note before its next activation, so the agent and the log agree.
@@ -447,9 +450,9 @@ restart, the turn's other inputs that
 nothing is based on are queued again as Submit would queue them, and one
 that something is based on gets a `recovered` marker. An open request whose
 entries all precede the newest finished one gets a `recovered` marker and is
-not re-run. A run that ends normally
-with no text and no tool calls writes no reply, so recovery cannot tell it
-finished; such a request is taken as in flight. After two restarts of the same
+not re-run. A run that ends normally always writes its reply, empty when it
+had no text and no recorded tool calls, so recovery sees the request
+answered. After two restarts of the same
 request it gets a `recovered` marker on its newest restart and waits for
 the next message, and the inputs that would have joined it get `recovered`
 markers too. Every marker has a dedup key of its own, so repeated restarts
@@ -468,6 +471,11 @@ leaving it for recovery.
   in a withdrawn benchmark comparison, with no result reported.
 * One Coordinator process per log; `FileStore` takes no file lock and keeps the
   whole log in memory.
+* Some state grows with the session: settled tasks stay in the Coordinator's
+  task table, the usage ledger keeps every call, and an agent's fan-out is
+  bounded only by its iteration limit at each assign depth. Imports and
+  routing read the log from the start, so each step costs time linear in
+  its length.
 * The Coordinator does not persist which peer summary a participant holds;
   after a restart the next clear decides from the log.
 * **Evaluation to do: local compression.** The edge compacts synchronously in

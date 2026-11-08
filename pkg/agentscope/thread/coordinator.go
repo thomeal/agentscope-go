@@ -307,9 +307,11 @@ type partState struct {
 	// the idle owner.
 	notify map[uint64]*Entry
 
-	// restored is set from recovery until its first activation starts: its
-	// checkpoint may predate what it wrote, so its first incremental import
-	// also brings its own entries based past its cursor.
+	// restored is set by recovery and stays set for the process: the
+	// participant's checkpoint may predate what it wrote, so its imports also
+	// bring its own entries based past its cursor. Keeping it set after the
+	// first import can re-import a few own entries; clearing it early would
+	// lose them when that first activation never applied its Sync.
 	restored bool
 
 	forking   bool

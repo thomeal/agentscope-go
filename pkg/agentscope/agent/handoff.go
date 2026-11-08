@@ -16,6 +16,12 @@ import (
 // normally, and a Conversation records no interruption marker for it. The
 // mark is cleared at the start of every reply, so a mark set outside a reply
 // has no effect. The loop bridge (UnifiedAgentRunner) does not observe it.
+//
+// The mark is not checkpointed: a reply resumed by reply recovery after a
+// crash between the handoff and the reply's end makes another model call.
+// It is also one per agent: a host that starts a reply while a canceled
+// one is still finishing must wait for that one first, or the two can clear
+// or set each other's mark.
 func (a *UnifiedAgent) MarkHandedOff() {
 	a.handedOff.Store(true)
 }

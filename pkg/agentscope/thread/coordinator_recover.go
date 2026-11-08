@@ -10,6 +10,9 @@ import (
 
 // maxRestarts bounds how often recovery resumes one request: a request
 // whose run keeps stopping the process waits for the user after it.
+// Restart markers are keyed by the leaf they resume; above 2, a resume after
+// a requeue could reuse a key, so raising it means keying them by count as
+// requeue markers are.
 const maxRestarts = 2
 
 // recoveryNoteRunes bounds the host's note a restarted marker records.
@@ -536,7 +539,11 @@ const orphanPrefix = "orphan:"
 // task it ran.
 func sealedOutput(e *Entry) bool {
 	switch e.Kind {
-	case KindReply, KindOwnerChange:
+	case KindReply:
+		// An empty reply only marks its request answered; a summary gains
+		// nothing from it.
+		return strings.TrimSpace(e.Text()) != "" || cloneDigest(e.Digest) != nil
+	case KindOwnerChange:
 		return true
 	case KindReport:
 		return e.Task != nil && strings.HasPrefix(e.DedupKey, taskReportPrefix)

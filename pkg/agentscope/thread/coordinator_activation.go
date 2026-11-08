@@ -456,7 +456,11 @@ func (c *Coordinator) sealForegroundLocked(a *activation, end *ActivationEnd, re
 	ps := a.part
 	t := a.trigger.Seq
 	var batch []Entry
-	if strings.TrimSpace(end.Text) != "" || cloneDigest(end.Digest) != nil {
+	// A run that ends normally always writes its reply, empty or not: the
+	// reply is what marks the request answered for recovery, records the
+	// inputs it took, and ends the run's progress. A failed or interrupted
+	// run writes one only when there is something to keep.
+	if strings.TrimSpace(end.Text) != "" || cloneDigest(end.Digest) != nil || (!isFailure(reason) && reason != types.ReplyHandedOff) {
 		rep := Entry{
 			Kind:     KindReply,
 			Origin:   Origin{Participant: ps.name},
@@ -489,7 +493,7 @@ func (c *Coordinator) sealForegroundLocked(a *activation, end *ActivationEnd, re
 		stored := c.commitLocked(ps.name, batch, &Guard{Owner: ps.name, Epoch: a.epoch})
 		for i := range stored {
 			switch e := &stored[i]; {
-			case e.Kind == KindReply:
+			case e.Kind == KindReply && sealedOutput(e):
 				ps.lastSealed = e.Seq
 			case e.Kind == KindMarker && e.Marker.Kind == MarkerFailed:
 				f.failed = e.Seq

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 
@@ -122,6 +123,13 @@ func (a *UnifiedAgent) runPrecompress(ctx context.Context, cfg *ContextConfig, c
 		logrus.WithError(err).WithField("agent", a.name).Warn("background pre-compression formatting failed")
 		return
 	}
+	// A blank summary (a custom template over empty fields) would empty the
+	// history if applied; it is discarded like a failed generation, so the
+	// next round may try again and the hard trigger compresses synchronously.
+	if strings.TrimSpace(newSummary) == "" {
+		logrus.WithField("agent", a.name).Warn("background pre-compression produced an empty summary")
+		return
+	}
 	if budget := a.ownSummaryBudget(cfg, ctxSize); budget > 0 {
 		if truncated, did := TruncateToolResult(newSummary, budget); did {
 			newSummary = truncated
@@ -130,7 +138,14 @@ func (a *UnifiedAgent) runPrecompress(ctx context.Context, cfg *ContextConfig, c
 
 	last := snapshot[len(snapshot)-1]
 	a.mu.Lock()
-	// The background result replaces whatever waited, an offer included.
+	// A generation starts only when nothing valid waits, so a valid result
+	// waiting now is an offer made while this one ran: it is newer and wins.
+	if p := a.readyLocked(); p != nil && p.validLocked(a.state) {
+		a.mu.Unlock()
+		logrus.WithField("agent", a.name).Debug("background pre-compression discarded: a newer offer is waiting")
+		return
+	}
+	// Otherwise the background result replaces whatever waited.
 	a.dropReadyLocked()
 	a.pendingPrecompress = &precompressResult{
 		prevSummary: prevSummary,
@@ -167,6 +182,11 @@ func (a *UnifiedAgent) dropReadyLocked() {
 // compaction or checkpoint rollback breaks identity). The ID comparison
 // survives in-place cache clones that replace message pointers.
 func (p *precompressResult) validLocked(state *AgentState) bool {
+	// An offer can come from a checkpoint the agent did not write: reject
+	// bounds that would index outside the context, and an empty summary.
+	if p.snapshotLen <= 0 || p.reservedLen < 0 || p.reservedLen > p.snapshotLen || strings.TrimSpace(p.summary) == "" {
+		return false
+	}
 	if state.Summary != p.prevSummary || len(state.Context) < p.snapshotLen {
 		return false
 	}

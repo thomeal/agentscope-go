@@ -59,7 +59,10 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
   the toolkit resolves), and the context-aware `SubmitExternalResultContext`
   and `SubmitUserConfirmContext`.
 - The loop hooks' `BeforeToolExec` and `AfterToolExec` now also run around
-  the awaiting calls a resumed reply executes, as on the normal tool path.
+  the awaiting calls a resumed reply executes. Unlike the normal tool path,
+  they run only once a call is confirmed: the confirmation wait is outside
+  them and a call denied again gets no hooks, and they receive `StateAct`
+  without a state transition.
 - `types.ReplyHandedOff` (`"handed_off"`) ends a reply after a committed
   handoff. Like an interrupted end it cannot be swallowed by `OnReply`
   middleware; `TeamRun` treats it as a normal end and the goal pipeline as
@@ -114,7 +117,12 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
   `status` is present and not `completed` (for example cut at
   `max_output_tokens`), in `Chat` and in the final `ChatStream` response;
   `response.incomplete` and `response.failed` stream events end the stream.
-  Content and usage are kept. Before, such a response looked complete.
+  Content and usage are kept. Before, a buffered `Chat` response, or a
+  `response.completed` event reporting another status, looked complete; a
+  stream ending in `response.incomplete` or `response.failed` already failed,
+  with a generic truncation error and without usage. On the buffered agent
+  path such a response now emits `model_partial_response`, so `TeamRun` and
+  the goal pipeline fail it where they used to accept it.
 - `UnifiedAgent` drops an external result or a user confirmation whose
   `ReplyID` names a reply other than the waiting one. Tool-call IDs can repeat
   across replies (Gemini numbers them per response), so a late answer to a

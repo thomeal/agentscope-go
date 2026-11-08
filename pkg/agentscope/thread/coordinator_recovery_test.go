@@ -2,12 +2,15 @@ package thread
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/model"
+	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/types"
 )
 
 // TestCoordinatorRecovery: a request the stopped process was answering is
@@ -790,5 +793,85 @@ func TestCoordinatorHostCalls(t *testing.T) {
 	if len(arts) != 1 || arts[0].Seq != 4 || len(reps) != 1 || !reflect.DeepEqual(reps[0].To, []string{"cloud"}) ||
 		reps[0].Task == nil || reps[0].Task.ID != "t-9" {
 		t.Fatalf("artifact %+v report %+v", arts, reps)
+	}
+}
+
+// A run that ends normally with no text and no tool digest still writes its
+// reply, so a restart sees the request answered and does not run it again.
+func TestRecoveryEmptyCompletedReplyIsNotResumed(t *testing.T) {
+	store := NewMemoryStore(WithClock(fixedClock()))
+	edge, cloud := edgeCloud()
+	edge.push(func(r *fakeRun) *ActivationEnd {
+		return &ActivationEnd{Reason: types.ReplyCompleted}
+	})
+	env := newCoEnv(t, store, nil, edge, cloud)
+	env.say("hello")
+	env.idle()
+	first := env.log()
+	if got := kindsOf(first); len(got) != 3 || got[2] != "reply" {
+		t.Fatalf("log after the run = %v, want the empty reply last", got)
+	}
+	if rep := first[2]; rep.Text() != "" || rep.BasedOn != first[0].Seq || rep.Origin.Participant != "edge" {
+		t.Fatalf("reply = %+v", rep)
+	}
+	_ = env.c.Close()
+
+	edge2, cloud2 := edgeCloud()
+	edge2.setState(func(s *ParticipantState) { s.Cursor = 2 })
+	c2, err := NewCoordinator(context.Background(), Config{Store: store, Participants: []Participant{edge2, cloud2}, Clock: fixedClock()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c2.Close() }()
+	go func() {
+		for range c2.Events() {
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c2.WaitIdle(ctx); err != nil {
+		t.Fatal(err)
+	}
+	all, err := store.Read(context.Background(), 0, Filter{}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != len(first) {
+		t.Fatalf("restart wrote %v", kindsOf(all[len(first):]))
+	}
+	if n := len(edge2.activations()) + len(cloud2.activations()); n != 0 {
+		t.Fatalf("an answered request was run again: %d activations", n)
+	}
+}
+
+// After a restart the owner's first activation fails at Activate, so its
+// Sync was never applied. Its next import must still bring back the own
+// entries it wrote past its checkpoint, here its live progress.
+func TestRecoveryOwnEntriesSurviveAFailedFirstActivation(t *testing.T) {
+	store := NewMemoryStore(WithClock(fixedClock()))
+	mustAppend(t, store, nil, userInput("q1"))
+	oc := ownerChange("", "cloud")
+	oc.BasedOn = 1
+	mustAppend(t, store, &Guard{}, oc)
+	mustAppend(t, store, nil, Entry{Kind: KindProgress, Origin: Origin{Participant: "cloud"}, BasedOn: 1, Run: "a-1",
+		Content: textBlocks("1. [in_progress] book the hotel"), DedupKey: "progress:a-1:1"})
+
+	edge, cloud := edgeCloud()
+	cloud.activateErr = errors.New("checkpoint save failed")
+	env := newCoEnv(t, store, func(c *Config) { c.Router = cloudRouter() }, edge, cloud)
+	env.idle()
+
+	cloud.mu.Lock()
+	cloud.activateErr = nil
+	cloud.mu.Unlock()
+	env.say("q2")
+	env.idle()
+	acts := cloud.activations()
+	if len(acts) == 0 {
+		t.Fatalf("cloud never ran; log %v", kindsOf(env.log()))
+	}
+	imported := strings.Join(syncTexts(acts[len(acts)-1].Sync), "\n")
+	if !strings.Contains(imported, "progress of cloud") {
+		t.Fatalf("the restored owner's own progress was not re-imported:\n%s", imported)
 	}
 }
