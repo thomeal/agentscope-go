@@ -15,6 +15,10 @@ single writer of that log.
 | [`thread/participant`](../pkg/agentscope/thread/participant/) | `AgentParticipant` (one `UnifiedAgent`), `TeamParticipant` (a cloud master with sub-agents through `pipeline.TeamPipeline`), and the thread tools |
 | [`thread/route`](../pkg/agentscope/thread/route/) | The router: three modes, rules and an optional classifier (Jev, Piccolo through the Jev adapter, OpenAI Decisions or the offline fake) |
 
+[Main Thread design](design/main-thread.md) explains why the runtime is
+shaped this way, with diagrams, an end-to-end example, the alternatives and
+the open questions.
+
 Every exported identifier in these packages is EXPERIMENTAL and may change
 without notice. The runtime's repository tests are offline, with scripted
 models. Its only live runs were in a benchmark comparison that was withdrawn,
