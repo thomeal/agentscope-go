@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/event"
@@ -51,23 +52,18 @@ func WithPlanAfterLatestInput() AgentOption {
 // with WithPlanAfterLatestInput. The returned slice is new; head and ctx
 // are not modified. Caller holds a.mu.
 func (a *UnifiedAgent) withPlan(head, ctx []*message.Msg) []*message.Msg {
-	out := make([]*message.Msg, 0, len(head)+len(ctx)+1)
-	out = append(out, head...)
 	if len(a.state.Plan) == 0 {
-		return append(out, ctx...)
+		return slices.Concat(head, ctx)
 	}
-	plan := planPromptMsg(a.name, a.state.Plan)
+	plan := []*message.Msg{planPromptMsg(a.name, a.state.Plan)}
 	at := -1
 	if a.planAfterInput {
 		at = latestInput(ctx)
 	}
 	if at < 0 {
-		out = append(out, plan)
-		return append(out, ctx...)
+		return slices.Concat(head, plan, ctx)
 	}
-	out = append(out, ctx[:at+1]...)
-	out = append(out, plan)
-	return append(out, ctx[at+1:]...)
+	return slices.Concat(head, ctx[:at+1], plan, ctx[at+1:])
 }
 
 // latestInput is the index of the newest user message in ctx that holds no

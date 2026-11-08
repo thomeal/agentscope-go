@@ -134,6 +134,16 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
   the checkpoint held, so an answer to the request seen before the restart
   still reaches it.
 
+### Changed — precompression
+
+- With `ContextConfig.PrecompressRatio` set, a context that is still at the
+  trigger after a ready summary is applied now also compresses synchronously,
+  instead of continuing above the trigger.
+- A blank background summary is discarded like a failed generation instead
+  of being applied, a background result does not replace a summary offered
+  (`OfferSummary`) while it ran, and an offer loaded from a checkpoint is
+  dropped when its bounds do not fit the context.
+
 ### Changed — Anthropic stream accumulation
 
 - Long, fragmented Anthropic-compatible streams (the parser is shared with MiniMax)

@@ -21,8 +21,9 @@ the open questions.
 
 Every exported identifier in these packages is EXPERIMENTAL and may change
 without notice. The runtime's repository tests are offline, with scripted
-models. Its only live runs were in a benchmark comparison that was withdrawn,
-with no result reported, so nothing here establishes task quality, cloud
+models. Its only live runs were in a benchmark comparison that was withdrawn;
+only one routing observation from it is used (the `hybrid` default), so nothing
+here establishes task quality, cloud
 cost, latency or energy benefits.
 
 ## Run the offline example
@@ -468,7 +469,8 @@ leaving it for recovery.
 ## Limits
 
 * Repository tests are offline, with scripted models. The only live runs were
-  in a withdrawn benchmark comparison, with no result reported.
+  in a withdrawn benchmark comparison; only its routing observation behind the
+  `hybrid` default is used.
 * One Coordinator process per log; `FileStore` takes no file lock and keeps the
   whole log in memory.
 * Some state grows with the session: settled tasks stay in the Coordinator's
