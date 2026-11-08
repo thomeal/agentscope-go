@@ -707,7 +707,7 @@ CIs over tasks; a cost ratio is the prototype's cloud cost over the other
 scheme's.
 
 The plan and each amendment were written down before the runs they govern, in
-the harness's [`prereg.md`](https://github.com/thomeal/agentscope-go/blob/eval/final/experiments/stage0/prereg.md). The plan changed after early results: the
+the harness's [`prereg.md`](https://github.com/thomeal/agentscope-go/blob/eval/stage0/experiments/stage0/prereg.md). The plan changed after early results: the
 primary measure moved from fact retention to hidden tests, and some gates
 were dropped after their previews fell short. The results measure
 the prototype, not this branch, and come from one configuration: one local
