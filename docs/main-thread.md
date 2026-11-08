@@ -141,17 +141,31 @@ the query only after that cloud run fails and failover moves it. A hosted
 classifier on the same failing network can add its timeout first.
 
 The classifier reads a fixed-size state, so it fits a small model's prompt
-(Piccolo's 8,192-token row): the query (cut to 1,500 tokens), the summary the
-cloud wrote for the edge window, recent published entries as text with the
-names of the tools each reply used (arguments and outputs never appear) and
-the participants. The hybrid question is stage 0's word for word, apart from
-the participant names. The participant descriptions are stage 0's too, with
-tool calls in place of the benchmark's records and the host's description in
-place of its record-ID line. The question carries no warning about the
-state's content: a state that steers the classifier can cost quality or
-money. The state holds the query and recent entries whatever the
-classifier's endpoint, so a hosted classifier sees them.
-`route.BuildState` returns the exact state for logs.
+(Piccolo's 8,192-token row). By default the state is what a classifier
+routing from the query alone sees:
+
+- the query, cut to 1,500 tokens;
+- the participants' names, zones, windows, availability and tool groups.
+
+`route.Config.IncludeHistory` adds the session's history:
+
+- the summary the cloud wrote for the edge window;
+- recent published entries as text, with the names of the tools each reply
+  used (arguments and outputs never appear);
+- each participant's lag and whether it owns the session.
+
+The local_based and cloud_based questions say what the state holds, so they
+name the summary and recent entries only with `IncludeHistory`. The hybrid
+question is stage 0's word for word, apart from the participant names, and
+does not describe the state. The participant descriptions are stage 0's
+too, with tool calls in place of the benchmark's records and the host's
+description in place of its record-ID line.
+
+The question carries no warning about the state's content: a state that
+steers the classifier can cost quality or money. The state holds the query,
+and with `IncludeHistory` the summary and recent entries, whatever the
+classifier's endpoint, so a hosted classifier sees them. `route.BuildState`
+returns the exact state for logs.
 
 The three windows involved are therefore bounded separately: the cloud's own
 window (own notes from 10,000 tokens, installed at its compaction line), the
@@ -469,8 +483,9 @@ leaving it for recovery.
 * The loop bridge (`UnifiedAgentRunner.LoopOptions`) cannot hand the
   foreground over or ask the user; use the Coordinator.
 * No privacy boundary: the cloud reads the edge's entries, briefs, reports
-  and recorded tool outputs, and a hosted classifier reads the query and
-  recent entries. Do not give the edge data that must stay on the device.
+  and recorded tool outputs, and a hosted classifier reads the query, plus
+  the peer summary and recent entries with `route.Config.IncludeHistory`.
+  Do not give the edge data that must stay on the device.
   Untrusted tool output is not tracked either: nothing gates a write after a
   web fetch beyond the host's permission rules. The design for both is in
   [Main Thread privacy](design/main-thread-privacy.md). Logs and checkpoints

@@ -95,6 +95,12 @@ type Config struct {
 	// Budget bounds the classifier state. Zero fields take the values of
 	// DefaultBudget.
 	Budget StateBudget
+	// IncludeHistory adds the session's history to the classifier state:
+	// the peer summary, recent entries, and each participant's lag and
+	// whether it owns the session. False, the default, sends the query and
+	// the participants' names, zones, windows, availability and tool groups
+	// only, as a classifier that routes from the query alone sees a request.
+	IncludeHistory bool
 	// Count counts the tokens of a string. Nil counts (runes+3)/4.
 	Count func(string) int
 	// Authorize is the dispatch-time authorization passed to
@@ -135,7 +141,7 @@ func New(cfg Config) (*Router, error) { //nolint:gocritic // value parameter kee
 	if err != nil {
 		return nil, err
 	}
-	return &Router{cfg: c, instructions: instructions(c.Mode, c.Edge, c.Cloud)}, nil
+	return &Router{cfg: c, instructions: instructions(c.Mode, c.Edge, c.Cloud, c.IncludeHistory)}, nil
 }
 
 func configError(format string, args ...any) error {
@@ -436,12 +442,19 @@ func (r *Router) fallback(in *thread.RouteRequest, set *candidateSet) (target, w
 }
 
 // instructions returns the Choice question's instructions for the mode. The
-// hybrid question is stage 0's, word for word apart from the participant
-// names.
-func instructions(mode Mode, edge, cloud string) string {
+// local_based and cloud_based questions say what the state holds, so they
+// name the history only when it is sent. The hybrid question is stage 0's,
+// word for word apart from the participant names, and does not describe the
+// state.
+func instructions(mode Mode, edge, cloud string, history bool) string {
 	var b strings.Builder
 	if mode != Hybrid {
-		b.WriteString("Pick the participant that should answer the user's query. The state holds the query, the session summary, recent entries of the shared thread and the participants. ")
+		b.WriteString("Pick the participant that should answer the user's query. ")
+		if history {
+			b.WriteString("The state holds the query, the session summary, recent entries of the shared thread and the participants. ")
+		} else {
+			b.WriteString("The state holds the query and the participants. ")
+		}
 	}
 	switch mode {
 	case LocalBased:

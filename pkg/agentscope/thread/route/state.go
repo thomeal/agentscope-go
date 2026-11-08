@@ -12,18 +12,20 @@ import (
 )
 
 // StateBudget bounds the classifier state in tokens, as counted by
-// Config.Count. The defaults keep the whole state near 5K tokens, inside
-// Piccolo's 8,192-token prompt.
+// Config.Count. The defaults keep the whole state near 5K tokens with
+// Config.IncludeHistory, inside Piccolo's 8,192-token prompt; without it the
+// state holds the query and the participants only.
 type StateBudget struct {
 	// Query bounds the query text; a longer query is cut in the middle.
 	// Default 1500.
 	Query int
-	// Summary bounds the peer summary text; a longer summary is cut in the
-	// middle. Zero, the default, keeps the summary as written: it was
-	// written for the edge window already.
+	// Summary bounds the peer summary text, sent only with
+	// Config.IncludeHistory; a longer summary is cut in the middle. Zero, the
+	// default, keeps the summary as written: it was written for the edge
+	// window already.
 	Summary int
-	// Recent bounds the recent entries, each counted as its JSON encoding.
-	// Default 1500.
+	// Recent bounds the recent entries, sent only with
+	// Config.IncludeHistory, each counted as its JSON encoding. Default 1500.
 	Recent int
 	// Participants bounds the participant list, counted as its JSON
 	// encoding. Default 300.
@@ -60,7 +62,8 @@ func (b StateBudget) withDefaults() (StateBudget, error) {
 	return b, nil
 }
 
-// StateStats describes a built classifier state.
+// StateStats describes a built classifier state. Without
+// Config.IncludeHistory the summary and recent-entry fields stay zero.
 type StateStats struct {
 	// Token counts of the query text, the summary text, the recent entries
 	// and the participant list as encoded, and of the whole encoded state.
@@ -140,6 +143,21 @@ type stateEntry struct {
 	Tools string `json:"tools,omitempty"`
 }
 
+// queryDoc is the state without history: what a query-only classifier
+// sees of a request.
+type queryDoc struct {
+	Query        string             `json:"query,omitempty"`
+	Participants []queryParticipant `json:"participants"`
+}
+
+type queryParticipant struct {
+	Name      string   `json:"name"`
+	Zone      string   `json:"zone"`
+	Window    int      `json:"window,omitempty"`
+	Available bool     `json:"available"`
+	Tools     []string `json:"tools,omitempty"`
+}
+
 type stateParticipant struct {
 	Name      string   `json:"name"`
 	Zone      string   `json:"zone"`
@@ -150,21 +168,24 @@ type stateParticipant struct {
 	Owner     bool     `json:"owner,omitempty"`
 }
 
-// BuildState builds the classifier state the router would send for in: a
-// JSON object with the query, the peer summary, recent entries and the
-// participants. It is deterministic: the same input gives the same bytes,
-// whatever the order of in.Participants. It reads cfg.Budget and cfg.Count
-// only, filling zero budget fields and a nil counter with their defaults.
+// BuildState builds the classifier state the router would send for in. By
+// default it is a JSON object with the query and the participants' names,
+// zones, windows, availability and tool groups. With cfg.IncludeHistory it
+// also holds the peer summary, recent entries, and each participant's lag
+// and whether it owns the session. It is deterministic: the same input gives
+// the same bytes, whatever the order of in.Participants. It reads
+// cfg.Budget, cfg.Count and cfg.IncludeHistory only, filling zero budget
+// fields and a nil counter with their defaults.
 //
-// When the state is over Budget.Total, recent entries are dropped oldest
-// first, then the summary is cut in the middle, then left out. An error
-// means the state cannot fit even then.
+// When a state with history is over Budget.Total, recent entries are
+// dropped oldest first, then the summary is cut in the middle, then left
+// out. An error means the state cannot fit even then.
 func BuildState(cfg Config, in thread.RouteRequest) (json.RawMessage, StateStats, error) { //nolint:gocritic // value parameters keep the documented API
 	budget, err := cfg.Budget.withDefaults()
 	if err != nil {
 		return nil, StateStats{}, err
 	}
-	c := Config{Budget: budget, Count: cfg.Count}
+	c := Config{Budget: budget, Count: cfg.Count, IncludeHistory: cfg.IncludeHistory}
 	if c.Count == nil {
 		c.Count = defaultCount
 	}
@@ -182,6 +203,9 @@ func buildState(cfg *Config, in *thread.RouteRequest) (json.RawMessage, StateSta
 	if count(doc.Query) > b.Query {
 		doc.Query, _ = cutMiddle(doc.Query, func(s string) bool { return count(s) <= b.Query })
 		stats.QueryCut = true
+	}
+	if !cfg.IncludeHistory {
+		return queryState(cfg, in, doc.Query, &stats)
 	}
 
 	if in.PeerSummary != "" {
@@ -202,7 +226,7 @@ func buildState(cfg *Config, in *thread.RouteRequest) (json.RawMessage, StateSta
 	}
 	doc.Recent = recent
 
-	parts, ptoks, err := participantList(in, count, b.Participants, &stats)
+	parts, ptoks, err := participantList(in, count, b.Participants, true, &stats)
 	if err != nil {
 		return nil, StateStats{}, err
 	}
@@ -335,10 +359,42 @@ func toStateEntry(e *thread.Entry) stateEntry {
 	}
 }
 
-// participantList renders every participant sorted by name. When the list
-// is over its budget the tool groups are left out; an error means it is over
-// even then.
-func participantList(in *thread.RouteRequest, count func(string) int, budget int, stats *StateStats) ([]stateParticipant, int, error) {
+// queryState is the state without history: the query, already cut to its
+// budget, and the participants without their lag or ownership.
+func queryState(cfg *Config, in *thread.RouteRequest, query string, stats *StateStats) (json.RawMessage, StateStats, error) {
+	full, ptoks, err := participantList(in, cfg.Count, cfg.Budget.Participants, false, stats)
+	if err != nil {
+		return nil, StateStats{}, err
+	}
+	doc := queryDoc{Query: query, Participants: withoutHistory(full)}
+	raw, err := encode(doc)
+	if err != nil {
+		return nil, StateStats{}, err
+	}
+	tokens := cfg.Count(string(raw))
+	if tokens > cfg.Budget.Total {
+		return nil, StateStats{}, fmt.Errorf("route: the classifier state needs %d tokens, over the total budget of %d", tokens, cfg.Budget.Total)
+	}
+	stats.QueryTokens = cfg.Count(query)
+	stats.ParticipantTokens = ptoks
+	stats.TotalTokens = tokens
+	return raw, *stats, nil
+}
+
+// withoutHistory drops each participant's lag and ownership.
+func withoutHistory(parts []stateParticipant) []queryParticipant {
+	out := make([]queryParticipant, 0, len(parts))
+	for _, p := range parts {
+		out = append(out, queryParticipant{Name: p.Name, Zone: p.Zone, Window: p.Window, Available: p.Available, Tools: p.Tools})
+	}
+	return out
+}
+
+// participantList renders every participant sorted by name, measured as it
+// is sent: with lag and ownership when history is on, without them when it
+// is off. When the list is over its budget the tool groups are left out; an
+// error means it is over even then.
+func participantList(in *thread.RouteRequest, count func(string) int, budget int, history bool, stats *StateStats) ([]stateParticipant, int, error) {
 	parts := make([]stateParticipant, 0, len(in.Participants))
 	for i := range in.Participants {
 		p := &in.Participants[i]
@@ -354,7 +410,11 @@ func participantList(in *thread.RouteRequest, count func(string) int, budget int
 	}
 	slices.SortStableFunc(parts, func(a, b stateParticipant) int { return strings.Compare(a.Name, b.Name) })
 	measure := func() (int, error) {
-		raw, err := encode(parts)
+		var v any = parts
+		if !history {
+			v = withoutHistory(parts)
+		}
+		raw, err := encode(v)
 		if err != nil {
 			return 0, err
 		}

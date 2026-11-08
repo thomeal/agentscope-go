@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -575,27 +576,37 @@ func TestModeDefaults(t *testing.T) {
 }
 
 func TestInstructions(t *testing.T) {
-	cases := map[Mode]string{
-		LocalBased: `Choose the cloud (participant "sky") only if the request needs stronger reasoning or tools only the cloud has; otherwise choose the edge (participant "phone").`,
-		CloudBased: `Choose the edge (participant "phone") only if the request is simple enough for a small local model or needs tools or data only on the device; otherwise choose the cloud (participant "sky").`,
-		Hybrid: `Prefer the local assistant (participant "phone") whenever it can answer correctly, because it is cheaper and keeps data on the device. ` +
-			`Choose the cloud assistant (participant "sky") when the answer needs something only the cloud has, or reasoning too hard for a small model.`,
+	const (
+		pick        = `Pick the participant that should answer the user's query. `
+		withHistory = `The state holds the query, the session summary, recent entries of the shared thread and the participants. `
+		queryOnly   = `The state holds the query and the participants. `
+		local       = `Choose the cloud (participant "sky") only if the request needs stronger reasoning or tools only the cloud has; otherwise choose the edge (participant "phone").`
+		cloud       = `Choose the edge (participant "phone") only if the request is simple enough for a small local model or needs tools or data only on the device; otherwise choose the cloud (participant "sky").`
+	)
+	cases := []struct {
+		mode    Mode
+		history bool
+		want    string
+	}{
+		{LocalBased, false, pick + queryOnly + local},
+		{LocalBased, true, pick + withHistory + local},
+		{CloudBased, false, pick + queryOnly + cloud},
+		{CloudBased, true, pick + withHistory + cloud},
+		{Hybrid, false, stage0Hybrid},
+		{Hybrid, true, stage0Hybrid},
 	}
-	for mode, want := range cases {
-		t.Run(string(mode), func(t *testing.T) {
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("%s/history=%t", tc.mode, tc.history), func(t *testing.T) {
 			rec := &recorder{inner: classifier.NewFake(nil)}
-			r := newRouter(t, Config{Mode: mode, Edge: "phone", Cloud: "sky", Classifier: rec})
+			r := newRouter(t, Config{Mode: tc.mode, Edge: "phone", Cloud: "sky", Classifier: rec, IncludeHistory: tc.history})
 			in := request()
 			in.Participants = []thread.RouteCandidate{namedCand("phone", thread.ZoneEdge, true), namedCand("sky", thread.ZoneCloud, true)}
 			if _, err := r.Route(context.Background(), in); err != nil {
 				t.Fatalf("Route: %v", err)
 			}
 			q := rec.last(t).Questions[QuestionID].(*classifier.ChoiceQuestion)
-			if !strings.Contains(q.Instructions, want) {
-				t.Fatalf("instructions %q lack %q", q.Instructions, want)
-			}
-			if mode == Hybrid && q.Instructions != stage0Hybrid {
-				t.Fatalf("hybrid instructions %q, want stage 0's %q", q.Instructions, stage0Hybrid)
+			if q.Instructions != tc.want {
+				t.Fatalf("instructions\n%q\nwant\n%q", q.Instructions, tc.want)
 			}
 		})
 	}
@@ -631,7 +642,7 @@ func TestStateBuildFailureSkipsClassifier(t *testing.T) {
 
 func TestStateTrimmingIsInReason(t *testing.T) {
 	rec := &recorder{inner: choiceFake("cloud", 0.99)}
-	r := newRouter(t, Config{Mode: LocalBased, Classifier: rec, Budget: StateBudget{Query: 50, Participants: 100, Total: 400}})
+	r := newRouter(t, Config{Mode: LocalBased, Classifier: rec, IncludeHistory: true, Budget: StateBudget{Query: 50, Participants: 100, Total: 400}})
 	in := request()
 	in.PeerSummary = strings.Repeat("summary words ", 200)
 	in.Recent = []thread.Entry{{Seq: 9, Kind: thread.KindUserInput, Content: textBlocks("hello there")}}

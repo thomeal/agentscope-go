@@ -17,7 +17,9 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
   A Coordinator runs a cloud participant (one agent, or a master with
   sub-agents through `pipeline.TeamPipeline`) and an edge participant over one
   append-only log: routing at query boundaries (local based, cloud based and
-  hybrid modes, rules and an optional classifier with a fixed-size state),
+  hybrid modes, rules and an optional classifier with a fixed-size state
+  that holds the query and the participants, and the session's history
+  only with `route.Config.IncludeHistory`),
   `transfer` of the foreground with a structured brief, background tasks and
   reports, summaries written by forked requests that reuse the prompt cache
   (with an optional guardrail on their text), a one-step clear for edge

@@ -208,6 +208,6 @@ or a compaction drops a label only when it drops the labeled content.
 
 Do not give the edge data that must stay on the device. The cloud reads the
 edge's entries, briefs, reports and recorded tool outputs, and a hosted
-routing classifier reads the query and recent entries. Rely on the host's
-permission rules for writing and device tools; the runtime does not track
-untrusted content.
+routing classifier reads the query, plus the peer summary and recent entries
+with `route.Config.IncludeHistory`. Rely on the host's permission rules for
+writing and device tools; the runtime does not track untrusted content.
