@@ -190,8 +190,8 @@ ports and deferred work, including realtime/TUI, SOP and model-context wiring.
   The between-replies seams refuse while any reply core is still running, even
   after its event stream closed; hosts that cancel a reply must let its core
   finish first. Tested offline with scripted
-  models only; one Coordinator process per log; no live quality, cost or
-  latency claim. See [Main Thread](docs/main-thread.md).
+  models; its only live runs were in a withdrawn benchmark comparison. One
+  Coordinator process per log; no live quality, cost or latency claim. See [Main Thread](docs/main-thread.md).
 
 - `model.WithCanonicalReplay` (for `ConnectivityAwareModel`) and
   `FallbackChatModel.CanonicalReplay` are Experimental additions to the

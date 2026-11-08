@@ -104,8 +104,9 @@ It is kept for reference on the branch `archive/main-thread-privacy-taint`
 * the cloud's imports showed gap markers instead of device-only entries, an
   edge clear carried an index of the device-only entries the summary could
   not hold, and summaries recorded which entries they left out;
-* the router removed the cloud for device-only queries and refused a
-  classifier endpoint off the device unless it was declared hosted;
+* the router removed the cloud for device-only queries, and refused a
+  classifier it could not show to be on the device unless the host declared
+  it hosted, which limited its state to shared content;
 * an edge whose context held device-only material wrote device-only entries
   unless a host `DisclosurePolicy` cleared the text, and the agent saved that
   privacy in its checkpoint through a probe asked before every save;
@@ -136,8 +137,9 @@ The review rounds and the design discussion found these problems:
    cloud.
 4. **Taint was coarse.** Tools were tainting by name in an opt-in list, and
    writes were gated by name. A write in the same step as a tainting call was
-   refused once, then asked about. With a gate list beyond the thread tools,
-   every thread write counted as gated. Hosts that cannot ask the user (the
+   refused once, then asked about. A gate entry that was not a thread tool
+   name might be a toolkit group holding one, so any such entry gated every
+   thread write. Hosts that cannot ask the user (the
    loop bridge, the don't-ask mode) got denials. Taint spread through whole
    entries and never wore off.
 5. **The guarantee had a narrow scope.** It covered what the runtime sends.

@@ -16,9 +16,10 @@ single writer of that log.
 | [`thread/route`](../pkg/agentscope/thread/route/) | The router: three modes, rules and an optional classifier (Jev, Piccolo through the Jev adapter, OpenAI Decisions or the offline fake) |
 
 Every exported identifier in these packages is EXPERIMENTAL and may change
-without notice. The runtime is covered by offline tests with scripted models
-only. It has not been measured against live models in this form: nothing here
-establishes task quality, cloud cost, latency or energy benefits.
+without notice. The runtime's repository tests are offline, with scripted
+models. Its only live runs were in a benchmark comparison that was withdrawn,
+with no result reported, so nothing here establishes task quality, cloud
+cost, latency or energy benefits.
 
 ## Run the offline example
 
@@ -141,7 +142,7 @@ the query only after that cloud run fails and failover moves it. A hosted
 classifier on the same failing network can add its timeout first.
 
 The classifier reads a fixed-size state, so it fits a small model's prompt
-(Piccolo's 8,192-token row). By default the state is what a classifier
+(within Piccolo's 8,192-token prompt). By default the state is what a classifier
 routing from the query alone sees:
 
 - the query, cut to 1,500 tokens;
@@ -245,7 +246,7 @@ this runtime. The fork sends tool choice none by default; some providers
 (Anthropic) invalidate cached message blocks when the tool choice changes, so
 `ForkRequest.KeepToolChoice` (participant option `KeepForkToolChoice`) keeps
 the main request's tool choice and asks the model to rewrite if it calls a
-tool. The main thread is never touched by a fork
+tool. A fork never touches the agent's main context
 (`agent.WithForkCapture`, `ForkSnapshot`, `ForkSummary`).
 
 * **Peer summary (for the edge).** At the end of a cloud reply, when what a
@@ -278,7 +279,7 @@ tool. The main thread is never touched by a fork
   not apply, or notes over `OwnMaxTokens` are sent back for one rewrite, and
   an update that still fails leaves the notes as they were.
   The notes are not applied when written: the Coordinator offers them to the
-  cloud (`Forker.OfferOwnSummary`, `agent.OfferSummary`), and the agent
+  cloud (`Forker.OfferOwnSummary`, `UnifiedAgent.OfferSummary`), and the agent
   installs them without a model call when its context reaches its own
   compaction line, keeping a recent tail with intact tool pairs and
   everything after the notes' snapshot. The offer is saved with the agent's
@@ -313,7 +314,7 @@ tool. The main thread is never touched by a fork
 * **Chunked import (edge fallback).** When an edge import does not fit (no
   newer peer summary exists, for example because the cloud is unavailable),
   the Coordinator imports in chunks and compacts between them with
-  `agent.CompactStrict`, which leaves the state unchanged on any failure.
+  `UnifiedAgent.CompactStrict`, which leaves the state unchanged on any failure.
   After `ImportPolicy.MaxRounds` it moves on and tells the participant
   which entries to read with `thread_read`.
 
@@ -458,7 +459,8 @@ leaving it for recovery.
 
 ## Limits
 
-* Offline tests with scripted models only; no live measurement of this runtime.
+* Repository tests are offline, with scripted models. The only live runs were
+  in a withdrawn benchmark comparison, with no result reported.
 * One Coordinator process per log; `FileStore` takes no file lock and keeps the
   whole log in memory.
 * The Coordinator does not persist which peer summary a participant holds;

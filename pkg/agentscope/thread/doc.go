@@ -10,7 +10,7 @@
 // progress of running work, summaries a cloud fork
 // wrote for another participant's window, ownership changes, background
 // assignments, reports, artifacts and markers. A Coordinator is the single
-// writer. It routes each query, owns the foreground owner and its epoch,
+// writer. It routes each query, keeps the foreground owner and its epoch,
 // forwards only the owner's output to the user, commits Transfer, Assign and
 // Report, wakes participants, schedules summary forks and records the shared
 // ledger.
