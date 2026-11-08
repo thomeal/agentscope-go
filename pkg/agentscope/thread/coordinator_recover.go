@@ -46,6 +46,9 @@ type reqChain struct {
 	lastFail uint64   // the newest failed marker based on any of its seqs
 	progress *Entry   // the newest live progress entry based on any of its seqs
 	with     []*Entry // the inputs recovery joins to it, in log order
+	// handoff is the newest transfer or failover that handed its run on; a
+	// requeue clears it, since the request then starts over.
+	handoff *Entry
 }
 
 // settled reports whether the request's own entries finished it. A reply
@@ -288,9 +291,15 @@ const (
 // newest progress the log holds, warning that work done before may or may
 // not have taken effect (nothing is re-run on its own). The owner is the
 // participant the log says was answering: a routed request's owner change
-// precedes its activation. When the owner may take none of them (or there
-// is none), the turn's routing never finished, so nothing ran: its request
-// is routed again behind a restarted marker that counts the restart.
+// precedes its activation. A request a Transfer handed to the owner is
+// resumed there even when the owner may not read it (an edge-only request
+// the edge handed to the cloud through a cleared brief): the input then
+// points at the brief instead of quoting the request. Such a request is
+// never joined to another one, since joined inputs are quoted; it gets a
+// recovered marker instead. When the owner may
+// take none of them (or there is none), the turn's routing never finished,
+// so nothing ran: its request is routed again behind a restarted marker
+// that counts the restart.
 //
 // A turn request the owner may not take that no entry is based on never ran
 // on it and is routed again as Submit would queue it (a skipped input waited
@@ -307,12 +316,15 @@ func (c *Coordinator) planRecovery(order []*reqChain, states map[string]Particip
 			lastDone = max(lastDone, ch.last)
 		}
 	}
-	var turn, take []*reqChain
+	var turn, take, joinable []*reqChain
 	for _, ch := range order {
 		if !ch.done() && !ch.follows() && (!ch.touched || ch.last > lastDone) {
 			turn = append(turn, ch)
 			if c.mayResume(ch, states) {
 				take = append(take, ch)
+			}
+			if c.mayJoin(ch, states) {
+				joinable = append(joinable, ch)
 			}
 		}
 	}
@@ -335,7 +347,7 @@ func (c *Coordinator) planRecovery(order []*reqChain, states map[string]Particip
 			fates[ch] = fateResume
 		case ch == base:
 			fates[ch] = fateRetry
-		case resumable && slices.Contains(take, ch) && retry:
+		case resumable && slices.Contains(joinable, ch) && retry:
 			fates[ch] = fateJoin
 		case resumable && slices.Contains(take, ch), ch.touched:
 			fates[ch] = fateRecovered
@@ -349,7 +361,7 @@ func (c *Coordinator) planRecovery(order []*reqChain, states map[string]Particip
 		}
 		switch fates[ch.top()] {
 		case fateResume, fateJoin:
-			if c.mayResume(ch, states) {
+			if c.mayJoin(ch, states) {
 				fates[ch] = fateJoin
 			} else {
 				fates[ch] = fateRequeue
@@ -415,6 +427,7 @@ func recordChainEntry(chains map[uint64]*reqChain, e *Entry, stale map[uint64]bo
 		}
 		chains[e.Seq] = ch
 		ch.extend(e.Seq)
+		ch.handoff = e
 	case KindReply:
 		if e.BasedOn == ch.leaf {
 			ch.replied = true
@@ -436,6 +449,7 @@ func recordChainEntry(chains map[uint64]*reqChain, e *Entry, stale map[uint64]bo
 				ch.extend(e.Seq)
 			case strings.HasPrefix(e.DedupKey, requeuePrefix):
 				ch.extend(ch.root.Seq)
+				ch.handoff = nil
 			}
 		case MarkerFailed:
 			ch.lastFail = e.Seq
@@ -474,9 +488,44 @@ func recordSteered(chains map[uint64]*reqChain, ch *reqChain, e *Entry) {
 	}
 }
 
-// mayResume reports whether the current owner may resume ch: it is
-// registered, may read the request, and may take its disclosure.
+// transferredTo returns the Transfer that handed ch's run to ps when it is
+// the run's newest hand-over and ps may read it; nil otherwise. The
+// Transfer already decided that ps continues the request, so a restart
+// resumes it there, whatever ps may read of the request itself.
+func (ch *reqChain) transferredTo(ps *partState) *Entry {
+	h := ch.handoff
+	if ps == nil || h == nil || h.Owner == nil || h.Owner.Reason != ReasonTransfer || h.Owner.To != ps.name ||
+		!ps.desc.Zone.CanRead(h.EffectiveVisibility()) {
+		return nil
+	}
+	return h
+}
+
+// briefFor returns the Transfer whose brief ps resumes ch from when ps may
+// not read the request: an edge-only request the edge handed to the cloud
+// through a brief the disclosure policy cleared. The cloud only ever had
+// the brief, which its context holds again after the restart's import
+// (from its checkpoint, or projected from the log), so the restart points
+// at the brief and never quotes the request. nil when ps reads the request.
+func (ch *reqChain) briefFor(ps *partState) *Entry {
+	if ps == nil || ps.desc.Zone.CanRead(ch.root.EffectiveVisibility()) {
+		return nil
+	}
+	return ch.transferredTo(ps)
+}
+
+// mayResume reports whether the current owner may resume ch: a Transfer it
+// may read handed the request's run to it, or it may join ch.
 func (c *Coordinator) mayResume(ch *reqChain, states map[string]ParticipantState) bool {
+	return ch.transferredTo(c.parts[c.owner]) != nil || c.mayJoin(ch, states)
+}
+
+// mayJoin reports whether the current owner may take ch as one of the
+// inputs joined to the request it resumes: it is registered, may read the
+// request, and may take its disclosure. A joined input is quoted, so a
+// request the owner may not read is never joined, also one a Transfer
+// handed to it.
+func (c *Coordinator) mayJoin(ch *reqChain, states map[string]ParticipantState) bool {
 	ps := c.parts[c.owner]
 	if ps == nil || !ps.desc.Zone.CanRead(ch.root.EffectiveVisibility()) {
 		return false
@@ -492,15 +541,22 @@ func (c *Coordinator) mayResume(ch *reqChain, states map[string]ParticipantState
 // owner resumes it (restartPrefix, which makes the marker the leaf), on its
 // request when it is routed again (requeuePrefix, keyed by the restart's
 // number, so every restart writes its own). It carries the host's note and
-// keeps the request's visibility.
+// keeps the request's visibility, or the brief's when the owner resumes
+// from a Transfer's brief: the marker is that owner's trigger.
 func (c *Coordinator) restartedMarker(ch *reqChain, prefix string) Entry {
 	on := ch.leaf
 	key := prefix + strconv.FormatUint(on, 10)
+	var brief *Entry
 	if prefix == requeuePrefix {
 		on = ch.root.Seq
 		key = fmt.Sprintf("%s%d:%d", requeuePrefix, on, ch.restarts+1)
+	} else {
+		brief = ch.briefFor(c.parts[c.owner])
 	}
 	what := "#" + strconv.FormatUint(ch.root.Seq, 10)
+	if brief != nil {
+		what += " (handed over in #" + strconv.FormatUint(brief.Seq, 10) + ")"
+	}
 	for _, e := range ch.with {
 		what += ", #" + strconv.FormatUint(e.Seq, 10)
 	}
@@ -510,6 +566,9 @@ func (c *Coordinator) restartedMarker(ch *reqChain, prefix string) Entry {
 	}
 	mk := markerEntry(MarkerRestarted, on, detail)
 	mk.Visibility = ch.root.EffectiveVisibility()
+	if brief != nil {
+		mk.Visibility = brief.EffectiveVisibility()
+	}
 	mk.DedupKey = key
 	return mk
 }
@@ -540,7 +599,11 @@ func (c *Coordinator) resumeLocked(ch *reqChain, stored []Entry) {
 	c.cycle = cycleState{input: ch.root.Seq, text: ch.root.Text(), disclosure: q.Disclosure}
 	a := c.newActivationLocked(ps, actRecover, trigger, true, 0)
 	a.cycleInput = ch.root.Seq
-	a.userText = ch.root.Text()
+	if b := ch.briefFor(ps); b != nil {
+		a.briefSeq = b.Seq
+	} else {
+		a.userText = ch.root.Text()
+	}
 	a.recoverWith = ch.with
 	for _, e := range ch.with {
 		a.steered = append(a.steered, &inputRec{entry: cloneEntry(e), q: recoveredQuery(e)})

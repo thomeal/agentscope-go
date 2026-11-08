@@ -11,6 +11,7 @@ import (
 
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/agent"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/event"
+	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/model"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/thread"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/thread/participant"
 )
@@ -441,5 +442,78 @@ func TestE2EPrivateRunSurvivesARestart(t *testing.T) {
 				t.Fatalf("the policy was asked about the reply after the restart: %v, want %v", got, private)
 			}
 		})
+	}
+}
+
+// TestE2ETransferredEdgeOnlyRequestResumesOnTheCloud: the edge hands an
+// edge-only request to the cloud through a brief the policy clears, and the
+// process stops while the master answers it. After the restart the master
+// resumes from the brief: its request holds the brief and a restart note
+// pointing at it, never the request, and the edge does not run again.
+func TestE2ETransferredEdgeOnlyRequestResumesOnTheCloud(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "thread.jsonl")
+	first, err := thread.OpenFileStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newSession(t, &sessionOptions{store: first})
+	const goal = "BRIEF-GOAL: book the garage service for Friday"
+	s.edge.script(act("", toolCall(participant.ToolTransfer, map[string]any{"to": "cloud", "goal": goal, "remaining": []any{"pick a slot"}})))
+	entered := make(chan struct{})
+	s.master.script(func(ctx context.Context, _ *wireCall) (*model.ChatResponse, error) {
+		close(entered)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	q := s.submit(&thread.Query{Text: "My door code is " + canary + "; have the cloud book the garage service.",
+		Disclosure: thread.DiscloseEdgeOnly, Explicit: "edge"})
+	waitClosed(t, entered, "the master's call on the transferred request")
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := thread.OpenFileStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+	s.store = second
+	transfer := one(t, find(s.since(q), thread.KindOwnerChange, "edge"), "transfer")
+	if transfer.Owner.Reason != thread.ReasonTransfer || transfer.Owner.To != "cloud" || transfer.Visibility != thread.Shared {
+		t.Fatalf("transfer:%s", describe([]thread.Entry{transfer}))
+	}
+	edgeCalls := s.edge.count("")
+	s.master.script(inspect(func(c *wireCall) {
+		text := c.text()
+		note := fmt.Sprintf("[The session restarted while you were continuing the request handed to you in #%d", transfer.Seq)
+		if !strings.Contains(text, note) || !strings.Contains(text, "check the actual state before you redo anything") {
+			t.Errorf("the resumed request misses the restart note:\n%s", text)
+		}
+		if !strings.Contains(text, goal) {
+			t.Errorf("the resumed request misses the brief:\n%s", text)
+		}
+		if strings.Contains(text, canary) || strings.Contains(text, "door code") {
+			t.Errorf("the resumed request holds the edge-only request:\n%s", text)
+		}
+	}, say("CLOUD: the garage service is booked for Friday at 9:00.")))
+	s.rebuild(second)
+	s.settle()
+
+	rec := one(t, find(s.since(transfer.Seq), thread.KindMarker, ""), "restarted marker")
+	if rec.Marker.Kind != thread.MarkerRestarted || rec.BasedOn != transfer.Seq || rec.Visibility != thread.Shared {
+		t.Fatalf("restarted marker:%s", describe([]thread.Entry{rec}))
+	}
+	resumed := one(t, find(s.since(transfer.Seq), thread.KindReply, "cloud"), "resumed reply")
+	if resumed.BasedOn != rec.Seq {
+		t.Fatalf("resumed reply:%s", describe([]thread.Entry{resumed}))
+	}
+	if owner, _ := s.c.Owner(); owner != "cloud" {
+		t.Fatalf("owner after recovery = %s", owner)
+	}
+	if n := s.edge.count(""); n != edgeCalls {
+		t.Fatalf("the edge made %d calls after the restart", n-edgeCalls)
 	}
 }

@@ -31,7 +31,8 @@ const (
 	// imports it, reads it or receives it through Pending, and its query
 	// cycle never goes to the cloud by routing or failover, also after a
 	// restart; an edge Transfer hands it over only through a brief the
-	// DisclosurePolicy clears. Otherwise the entry is shared, and routing still keeps
+	// DisclosurePolicy clears, and a restart resumes such a Transfer on the
+	// cloud from that brief. Otherwise the entry is shared, and routing still keeps
 	// the query off the cloud if the edge is tainted when the query is
 	// routed.
 	DiscloseUnclassified Disclosure = "unclassified"

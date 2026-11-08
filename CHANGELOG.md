@@ -39,7 +39,10 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
   steering it may read (the rest gets a cycle of its own); plan updates are
   logged as `progress`; after a crash the turn in flight is resumed on its
   owner, with the user's steering since then and a warning to check the
-  actual state. The edge's privacy is saved in its checkpoint with what
+  actual state (an edge-only request the edge transferred to the cloud is
+  resumed there from its brief, which the restart points at instead of
+  quoting the request, and is never joined to another resumed request).
+  The edge's privacy is saved in its checkpoint with what
   caused it, and recovery reads it from there. See
   [Main Thread](docs/main-thread.md) and `examples/main_thread`.
 - Opt-in `agent` seams it builds on, inert unless used: `ApplyThreadUpdate`,

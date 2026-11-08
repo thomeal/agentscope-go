@@ -47,6 +47,10 @@ type activation struct {
 	// there is none it may read.
 	failSeq  uint64
 	progress uint64
+	// briefSeq is set on a restart that resumes a request its owner may not
+	// read from the brief a Transfer handed it: the owner change holding the
+	// brief, which its input points at instead of quoting the request.
+	briefSeq uint64
 	// cycleInput is the user_input this activation answers: the trigger of
 	// a routed input, passed on through Transfer and failover; 0 for wakes
 	// and tasks. Only such an activation fails over.

@@ -104,12 +104,28 @@ func failoverNote(a *activation) string {
 
 // restartNote is the input of an activation that resumes a request the
 // stopped process was answering. Nothing that ran before the restart is
-// re-run: the participant checks the actual state first.
+// re-run: the participant checks the actual state first. An owner resuming
+// from a Transfer's brief is pointed at the brief; the request is never
+// quoted to it.
 func restartNote(a *activation, hostNote string) string {
 	var b strings.Builder
-	if len(a.recoverWith) == 0 {
+	switch {
+	case a.briefSeq != 0:
+		fmt.Fprintf(&b, "[The session restarted while you were continuing the request handed to you in #%d", a.briefSeq)
+		for i, e := range a.recoverWith {
+			switch {
+			case i > 0:
+				b.WriteString(", ")
+			case len(a.recoverWith) == 1:
+				b.WriteString(", with the user's message ")
+			default:
+				b.WriteString(", with the user's messages ")
+			}
+			fmt.Fprintf(&b, "#%d %s", e.Seq, quoteRequest(e.Text()))
+		}
+	case len(a.recoverWith) == 0:
 		fmt.Fprintf(&b, "[The session restarted while the user's request #%d %s was being answered", a.cycleInput, quoteRequest(a.userText))
-	} else {
+	default:
 		// The joined inputs are quoted with the request, in log order.
 		msgs := append([]*Entry{{Seq: a.cycleInput, Content: textContent(a.userText)}}, a.recoverWith...)
 		slices.SortFunc(msgs, func(x, y *Entry) int { return cmp.Compare(x.Seq, y.Seq) })

@@ -437,8 +437,17 @@ and the inputs joined to it, the host's `Config.RecoveryNote` (why the
 process stopped, on one line), the failure before the restart if any, and
 the latest progress. The input also warns that work done before the restart
 may or may not have taken effect, so the owner checks the actual state
-before redoing anything. The marker is shared whenever the request is, so
-the recovery note must never hold edge-only material. After the restart an
+before redoing anything. A request a Transfer handed to the owner is resumed
+there even when the owner may not read it: for an edge-only request the edge
+handed to the cloud through a cleared brief, the input points at the
+transfer's brief instead of quoting the request. The cloud only ever had the
+brief, and its context holds it again after the restart's import, from its
+checkpoint or projected from the log. The inputs joined to a resumed request
+are quoted, so a request the owner may not read is never joined: another
+edge-only request in the turn gets a `recovered` marker if it ran, and is
+queued again if nothing is based on it. The marker has the request's visibility,
+or the brief's when the owner resumes from one, so the recovery note must
+never hold edge-only material. After the restart an
 edge counts as private exactly when its checkpoint says so
 (`ParticipantState.Private`): a run's private reading, also one the stop cut
 off, is saved with the flag, and the log shows neither. A custom edge
@@ -482,10 +491,6 @@ leaving it for recovery.
   compresses synchronously.
 * Resuming a request after a restart cannot tell which of its tool calls took
   effect; the resumed owner is told to check the actual state.
-* An edge-only request the edge handed to the cloud through a Transfer is not
-  resumed on the cloud after a restart: the restart note would quote the
-  request. It is routed back to the edge behind a `requeue:` marker and
-  starts over there.
 * An edge agent built without `Prepare` has no privacy probe: a checkpoint it
   saves during a reply lacks that reply's privacy, which is saved when the
   activation ends. A crash in between restores the edge as shared.
