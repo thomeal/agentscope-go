@@ -1416,7 +1416,7 @@ The arrangement raised master's cloud cost, because its compression was most of 
 
 Written on 2026-11-20, before any live row. The program passed its offline check, described below, and has sent nothing.
 
-> **Published copy.** The program and the library code it tests are published on this fork, on the branches `exp/canonical-replay-live` and `feat/canonical-replay`; the commits named below are on them. The run directories are local, as for the earlier amendments.
+> **Published copy.** The program and the library code it tests are published on this fork, on the branches `exp/canonical-replay-live` and `feat/canonical-replay`; the commits named below are on them. The run directories are local, as for the earlier amendments. The amendment was committed locally at 18:01:19 UTC on 2026-11-20 (`f8fb31b`, not published), and the ledger's first row is at 18:02:36 UTC.
 
 **Why.** Amendment 8 measured an argument form, not code anyone ships. Its replay rewrote recorded request bodies, and `--canonical-replay` rewrote local's arguments in stage 0's transport. `feat/canonical-replay` (`a3407ed`) adds `model.WithCanonicalReplay()` to `ConnectivityAwareModel`:
 - it marks the tool calls the local model returns (`ToolCallBlock.Extra["agentscope_writer_rank"]`);
@@ -1435,12 +1435,12 @@ The PR's only evidence is Amendment 8. This replay sends the same prompts throug
   A request field or item the program cannot reproduce is an error, not dropped.
 - **Local's turns.** These are the replies whose calls carry the local server's `chatcmpl` prefix, text included. A scripted local model returns them while the cloud's transport refuses every request. So the wrapper's own local path produces them, and with the option it marks them. Each call gets a fresh `ConnectivityAwareModel` with `WithFailureThreshold(1)`.
 - **The cloud's turns** are spliced in as the adapter's parser stores them.
-- **The final request.** The cloud is restored, and the request goes through `cam.Chat` and main's Responses adapter.
+- **The final request.** The cloud is restored, and the request goes through `cam.Chat` and `main`'s Responses adapter.
 - **Variants.** `lib_off` has no option, and `lib_on` has `WithCanonicalReplay()`. Nothing else differs.
 
 **The transport** is the same in both variants:
 - `store` is false, encrypted reasoning is included, and `max_output_tokens` is 8,000.
-- It drops every `function_call` item `id` that does not start with `fc`. Main's adapter sends a local call's ID as the item id, and the API rejects that with HTTP 400 ("Expected an ID that begins with 'fc'"). A check today found that the API accepts the same request without the id, with the `chatcmpl-tool-…` call_id kept.
+- It drops every `function_call` item `id` that does not start with `fc`. `main`'s adapter sends a local call's ID as the item id, and the API rejects that with HTTP 400 ("Expected an ID that begins with 'fc'"). A check on 2026-11-20 found that the API accepts the same request without the id, with the `chatcmpl-tool-…` call_id kept.
 - Stage 0's transport made the same drop. Its `prepareResponses` is copied verbatim, and a test compares the copy with the source. So the recorded requests carry no such ids either.
 - The body is re-encoded from a decoded map, as stage 0's was, so keys are sorted at every level.
 
@@ -1456,8 +1456,8 @@ A reply stopped at the cap is a runaway, as in Amendment 8.
 - **Before the run.** The run repeats the check and does not start on a difference. It refuses to send any body whose hash differs from the checked one.
 
 **What the check cannot rule out.** These are differences from what Amendment 8 actually sent:
-- **The replay script.** Amendment 8's replay was a Python script that is no longer on disk. Its conventions are taken from its ledger: the fields; the prices, which give every priced row's cost exactly; and a runaway as status `incomplete` for `max_output_tokens`. Its bytes differed in whitespace and escaping, and its HTTP client differed. The parsed request is the same.
-- **The cloud's call_ids.** The recorded calls carry the `fc` item id as call_id, which is what stage 0's version of the adapter sent. Main's parser now keeps the API's `call_…` id. The program reproduces the recorded value in both variants.
+- **The replay script.** Amendment 8's replay was a Python script that was not kept. Its conventions are taken from its ledger: the fields; the prices, which give every priced row's cost exactly; and a runaway as status `incomplete` for `max_output_tokens`. Its bytes differed in whitespace and escaping, and its HTTP client differed. The parsed request is the same.
+- **The cloud's call_ids.** The recorded calls carry the `fc` item id as call_id, which is what stage 0's version of the adapter sent. `main`'s parser now keeps the API's `call_…` id. The program reproduces the recorded value in both variants.
 
 None of these touches local's arguments, which are what the variants change.
 
@@ -1505,7 +1505,7 @@ Reported beside it, and not read:
 - **The same 11 prompts as Amendment 8.** They were chosen by shape, and one of them by its outcome. They show whether this code reproduces that measurement. They do not show how often runaways happen in a live session.
 - **One configuration:** one cloud model, and one local model's calls.
 - **Local's calls are recorded, not live.** The scripted model returns what Qwen3.5-4B wrote in stage 0. The marking runs on the wrapper's real local path, but no local server runs.
-- **The id drop is not the library's.** Without it, main's adapter cannot send local calls to the Responses API, in either variant. So `ConnectivityAwareModel` with a Chat Completions local model and this adapter gets HTTP 400 today, with or without the option. That is a separate defect, and this replay does not test a fix for it.
+- **The id drop is not the library's.** Without it, `main`'s adapter cannot send local calls to the Responses API, in either variant. So `ConnectivityAwareModel` with a Chat Completions local model and this adapter gets HTTP 400 on `main` as of 2026-11-20, with or without the option. That is a separate defect, and this replay does not test a fix for it.
 - **`store` and `include` are stage 0's settings,** not the adapter's defaults.
 - **Only the buffered `Chat` path runs.** `ChatStream` marks through a separate forwarder, which this replay does not exercise.
 - **Two weeks have passed since Amendment 8,** so `lib_off` is the control here, not Amendment 8's rows.
@@ -1534,8 +1534,8 @@ Written on 2026-11-20, after the run, from `canonical-replay report` on the ledg
 - **By the local model's key order.** All 20 came on the 8 prompts where local wrote `path` first (0 to 6, and 8). Prompts 7, 9 and 10, where local wrote `content` first, gave none, as in Amendment 8.
 - **The cloud's replies.** Every `write_file` reply that was parsed began with `content`: 305 in `lib_off` and 302 in `lib_on`.
 
-**What this shows.** On these 11 prompts, the library option removes the runaways that the transport rewrite removed. It ran on the wrapper's real local path and main's Responses adapter. The limits listed in Amendment 22 stand:
+**What this shows.** On these 11 prompts, the library option removes the runaways that the transport rewrite removed. It ran on the wrapper's real local path and `main`'s Responses adapter. The limits listed in Amendment 22 stand:
 - the same prompts, with recorded local calls;
 - only the buffered `Chat` path;
-- the item-id drop, which main's adapter needs and does not do;
+- the item-id drop, which `main`'s adapter needs and does not do;
 - stage 0's `store` and `include` settings.
