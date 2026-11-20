@@ -1411,3 +1411,131 @@ The arrangement raised master's cloud cost, because its compression was most of 
 - **The user's reading.** `main` has no scheme that puts a tool-using session's work on the edge. The shipped Main Thread is therefore the scheme to go forward with.
 - **No measurement backs this choice.** Main Thread has not been measured as better than any `main` scheme: every final reading against master is void.
 - **Stage 0's single-history baselines also compressed in the cloud.** So stage 0's cost comparisons against them are biased in the same way. Its score comparisons favored the baselines, so a Main Thread lead in score there is conservative.
+
+## Amendment 22: the library's canonical replay on Amendment 8's prompts
+
+Written on 2026-11-20, before any live row. The program passed its offline check, described below, and has sent nothing.
+
+> **Published copy.** The program and the library code it tests are published on this fork, on the branches `exp/canonical-replay-live` and `feat/canonical-replay`; the commits named below are on them. The run directories are local, as for the earlier amendments.
+
+**Why.** Amendment 8 measured an argument form, not code anyone ships. Its replay rewrote recorded request bodies, and `--canonical-replay` rewrote local's arguments in stage 0's transport. `feat/canonical-replay` (`a3407ed`) adds `model.WithCanonicalReplay()` to `ConnectivityAwareModel`:
+- it marks the tool calls the local model returns (`ToolCallBlock.Extra["agentscope_writer_rank"]`);
+- in the copy of the history it sends to the cloud, it rewrites the arguments of marked calls as compact JSON with sorted keys.
+
+The PR's only evidence is Amendment 8. This replay sends the same prompts through that code.
+
+**The program.** `experiments/canonical-replay` on `exp/canonical-replay-live` (`dd5c72a`), cut from `feat/canonical-replay`. It reads `runs/replay-runaway/prompts.jsonl` and writes `runs/replay-canonical-lib`.
+- **The history.** Each of the 11 first-write requests is taken apart into the history that produced it:
+  - the instructions become a system message, and user messages stay user messages;
+  - each reply is one assistant message holding all its blocks, calls and results together, as UnifiedAgent stores them;
+  - a reasoning item becomes a thinking block that carries the item in `Extra["responses_item"]`, which the adapter replays;
+  - a cloud call keeps its `fc` item id and its call_id;
+  - the tools become `[]model.ToolSchema`.
+
+  A request field or item the program cannot reproduce is an error, not dropped.
+- **Local's turns.** These are the replies whose calls carry the local server's `chatcmpl` prefix, text included. A scripted local model returns them while the cloud's transport refuses every request. So the wrapper's own local path produces them, and with the option it marks them. Each call gets a fresh `ConnectivityAwareModel` with `WithFailureThreshold(1)`.
+- **The cloud's turns** are spliced in as the adapter's parser stores them.
+- **The final request.** The cloud is restored, and the request goes through `cam.Chat` and main's Responses adapter.
+- **Variants.** `lib_off` has no option, and `lib_on` has `WithCanonicalReplay()`. Nothing else differs.
+
+**The transport** is the same in both variants:
+- `store` is false, encrypted reasoning is included, and `max_output_tokens` is 8,000.
+- It drops every `function_call` item `id` that does not start with `fc`. Main's adapter sends a local call's ID as the item id, and the API rejects that with HTTP 400 ("Expected an ID that begins with 'fc'"). A check today found that the API accepts the same request without the id, with the `chatcmpl-tool-…` call_id kept.
+- Stage 0's transport made the same drop. Its `prepareResponses` is copied verbatim, and a test compares the copy with the source. So the recorded requests carry no such ids either.
+- The body is re-encoded from a decoded map, as stage 0's was, so keys are sorted at every level.
+
+A reply stopped at the cap is a runaway, as in Amendment 8.
+
+**Offline check, run before this was written.** Nothing was sent.
+- **`lib_off`:** for all 11 prompts, the outbound body equals the recorded request plus the cap, byte for byte as Go encodes both. That covers item order, reasoning items, tools and instructions.
+- **`lib_on`:** the outbound body equals stage 0's `cloud_style` rewrite of the same request.
+  - 46 of local's 64 calls change, and each is byte-equal to the harness function's output. The other 18 are `{}` and already in that form.
+  - The cloud's 46 calls are unchanged.
+  - The stored history is not rewritten. In it, every local call carries the mark and no cloud call does; `lib_off` marks nothing.
+- **A separate Python check** of the same bodies agrees. A Python rewrite gives the same bytes with or without ASCII escaping, because local's arguments are all ASCII.
+- **Before the run.** The run repeats the check and does not start on a difference. It refuses to send any body whose hash differs from the checked one.
+
+**What the check cannot rule out.** These are differences from what Amendment 8 actually sent:
+- **The replay script.** Amendment 8's replay was a Python script that is no longer on disk. Its conventions are taken from its ledger: the fields; the prices, which give every priced row's cost exactly; and a runaway as status `incomplete` for `max_output_tokens`. Its bytes differed in whitespace and escaping, and its HTTP client differed. The parsed request is the same.
+- **The cloud's call_ids.** The recorded calls carry the `fc` item id as call_id, which is what stage 0's version of the adapter sent. Main's parser now keeps the API's `call_…` id. The program reproduces the recorded value in both variants.
+
+None of these touches local's arguments, which are what the variants change.
+
+**Run.** `replay-canonical-lib`:
+- 11 prompts × 30 replays × 2 variants = 660 calls on `gpt-6-luna`, shuffled together with seed 4 (Amendment 8's passes used seeds 1 to 3), 8 at a time.
+- One row per call, in Amendment 8's ledger format, with the variants named `lib_off` and `lib_on`. Each row adds the HTTP status, the outbound body's hash, the attempts and a rerun flag.
+- Retries are stage 0's: 429, 5xx and dropped connections, up to nine attempts.
+- An interrupted run resumes where it stopped.
+
+**Prediction,** from Amendment 8:
+- `lib_off` behaves as `exact` did: 21 to 27 runaways in 330 (6.4% to 8.2%), all on prompts where local wrote `path` first.
+- `lib_on` behaves as `cloud_style` and `sorted_spaced` did: 0 of 330.
+
+**Primary reading.** `lib_on` − `lib_off` in runaway rate, by prompt:
+- each prompt's rate in each variant is taken over its valid calls;
+- the difference is averaged over the 11 prompts;
+- the 95% CI is a percentile bootstrap over prompts, seed 1, 10,000 resamples.
+
+This is Amendment 8's reading. On Amendment 8's second pass, the program gives `cloud_style` − `exact` as −8.18 [−13.64, −3.64], which matches the published figures.
+- **Confirmed** if the CI lies below 0: the option removes the runaways that the transport rewrite removed.
+- **Reversed** if the CI lies above 0.
+- **Otherwise not confirmed.** That is not evidence of no effect.
+- **No test** if `lib_off` gives fewer than 10 runaways, whatever `lib_on` shows. Either the library path does not reproduce the effect, or the model has changed since 2026-11-06, and this run cannot tell which. Either way the PR's evidence does not carry over, and that is the finding. As in Amendment 7, no further run is made on that basis.
+
+Reported beside it, and not read:
+- the same reading without prompt 0, which was chosen by its outcome;
+- runaways by prompt;
+- the first key of the cloud's `write_file` replies in each variant;
+- any `lib_on` runaways, with their prompts;
+- cost by variant.
+
+**Void and infra rows.**
+- **Infra rows:** a call that ends without a usable reply is an infra row and is not read. That covers an HTTP error after the retries, a dropped connection, a failed response, a response without usage, and the 10 minute timeout.
+- **Reruns:** each infra row is rerun once, as the same job (`run -rerun`). The rerun row replaces it.
+- **Missing jobs:** a job without a valid row after that is left out. The counts by prompt and variant are reported.
+- **Hard stop:** if the hard stop ends the run, the rows already written are kept, and the result is reported as incomplete.
+- **Body mismatch:** a body that differs from the checked one is never sent, and it stops the run.
+
+**Spend.** In Amendment 8's ledger, 330 calls cost $0.21 to $0.23 for `exact` and $0.13 for `cloud_style`, so about $0.35 is expected here.
+- The hard stop is $2 over the whole ledger, reruns included, and the program enforces it.
+- Each call reserves its worst case before it is sent: all input uncached and the full 8,000 tokens out.
+- It binds only if most calls run away.
+
+**Limits.**
+- **The same 11 prompts as Amendment 8.** They were chosen by shape, and one of them by its outcome. They show whether this code reproduces that measurement. They do not show how often runaways happen in a live session.
+- **One configuration:** one cloud model, and one local model's calls.
+- **Local's calls are recorded, not live.** The scripted model returns what Qwen3.5-4B wrote in stage 0. The marking runs on the wrapper's real local path, but no local server runs.
+- **The id drop is not the library's.** Without it, main's adapter cannot send local calls to the Responses API, in either variant. So `ConnectivityAwareModel` with a Chat Completions local model and this adapter gets HTTP 400 today, with or without the option. That is a separate defect, and this replay does not test a fix for it.
+- **`store` and `include` are stage 0's settings,** not the adapter's defaults.
+- **Only the buffered `Chat` path runs.** `ChatStream` marks through a separate forwarder, which this replay does not exercise.
+- **Two weeks have passed since Amendment 8,** so `lib_off` is the control here, not Amendment 8's rows.
+
+## Results of Amendment 22
+
+Written on 2026-11-20, after the run, from `canonical-replay report` on the ledger in `runs/replay-canonical-lib`.
+
+**The run.**
+- 660 rows, with no infra rows, reruns or interrupted jobs. `run -rerun` found nothing to run.
+- Every body sent had the hash the offline check recorded.
+- Spend was $0.334 against the $2 hard stop: $0.204 for `lib_off` and $0.130 for `lib_on`.
+
+| Variant | Runaways | Valid calls | Rate | Largest ordinary reply |
+|---|---|---|---|---|
+| `lib_off` | 20 | 330 | 6.06% | 2,344 |
+| `lib_on` | 0 | 330 | 0% | 1,456 |
+
+**Primary reading: confirmed.** `lib_on` − `lib_off` by prompt is −6.1 points [−9.7, −2.7] on 11 prompts. The CI lies below 0.
+- `lib_off` gave 20 runaways, above the 10 below which the run would have been no test.
+- 20 is just under the predicted 21 to 27.
+
+**Reported beside it, and not read.**
+- **Without prompt 0,** which was chosen by its outcome: −6.0 points [−10.0, −2.3] on 10 prompts.
+- **By prompt,** `lib_off` runaways for prompts 0 to 10: 2, 6, 2, 4, 1, 1, 3, 0, 1, 0, 0. `lib_on` gave none on any prompt.
+- **By the local model's key order.** All 20 came on the 8 prompts where local wrote `path` first (0 to 6, and 8). Prompts 7, 9 and 10, where local wrote `content` first, gave none, as in Amendment 8.
+- **The cloud's replies.** Every `write_file` reply that was parsed began with `content`: 305 in `lib_off` and 302 in `lib_on`.
+
+**What this shows.** On these 11 prompts, the library option removes the runaways that the transport rewrite removed. It ran on the wrapper's real local path and main's Responses adapter. The limits listed in Amendment 22 stand:
+- the same prompts, with recorded local calls;
+- only the buffered `Chat` path;
+- the item-id drop, which main's adapter needs and does not do;
+- stage 0's `store` and `include` settings.
