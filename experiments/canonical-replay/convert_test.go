@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -15,11 +17,37 @@ import (
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/message"
 )
 
-// Paths on the eval/final checkout. Tests that need them skip when they are absent.
+// The cross-checks read stage 0's material and skip without it.
+//
+// STAGE0_DIR is a checkout of thomeal/agentscope-go at eval/stage0, which holds stage 0's
+// source. STAGE0_REPLAY_DIR is a directory holding Amendment 8's prompts.jsonl and
+// replay.jsonl (stage 0's runs/replay-runaway); that data is not published.
 const (
-	stage0Cloud  = `H:/Claude/Projects/agentscope-go/experiments/stage0/lab/cloud.go`
-	stage0Ledger = `H:/Claude/Projects/agentscope-go/experiments/stage0/runs/replay-runaway/replay.jsonl`
+	stage0DirEnv    = "STAGE0_DIR"
+	stage0ReplayEnv = "STAGE0_REPLAY_DIR"
 )
+
+// stage0Cloud returns stage 0's lab/cloud.go, or skips.
+func stage0Cloud(t *testing.T) string {
+	t.Helper()
+	dir := os.Getenv(stage0DirEnv)
+	path := filepath.Join(dir, "experiments", "stage0", "lab", "cloud.go")
+	if _, err := os.Stat(path); dir == "" || err != nil {
+		t.Skip("stage 0 source not found (set STAGE0_DIR)")
+	}
+	return path
+}
+
+// stage0Replay returns a file of Amendment 8's replay data, or skips saying why.
+func stage0Replay(t *testing.T, name, unpublished string) string {
+	t.Helper()
+	dir := os.Getenv(stage0ReplayEnv)
+	path := filepath.Join(dir, name)
+	if _, err := os.Stat(path); dir == "" || err != nil {
+		t.Skipf("%s; to run this check, set %s to a directory holding %s", unpublished, stage0ReplayEnv, name)
+	}
+	return path
+}
 
 var testTools = []any{
 	map[string]any{"type": "function", "name": "list_files", "description": "List files.",
@@ -296,18 +324,21 @@ func TestShapeDropsOnlyNonFCIDs(t *testing.T) {
 
 // TestStage0CopiesAreVerbatim compares the copied helpers with stage 0's source.
 func TestStage0CopiesAreVerbatim(t *testing.T) {
-	src, err := os.ReadFile(stage0Cloud)
+	path := stage0Cloud(t)
+	src, err := os.ReadFile(path)
 	if err != nil {
-		t.Skip("eval/final checkout not on disk")
+		t.Fatal(err)
 	}
 	mine, err := os.ReadFile("stage0ref.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	theirs, ours := decls(t, src), decls(t, mine)
+	// A checkout may have either line ending; the comparison is of the text.
+	lf := func(b []byte) []byte { return bytes.ReplaceAll(b, []byte("\r\n"), []byte("\n")) }
+	theirs, ours := decls(t, lf(src)), decls(t, lf(mine))
 	for _, name := range []string{"prepareResponses", "localCallPrefix", "canonicalReplay", "canonicalJSON"} {
 		if theirs[name] == "" || theirs[name] != ours[name] {
-			t.Errorf("%s differs from %s", name, stage0Cloud)
+			t.Errorf("%s differs from %s", name, path)
 		}
 	}
 }
@@ -344,9 +375,9 @@ func decls(t *testing.T, src []byte) map[string]string {
 
 // TestRecordedPromptsFidelity is the offline check on the real prompts.
 func TestRecordedPromptsFidelity(t *testing.T) {
-	prompts, err := loadPrompts(defaultPrompts)
+	prompts, err := loadPrompts(stage0Replay(t, "prompts.jsonl", "stage 0's recorded prompts are not published"))
 	if err != nil {
-		t.Skip("prompts.jsonl not on disk")
+		t.Fatal(err)
 	}
 	if err := checkSet(prompts); err != nil {
 		t.Fatal(err)

@@ -1,9 +1,10 @@
 package main
 
 // This file holds verbatim copies of stage 0's transport helpers, from
-// experiments/stage0/lab/cloud.go on eval/final (5289a2e). That package is
-// not on this branch. TestStage0CopiesAreVerbatim compares each declaration
-// with the source file when the eval/final checkout is on disk.
+// experiments/stage0/lab/cloud.go on thomeal/agentscope-go eval/stage0
+// (5c334a0). That package is not on this branch. TestStage0CopiesAreVerbatim
+// compares each declaration with that file when STAGE0_DIR names a checkout
+// of eval/stage0.
 //
 // prepareResponses is applied to every outbound request in both variants: it
 // is the id drop the replay needs (main's Responses adapter sends the local

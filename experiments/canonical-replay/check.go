@@ -116,7 +116,10 @@ func expectedExact(raw []byte) (map[string]any, error) {
 	// Round-trip so numbers have the type the outbound body decodes to.
 	b, _ := json.Marshal(body)
 	var out map[string]any
-	return out, json.Unmarshal(b, &out)
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // checkCalls compares every call's arguments in lib_on's outbound body with the recording:

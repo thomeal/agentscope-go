@@ -2,9 +2,11 @@
 // ConnectivityAwareModel, with and without WithCanonicalReplay, against the OpenAI
 // Responses API (prereg.md, Amendment 22).
 //
-//	canonical-replay check  -prompts P [-out DIR]     offline fidelity check; sends nothing
-//	canonical-replay run    -prompts P -out DIR -env F live replay, resumable, hard stop
-//	canonical-replay report -out DIR                  readings from the ledger
+//	canonical-replay check  -prompts P [-out DIR]      offline fidelity check; sends nothing
+//	canonical-replay run    -prompts P -env F [-out DIR] live replay, resumable, hard stop
+//	canonical-replay report [-out DIR]                 readings from the ledger
+//
+// See README.md for the inputs, which are not published.
 package main
 
 import (
@@ -30,8 +32,8 @@ import (
 )
 
 const (
-	defaultPrompts = `H:/Claude/Projects/agentscope-go/experiments/stage0/runs/replay-runaway/prompts.jsonl`
-	defaultOut     = `H:/Claude/Projects/agentscope-go/experiments/stage0/runs/replay-canonical-lib`
+	// defaultOut is the output directory, relative to the working directory.
+	defaultOut = "replay-canonical-lib"
 	// hardStop is Amendment 22's cap on the whole experiment, reruns included.
 	hardStop = 2.0
 	// wantModel is the cloud model the recorded requests name.
@@ -64,10 +66,13 @@ func main() {
 
 func cmdCheck(args []string, w io.Writer) error {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
-	promptsPath := fs.String("prompts", defaultPrompts, "stage 0's prompts.jsonl (read only)")
+	promptsPath := fs.String("prompts", "", "stage 0's prompts.jsonl, read only (required)")
 	out := fs.String("out", "", "write the bodies and summary.json under OUT/check")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *promptsPath == "" {
+		return errors.New("-prompts is required")
 	}
 	prompts, err := loadPrompts(*promptsPath)
 	if err != nil {
@@ -127,7 +132,7 @@ type runConfig struct {
 
 func cmdRun(args []string, w io.Writer) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
-	promptsPath := fs.String("prompts", defaultPrompts, "stage 0's prompts.jsonl (read only)")
+	promptsPath := fs.String("prompts", "", "stage 0's prompts.jsonl, read only (required)")
 	out := fs.String("out", defaultOut, "output directory; the ledger is OUT/replay.jsonl")
 	envPath := fs.String("env", "", "file holding an OPENAI_API_KEY= line (required; never printed)")
 	model := fs.String("model", wantModel, "cloud model; must match the recorded requests")
@@ -143,6 +148,9 @@ func cmdRun(args []string, w io.Writer) error {
 	}
 	if *limit <= 0 || *limit > hardStop {
 		return fmt.Errorf("budget must be in (0, %.2f]", hardStop)
+	}
+	if *promptsPath == "" {
+		return errors.New("-prompts is required")
 	}
 	if *envPath == "" {
 		return errors.New("-env is required")
@@ -168,7 +176,7 @@ func readKey(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("cannot open the key file")
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }() // read only
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -232,7 +240,8 @@ func run(parent context.Context, cfg runConfig, w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	defer lw.close()
+	// Every row is synced as it is written, so closing has nothing left to lose.
+	defer func() { _ = lw.close() }()
 
 	ctx, stop := signal.NotifyContext(parent, os.Interrupt)
 	defer stop()
@@ -366,9 +375,11 @@ func writeManifest(cfg runConfig, rows int, spent float64, todo int) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	_, err = f.Write(append(b, '\n'))
-	return err
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // runJob replays one job and returns its row, or nil when no row is written: the hard

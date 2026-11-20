@@ -49,10 +49,10 @@ func (c cell) rate() float64 { return float64(c.runaways) / float64(c.valid) }
 // paired is a variant against a baseline by prompt: the mean over prompts of the
 // difference in runaway rate, in points, with its bootstrap CI over prompts.
 type paired struct {
-	prompts       []int
-	diffs         []float64
-	mean, lo, hi  float64
-	left, outside int // prompts without valid rows in both variants
+	prompts      []int
+	diffs        []float64
+	mean, lo, hi float64
+	left         int // prompts without valid rows in both variants
 }
 
 // byPrompt is Amendment 8's reading: per-prompt rates, differenced, averaged over prompts.

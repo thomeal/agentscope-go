@@ -80,8 +80,10 @@ func TestPendingAndFinal(t *testing.T) {
 
 func TestBudgetHoldsConcurrentReservations(t *testing.T) {
 	b := &budget{limit: 0.01}
-	if !b.reserve(0.004) || !b.reserve(0.004) || b.reserve(0.004) {
-		t.Fatal("the third reservation should not fit")
+	for i, want := range []bool{true, true, false} {
+		if got := b.reserve(0.004); got != want {
+			t.Fatalf("reservation %d: got %v, want %v", i+1, got, want)
+		}
 	}
 	b.settle(0.004, 0.001)
 	if !b.reserve(0.004) {
@@ -93,9 +95,9 @@ func TestBudgetHoldsConcurrentReservations(t *testing.T) {
 }
 
 func TestCostMatchesStage0Ledger(t *testing.T) {
-	rows, err := readLedger(stage0Ledger)
+	rows, err := readLedger(stage0Replay(t, "replay.jsonl", "stage 0's replay ledger is not published"))
 	if err != nil || len(rows) == 0 {
-		t.Skip("stage 0 ledger not on disk")
+		t.Fatalf("ledger: %d rows, %v", len(rows), err)
 	}
 	n := 0
 	for _, r := range rows {
@@ -338,9 +340,9 @@ func TestRunRefusesABodyThatDiffersFromTheCheck(t *testing.T) {
 // TestReportReproducesAmendment8 reads Amendment 8's ledger with this program's reading:
 // cloud_style against exact on the second pass gave −8.2 points [−13.6, −3.6].
 func TestReportReproducesAmendment8(t *testing.T) {
-	old, err := readLedger(stage0Ledger)
+	old, err := readLedger(stage0Replay(t, "replay.jsonl", "stage 0's replay ledger is not published"))
 	if err != nil || len(old) == 0 {
-		t.Skip("stage 0 ledger not on disk")
+		t.Fatalf("ledger: %d rows, %v", len(old), err)
 	}
 	var rows []Row
 	for _, r := range old {
